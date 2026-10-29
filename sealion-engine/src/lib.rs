@@ -1,4 +1,4 @@
-//! A small JavaScript-to-native compiler for the 0.1.0 roadmap subset.
+//! A small JavaScript-to-native compiler for the 0.2.0 roadmap subset.
 //!
 //! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
@@ -11,15 +11,27 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! The 0.1.0 subset supports functions (named declarations), variables,
-//! arithmetic, `if`/`else`, `while`, `return`, and closures. Values are
-//! represented as `f64`; closures are heap pointers stored in `f64` values.
+//! The 0.2.0 subset supports functions (named declarations), variables,
+//! arithmetic, `if`/`else`, `while`, `break`/`continue`, `return`, closures,
+//! the `undefined`/`null` literals, and the `void` operator.
+//!
+//! Values are NaN-boxed `f64`s: numbers are plain IEEE-754, while `undefined`,
+//! `null` and closures live in reserved quiet-NaN tag ranges.
+//! Consequences of the current encoding:
+//!
+//! - `===`/`!==` distinguish the tagged values, but booleans are still plain
+//!   `0`/`1` numbers, so `true === 1` holds.
+//! - Arithmetic on tagged values yields a NaN rather than coercing, so
+//!   `undefined + 1` is not `NaN` by spec rules yet.
+//! - String literals are rejected outright; strings arrive with the object work.
+//!
 //! Block scoping, anonymous/arrow functions, objects, arrays, and strings are
 //! intentionally deferred to later roadmap versions.
 
 mod compiler;
 mod error;
 mod plan;
+mod value;
 
 pub use error::Error;
 
@@ -62,7 +74,8 @@ impl Engine {
         let mut parser = Parser::new(Source::from_bytes(source));
         let script = parser.parse_script(&scope, &mut interner)?;
 
-        let plans = build_program_plan(&script)?;
+        let undefined_sym = interner.get_or_intern("undefined");
+        let plans = build_program_plan(&script, undefined_sym)?;
 
         let triple = Triple::host();
         let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;

@@ -15,8 +15,8 @@ use boa_ast::{
 };
 use boa_interner::Sym;
 use cranelift_codegen::ir::{
-    AbiParam, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature, UserFuncName, Value,
-    condcodes::FloatCC, types,
+    AbiParam, Block, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature, UserFuncName,
+    Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Module};
@@ -25,6 +25,7 @@ use cranelift_object::ObjectModule;
 use crate::{
     Error, IrFunction,
     plan::{FunctionPlan, resolve},
+    value,
 };
 
 const MAX_ARGS: usize = 32;
@@ -95,13 +96,26 @@ pub fn compile_functions(
         let args_param = builder.block_params(entry)[1];
         let env = alloc_env(&mut builder, calloc_ref, plan.slot_count(), env_param);
 
+        let undef = value::undefined(&mut builder);
+        for slot in 0..plan.slot_count() {
+            builder
+                .ins()
+                .store(MemFlags::new(), undef, env, (8 + 8 * slot) as i32);
+        }
+
         if !plan.is_script {
+            let len = builder
+                .ins()
+                .load(types::I64, MemFlags::new(), args_param, 0i32);
             for i in 0..plan.params.len() {
                 let offset = (8 + 8 * i) as i32;
-                let value = builder
+                let idx = builder.ins().iconst(types::I64, i as i64);
+                let present = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                let loaded = builder
                     .ins()
                     .load(types::F64, MemFlags::new(), args_param, offset);
-                builder.ins().store(MemFlags::new(), value, env, offset);
+                let arg = builder.ins().select(present, loaded, undef);
+                builder.ins().store(MemFlags::new(), arg, env, offset);
             }
         }
 
@@ -130,9 +144,13 @@ pub fn compile_functions(
             js_sig_ref,
         };
 
-        let out = compile_statements(&mut builder, &ctx, &plan.body)?;
+        let mut loops = Vec::new();
+        let out = compile_statements(&mut builder, &ctx, &plan.body, &mut loops)?;
         if !out.terminated {
-            let ret = out.last.unwrap_or_else(|| builder.ins().f64const(0.0));
+            let ret = match out.last {
+                Some(value) => value,
+                None => value::undefined(&mut builder),
+            };
             builder.ins().return_(&[ret]);
         }
 
@@ -232,12 +250,12 @@ fn new_closure(
     let ptr = call_calloc(builder, calloc_ref, 16);
     builder.ins().store(MemFlags::new(), code, ptr, 0i32);
     builder.ins().store(MemFlags::new(), env, ptr, 8i32);
-    builder.ins().bitcast(types::F64, MemFlags::new(), ptr)
+    value::function(builder, ptr)
 }
 
-fn truthy(builder: &mut FunctionBuilder, value: Value) -> Value {
-    let zero = builder.ins().f64const(0.0);
-    builder.ins().fcmp(FloatCC::OrderedNotEqual, value, zero)
+struct LoopTarget {
+    break_block: Block,
+    continue_block: Block,
 }
 
 fn call_pow(builder: &mut FunctionBuilder, pow_ref: FuncRef, lhs: Value, rhs: Value) -> Value {
@@ -279,11 +297,12 @@ fn compile_statements(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     list: &StatementList,
+    loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
     let mut last = None;
     for item in list.statements() {
         let out = match item {
-            StatementListItem::Statement(stmt) => compile_statement(builder, ctx, stmt)?,
+            StatementListItem::Statement(stmt) => compile_statement(builder, ctx, stmt, loops)?,
             StatementListItem::Declaration(decl) => compile_declaration(builder, ctx, decl)?,
         };
         if out.last.is_some() {
@@ -345,9 +364,10 @@ fn compile_statement(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     stmt: &Statement,
+    loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
     match stmt {
-        Statement::Block(block) => compile_statements(builder, ctx, block.statement_list()),
+        Statement::Block(block) => compile_statements(builder, ctx, block.statement_list(), loops),
         Statement::Var(var) => {
             compile_var_list(builder, ctx, &var.0)?;
             Ok(StmtOutcome::default())
@@ -360,13 +380,33 @@ fn compile_statement(
                 terminated: false,
             })
         }
-        Statement::If(if_stmt) => compile_if(builder, ctx, if_stmt),
-        Statement::WhileLoop(while_stmt) => compile_while(builder, ctx, while_stmt),
+        Statement::If(if_stmt) => compile_if(builder, ctx, if_stmt, loops),
+        Statement::WhileLoop(while_stmt) => compile_while(builder, ctx, while_stmt, loops),
+        Statement::Break(_) => {
+            let target = loops
+                .last()
+                .ok_or_else(|| Error::Scope("break statement outside of a loop".to_string()))?;
+            builder.ins().jump(target.break_block, &[]);
+            Ok(StmtOutcome {
+                last: None,
+                terminated: true,
+            })
+        }
+        Statement::Continue(_) => {
+            let target = loops
+                .last()
+                .ok_or_else(|| Error::Scope("continue statement outside of a loop".to_string()))?;
+            builder.ins().jump(target.continue_block, &[]);
+            Ok(StmtOutcome {
+                last: None,
+                terminated: true,
+            })
+        }
         Statement::Return(ret) => {
             let value = if let Some(target) = ret.target() {
                 compile_expr(builder, ctx, target)?
             } else {
-                builder.ins().f64const(0.0)
+                value::undefined(builder)
             };
             builder.ins().return_(&[value]);
             Ok(StmtOutcome {
@@ -384,9 +424,10 @@ fn compile_if(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     if_stmt: &boa_ast::statement::If,
+    loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
     let cond_value = compile_expr(builder, ctx, if_stmt.cond())?;
-    let cond = truthy(builder, cond_value);
+    let cond = value::truthy(builder, cond_value);
 
     let then_block = builder.create_block();
     let else_block = builder.create_block();
@@ -394,14 +435,14 @@ fn compile_if(
     builder.ins().brif(cond, then_block, &[], else_block, &[]);
 
     builder.switch_to_block(then_block);
-    let then_out = compile_statement(builder, ctx, if_stmt.body())?;
+    let then_out = compile_statement(builder, ctx, if_stmt.body(), loops)?;
     if !then_out.terminated {
         builder.ins().jump(join_block, &[]);
     }
 
     builder.switch_to_block(else_block);
     let else_out = if let Some(else_node) = if_stmt.else_node() {
-        compile_statement(builder, ctx, else_node)?
+        compile_statement(builder, ctx, else_node, loops)?
     } else {
         StmtOutcome::default()
     };
@@ -424,6 +465,7 @@ fn compile_while(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     while_stmt: &boa_ast::statement::iteration::WhileLoop,
+    loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
     let header = builder.create_block();
     let body = builder.create_block();
@@ -433,11 +475,16 @@ fn compile_while(
     builder.switch_to_block(header);
 
     let cond_value = compile_expr(builder, ctx, while_stmt.condition())?;
-    let cond = truthy(builder, cond_value);
+    let cond = value::truthy(builder, cond_value);
     builder.ins().brif(cond, body, &[], exit, &[]);
 
     builder.switch_to_block(body);
-    let body_out = compile_statement(builder, ctx, while_stmt.body())?;
+    loops.push(LoopTarget {
+        break_block: exit,
+        continue_block: header,
+    });
+    let body_out = compile_statement(builder, ctx, while_stmt.body(), loops)?;
+    loops.pop();
     if !body_out.terminated {
         builder.ins().jump(header, &[]);
     }
@@ -468,23 +515,21 @@ fn compile_expr(
 
 fn compile_literal(builder: &mut FunctionBuilder, kind: &LiteralKind) -> Result<Value, Error> {
     let value = match kind {
-        LiteralKind::Num(n) => *n,
-        LiteralKind::Int(i) => *i as f64,
+        LiteralKind::Num(n) => builder.ins().f64const(*n),
+        LiteralKind::Int(i) => builder.ins().f64const(*i as f64),
         LiteralKind::Bool(b) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
+            let n = if *b { 1.0 } else { 0.0 };
+            builder.ins().f64const(n)
         }
-        LiteralKind::Null | LiteralKind::Undefined => 0.0,
+        LiteralKind::Null => value::null(builder),
+        LiteralKind::Undefined => value::undefined(builder),
         LiteralKind::String(_) | LiteralKind::BigInt(_) => {
             return Err(Error::Unsupported(
                 "string and bigint literals are not supported".to_string(),
             ));
         }
     };
-    Ok(builder.ins().f64const(value))
+    Ok(value)
 }
 
 fn compile_binary(
@@ -528,7 +573,7 @@ fn compile_logical(
     let join_block = builder.create_block();
 
     builder.def_var(result_var, lhs);
-    let cond = truthy(builder, lhs);
+    let cond = value::truthy(builder, lhs);
     if is_and {
         builder.ins().brif(cond, rhs_block, &[], join_block, &[]);
     } else {
@@ -574,8 +619,15 @@ fn compile_relational(
     rhs: Value,
 ) -> Result<Value, Error> {
     let cc = match op {
-        RelationalOp::Equal | RelationalOp::StrictEqual => FloatCC::Equal,
-        RelationalOp::NotEqual | RelationalOp::StrictNotEqual => FloatCC::NotEqual,
+        RelationalOp::Equal | RelationalOp::StrictEqual => {
+            return Ok(value::strict_equal(builder, lhs, rhs));
+        }
+        RelationalOp::NotEqual | RelationalOp::StrictNotEqual => {
+            let eq = value::strict_equal(builder, lhs, rhs);
+            let zero = builder.ins().f64const(0.0);
+            let cmp = builder.ins().fcmp(FloatCC::Equal, eq, zero);
+            return Ok(value::from_bool(builder, cmp));
+        }
         RelationalOp::GreaterThan => FloatCC::GreaterThan,
         RelationalOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
         RelationalOp::LessThan => FloatCC::LessThan,
@@ -587,8 +639,7 @@ fn compile_relational(
         }
     };
     let cmp = builder.ins().fcmp(cc, lhs, rhs);
-    let ext = builder.ins().uextend(types::I32, cmp);
-    Ok(builder.ins().fcvt_from_uint(types::F64, ext))
+    Ok(value::from_bool(builder, cmp))
 }
 
 fn compile_unary(
@@ -601,11 +652,12 @@ fn compile_unary(
         UnaryOp::Minus => Ok(builder.ins().fneg(target)),
         UnaryOp::Plus => Ok(target),
         UnaryOp::Not => {
-            let cond = truthy(builder, target);
+            let cond = value::truthy(builder, target);
             let zero = builder.ins().f64const(0.0);
             let one = builder.ins().f64const(1.0);
             Ok(builder.ins().select(cond, zero, one))
         }
+        UnaryOp::Void => Ok(value::undefined(builder)),
         other => Err(Error::Unsupported(format!(
             "unary operator not supported: {other:?}"
         ))),
@@ -702,7 +754,7 @@ fn compile_call(
     }
 
     let callee = compile_expr(builder, ctx, call.function())?;
-    let callee_ptr = builder.ins().bitcast(types::I64, MemFlags::new(), callee);
+    let callee_ptr = value::payload(builder, callee);
     let code = builder
         .ins()
         .load(types::I64, MemFlags::new(), callee_ptr, 0i32);

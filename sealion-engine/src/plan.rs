@@ -28,9 +28,9 @@ impl FunctionPlan {
     }
 }
 
-pub fn build_program_plan(script: &Script) -> Result<Vec<FunctionPlan>, Error> {
+pub fn build_program_plan(script: &Script, undefined_sym: Sym) -> Result<Vec<FunctionPlan>, Error> {
     let mut plans = Vec::new();
-    build_function_plan(
+    let script_id = build_function_plan(
         &mut plans,
         None,
         "__script".to_string(),
@@ -38,6 +38,7 @@ pub fn build_program_plan(script: &Script) -> Result<Vec<FunctionPlan>, Error> {
         script.statements().clone(),
         true,
     )?;
+    add_binding(&mut plans, script_id, undefined_sym);
     Ok(plans)
 }
 
@@ -108,12 +109,23 @@ fn scan_statement(
         Statement::WhileLoop(while_stmt) => {
             scan_statement(plans, plan_id, while_stmt.body())?;
         }
+        Statement::Break(break_stmt) => reject_label(break_stmt.label(), "break")?,
+        Statement::Continue(continue_stmt) => reject_label(continue_stmt.label(), "continue")?,
         Statement::Empty | Statement::Expression(_) | Statement::Return(_) => {}
         other => {
             return Err(Error::Unsupported(format!(
-                "statement not supported in 0.1.0: {other:?}"
+                "statement not supported: {other:?}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn reject_label(label: Option<Sym>, keyword: &str) -> Result<(), Error> {
+    if label.is_some() {
+        return Err(Error::Unsupported(format!(
+            "labelled {keyword} is not supported"
+        )));
     }
     Ok(())
 }
@@ -132,7 +144,7 @@ fn scan_declaration(
         }
         other => {
             return Err(Error::Unsupported(format!(
-                "declaration not supported in 0.1.0: {other:?}"
+                "declaration not supported: {other:?}"
             )));
         }
     }

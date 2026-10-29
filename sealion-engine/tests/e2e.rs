@@ -151,8 +151,83 @@ fn unary_and_comparison() {
 }
 
 #[test]
-fn missing_arguments_are_zero() {
-    assert_eq!(run("function add(a, b) { return a + b; } add(2);"), 2);
+fn missing_arguments_are_undefined() {
+    assert_eq!(
+        run("function f(a) { if (a === undefined) { return 7; } return 1; } f();"),
+        7
+    );
+}
+
+#[test]
+fn undefined_literal_and_identity() {
+    assert_eq!(run("undefined === undefined;"), 1);
+    assert_eq!(run("var x; x === undefined;"), 1);
+    assert_eq!(run("undefined === null;"), 0);
+    assert_eq!(run("undefined === 0;"), 0);
+    assert_eq!(run("var x = 0; if (undefined) { x = 1; } x;"), 0);
+}
+
+#[test]
+fn null_literal_and_identity() {
+    assert_eq!(run("null === null;"), 1);
+    assert_eq!(run("null === 0;"), 0);
+    assert_eq!(run("null !== undefined;"), 1);
+    assert_eq!(run("var x = 0; if (null) { x = 1; } x;"), 0);
+}
+
+#[test]
+fn void_operator() {
+    assert_eq!(run("void 0 === undefined;"), 1);
+    assert_eq!(run("var x = 0; void (x = 1); x;"), 1);
+}
+
+#[test]
+fn undefined_implicit_returns() {
+    assert_eq!(run("function f() { return; } f() === undefined;"), 1);
+    assert_eq!(run("function f() {} f() === undefined;"), 1);
+    assert_eq!(run("function f() { undefined; } f() === undefined;"), 1);
+}
+
+#[test]
+fn functions_are_truthy() {
+    assert_eq!(
+        run("function f() { return 1; } var x = 6; if (f) { x = 5; } x;"),
+        5
+    );
+}
+
+#[test]
+fn break_statement() {
+    assert_eq!(
+        run("var i = 0; while (1) { i = i + 1; if (i > 3) { break; } } i;"),
+        4
+    );
+}
+
+#[test]
+fn continue_statement() {
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; while (i < 5) { i = i + 1; if (i === 3) { continue; } s = s + i; } s;"
+        ),
+        12
+    );
+}
+
+#[test]
+fn nested_break_only_exits_inner_loop() {
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; while (i < 3) { i = i + 1; var j = 0; while (1) { j = j + 1; if (j > 2) { break; } s = s + 10; } s = s + 1; } s;"
+        ),
+        63
+    );
+}
+
+#[test]
+fn break_outside_loop_is_rejected() {
+    assert!(Engine::new().compile("break;").is_err());
+    assert!(Engine::new().compile("continue;").is_err());
 }
 
 #[test]

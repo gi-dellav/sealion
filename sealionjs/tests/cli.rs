@@ -87,6 +87,20 @@ fn prints_ir_without_running() {
 }
 
 #[test]
+fn runs_break_continue_and_undefined() {
+    let input = write_source(
+        "var i = 0; var s = 0;
+         while (i < 5) { i = i + 1; if (i === 3) { continue; } if (i > 4) { break; } s = s + i; }
+         if (s === undefined) { s = 0; }
+         void null;
+         s;",
+    );
+    let status = Command::new(bin()).arg(&input).status().unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
 fn reports_errors() {
     let input = write_source("var = ;");
     let output = Command::new(bin()).arg(&input).output().unwrap();

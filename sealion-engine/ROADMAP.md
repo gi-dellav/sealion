@@ -10,12 +10,12 @@
 
 ## 0.2.0
 
-- [ ] `undefined` type
-- [ ] `null` type
-- [ ] `typeof`
-- [ ] `void`
-- [ ] `break` statement
-- [ ] `continue` statement
+- [x] `undefined` type
+- [x] `null` type
+- [ ] `typeof` (moved to Later)
+- [x] `void`
+- [x] `break` statement
+- [x] `continue` statement
 
 ## 0.3.0
 
@@ -29,6 +29,7 @@
 
 ### Later
 
+- [ ] `typeof`
 - [ ] `Object` type
 - [ ] `array` type
 - [ ] `string` type
