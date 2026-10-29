@@ -48,6 +48,11 @@
 - [ ] `Math.clz32(), Math.imul(), Math.sign()`
 - [ ] `Math.PI, Math.E, Math.LN2, Math.LN10, Math.LOG2E, Math.LOG10E, Math.SQRT1_2, Math.SQRT2`
 
+## 0.6.0
+
+- [ ] `Slice(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`)
+- [ ] `string`, which are based on sealion's Slice; the compiler offers a `--string-length` to define the static length, by default 255
+
 ### Later
 
 - [ ] `typeof`
