@@ -34,30 +34,33 @@
 
 ## 0.5.0
 
-- [ ] `Number.isNaN(value)` (+ alias `isNaN`)
-- [ ] `Number.isFinite(value)` (+ alias `isFinite`)
-- [ ] `Number.isInteger(value)`
-- [ ] `Number.isSafeInteger(value)`
-- [ ] `Number.MAX_VALUE, Number.MIN_VALUE, Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, Number.EPSILON, Number.NaN, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY`
-- [ ] `Math.abs(), Math.ceil(), Math.floor(), Math.round(), Math.trunc(), Math.fround()`
-- [ ] `Math.min(a, b), Math.max(a, b)`
-- [ ] `Math.pow(), Math.sqrt(), Math.cbrt(), Math.exp(), Math.expm1(), Math.log(), Math.log10(), Math.log1p(), Math.log2()`
-- [ ] `Math.sin(), Math.cos(), Math.tan(), Math.asin(), Math.acos(), Math.atan(), Math.atan2(y, x), Math.sinh(), Math.cosh(), Math.tanh(), Math.asinh(), Math.acosh(), Math.atanh()`
-- [ ] `Math.clz32(), Math.imul(), Math.sign()`
-- [ ] `Math.PI, Math.E, Math.LN2, Math.LN10, Math.LOG2E, Math.LOG10E, Math.SQRT1_2, Math.SQRT2`
+- [x] `Number.isNaN(value)` (+ alias `isNaN`)
+- [x] `Number.isFinite(value)` (+ alias `isFinite`)
+- [x] `Number.isInteger(value)`
+- [x] `Number.isSafeInteger(value)`
+- [x] `Number.MAX_VALUE, Number.MIN_VALUE, Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, Number.EPSILON, Number.NaN, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY`
+- [x] `Math.abs(), Math.ceil(), Math.floor(), Math.round(), Math.trunc(), Math.fround()`
+- [x] `Math.min(a, b), Math.max(a, b)`
+- [x] `Math.pow(), Math.sqrt(), Math.cbrt(), Math.exp(), Math.expm1(), Math.log(), Math.log10(), Math.log1p(), Math.log2()`
+- [x] `Math.sin(), Math.cos(), Math.tan(), Math.asin(), Math.acos(), Math.atan(), Math.atan2(y, x), Math.sinh(), Math.cosh(), Math.tanh(), Math.asinh(), Math.acosh(), Math.atanh()`
+- [x] `Math.clz32(), Math.imul(), Math.sign()`
+- [x] `Math.PI, Math.E, Math.LN2, Math.LN10, Math.LOG2E, Math.LOG10E, Math.SQRT1_2, Math.SQRT2`
+
 
 ## 0.6.0
+
+- [ ] `switch, case, default`
+- [ ] `for` loops
+- [ ] `const` keyword
+
+## 0.7.0
 
 - [ ] `StaticArray(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`); inside the engine, it's a static container of `number` values
 - [ ] `Array`, JS's `array` type, based on sealion's StaticArray; the compiler offers a `--array-length` to define the static length, by default 1024
 - [ ] `string`, which are based on sealion's StaticArray; the compiler offers a `--string-length` to define the static length, by default 1024
 - [ ] `typeof` operand
 
-## 0.7.0
-
-- [ ] `switch, case, default`
-- [ ] `for` loops
-- [ ] `const` keyword
++ implementing `StaticArray` and dervied methods require `--staticjs`
 
 ### Later
 

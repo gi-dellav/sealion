@@ -8,7 +8,7 @@ use std::{
 use clap::Parser;
 use sealion_engine::Engine;
 
-/// Run or build the sealion 0.4.0 JavaScript subset.
+/// Run or build the sealion 0.5.0 JavaScript subset.
 #[derive(Debug, Parser)]
 #[command(name = "sealionjs", version, about)]
 struct Cli {

@@ -347,10 +347,7 @@ fn block_scope_does_not_leak() {
 
 #[test]
 fn block_scope_nested_blocks() {
-    assert_eq!(
-        run("let x = 1; { let x = 2; { let x = 3; } } x;"),
-        1
-    );
+    assert_eq!(run("let x = 1; { let x = 2; { let x = 3; } } x;"), 1);
     assert_eq!(
         run("let x = 0; { let y = 1; x = y + 1; { let z = 5; x = x + z; } x = x + y; } x;"),
         8
@@ -384,7 +381,10 @@ fn arrow_functions() {
     assert_eq!(run("var inc = (x) => x + 1; inc(4);"), 5);
     assert_eq!(run("var add = (a, b) => a + b; add(2, 3);"), 5);
     assert_eq!(run("var f = () => 9; f();"), 9);
-    assert_eq!(run("var f = (x) => { var y = x * 2; return y + 1; }; f(5);"), 11);
+    assert_eq!(
+        run("var f = (x) => { var y = x * 2; return y + 1; }; f(5);"),
+        11
+    );
     assert_eq!(run("var f = x => x; f(3);"), 3);
 }
 
@@ -395,7 +395,9 @@ fn arrow_functions_capture_closures() {
         8
     );
     assert_eq!(
-        run("function counter() { var n = 0; return () => { n = n + 1; return n; }; } var c = counter(); c(); c(); c();"),
+        run(
+            "function counter() { var n = 0; return () => { n = n + 1; return n; }; } var c = counter(); c(); c(); c();"
+        ),
         3
     );
     assert_eq!(
@@ -415,4 +417,164 @@ fn arrow_function_inside_block_scope() {
         8
     );
     assert_eq!(run("{ let a = 1; } var g = () => 2; g();"), 2);
+}
+
+#[test]
+fn number_predicates() {
+    assert_eq!(run("Number.isNaN(Number.NaN);"), 1);
+    assert_eq!(run("Number.isNaN(0 / 0);"), 1);
+    assert_eq!(run("Number.isNaN(1);"), 0);
+    assert_eq!(run("Number.isNaN(undefined);"), 0);
+    assert_eq!(run("Number.isNaN(null);"), 0);
+    assert_eq!(run("isNaN(0 / 0);"), 1);
+    assert_eq!(run("isNaN(4);"), 0);
+
+    assert_eq!(run("Number.isFinite(1);"), 1);
+    assert_eq!(run("Number.isFinite(Number.POSITIVE_INFINITY);"), 0);
+    assert_eq!(run("Number.isFinite(Number.NaN);"), 0);
+    assert_eq!(run("Number.isFinite(undefined);"), 0);
+    assert_eq!(run("isFinite(0 - 1);"), 1);
+    assert_eq!(run("isFinite(1 / 0);"), 0);
+
+    assert_eq!(run("Number.isInteger(3);"), 1);
+    assert_eq!(run("Number.isInteger(-3);"), 1);
+    assert_eq!(run("Number.isInteger(3.5);"), 0);
+    assert_eq!(run("Number.isInteger(Number.NaN);"), 0);
+    assert_eq!(run("Number.isInteger(1 / 0);"), 0);
+    assert_eq!(run("Number.isInteger(undefined);"), 0);
+
+    assert_eq!(run("Number.isSafeInteger(9007199254740991);"), 1);
+    assert_eq!(run("Number.isSafeInteger(9007199254740992);"), 0);
+    assert_eq!(run("Number.isSafeInteger(0.5);"), 0);
+}
+
+#[test]
+fn number_constants() {
+    assert_eq!(run("Number.MAX_VALUE > 1e308;"), 1);
+    assert_eq!(run("Number.MIN_VALUE > 0;"), 1);
+    assert_eq!(run("Number.MIN_VALUE < 1e-300;"), 1);
+    assert_eq!(run("Number.MAX_SAFE_INTEGER === 9007199254740991;"), 1);
+    assert_eq!(run("Number.MIN_SAFE_INTEGER === -9007199254740991;"), 1);
+    assert_eq!(run("Number.EPSILON > 0 && Number.EPSILON < 1e-15;"), 1);
+    assert_eq!(run("Number.NaN === Number.NaN;"), 0);
+    assert_eq!(run("Number.isNaN(Number.NaN);"), 1);
+    assert_eq!(run("Number.NEGATIVE_INFINITY < 0;"), 1);
+    assert_eq!(run("Number.POSITIVE_INFINITY > 1e308;"), 1);
+    assert_eq!(run("Number.POSITIVE_INFINITY === 1 / 0;"), 1);
+}
+
+#[test]
+fn math_rounding() {
+    assert_eq!(run("Math.abs(-3);"), 3);
+    assert_eq!(run("Math.abs(3);"), 3);
+    assert_eq!(run("Math.ceil(1.2);"), 2);
+    assert_eq!(run("Math.ceil(-1.2) === -1;"), 1);
+    assert_eq!(run("Math.floor(1.8);"), 1);
+    assert_eq!(run("Math.floor(-1.2) === -2;"), 1);
+    assert_eq!(run("Math.round(1.5);"), 2);
+    assert_eq!(run("Math.round(-1.5) === -1;"), 1);
+    assert_eq!(run("Math.round(2.4);"), 2);
+    assert_eq!(run("Math.round(-2.6) === -3;"), 1);
+    assert_eq!(run("Math.trunc(1.7);"), 1);
+    assert_eq!(run("Math.trunc(-1.7) === -1;"), 1);
+    assert_eq!(run("Math.fround(1.337) === 1.3370000123977661;"), 1);
+    assert_eq!(
+        run("Math.abs(Math.fround(0.1) - 0.10000000149011612) < 1e-20;"),
+        1
+    );
+}
+
+#[test]
+fn math_min_max() {
+    assert_eq!(run("Math.min(3, 1);"), 1);
+    assert_eq!(run("Math.max(3, 1);"), 3);
+    assert_eq!(run("Math.min(5);"), 5);
+    assert_eq!(run("Math.max(-1, -2, -3) === -1;"), 1);
+    assert_eq!(run("Math.min(1, 2, -3, 4) === -3;"), 1);
+    assert_eq!(run("Math.min() === Number.POSITIVE_INFINITY;"), 1);
+    assert_eq!(run("Math.max() === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("Number.isNaN(Math.max(1, 0 / 0));"), 1);
+    assert_eq!(run("Number.isNaN(Math.min(0 / 0, 1));"), 1);
+}
+
+#[test]
+fn math_powers_and_logs() {
+    assert_eq!(run("Math.pow(2, 10) === 1024;"), 1);
+    assert_eq!(run("Math.sqrt(16);"), 4);
+    assert_eq!(run("Math.abs(Math.sqrt(2) * Math.sqrt(2) - 2) < 1e-15;"), 1);
+    assert_eq!(run("Math.cbrt(27);"), 3);
+    assert_eq!(run("Math.exp(0);"), 1);
+    assert_eq!(run("Math.expm1(0);"), 0);
+    assert_eq!(run("Math.round(Math.log(Math.E));"), 1);
+    assert_eq!(run("Math.log1p(0);"), 0);
+    assert_eq!(run("Math.log2(8);"), 3);
+    assert_eq!(run("Math.log10(1000);"), 3);
+    assert_eq!(run("Math.abs(Math.LN2 - Math.log(2)) < 1e-15;"), 1);
+    assert_eq!(run("Math.abs(Math.LN10 - Math.log(10)) < 1e-15;"), 1);
+    assert_eq!(run("Math.abs(Math.LOG2E * Math.LN2 - 1) < 1e-15;"), 1);
+    assert_eq!(run("Math.abs(Math.LOG10E * Math.LN10 - 1) < 1e-15;"), 1);
+    assert_eq!(run("Math.abs(Math.SQRT1_2 - Math.sqrt(0.5)) < 1e-15;"), 1);
+    assert_eq!(run("Math.abs(Math.SQRT2 - Math.sqrt(2)) < 1e-15;"), 1);
+    assert_eq!(run("Math.PI > 3.14 && Math.PI < 3.15;"), 1);
+    assert_eq!(run("Math.E > 2.71 && Math.E < 2.72;"), 1);
+}
+
+#[test]
+fn math_trigonometry() {
+    assert_eq!(run("Math.sin(0);"), 0);
+    assert_eq!(run("Math.cos(0);"), 1);
+    assert_eq!(run("Math.tan(0);"), 0);
+    assert_eq!(run("Math.asin(0);"), 0);
+    assert_eq!(run("Math.acos(1);"), 0);
+    assert_eq!(run("Math.atan(0);"), 0);
+    assert_eq!(run("Math.round(Math.atan2(1, 1) * 4);"), 3);
+    assert_eq!(run("Math.sinh(0);"), 0);
+    assert_eq!(run("Math.cosh(0);"), 1);
+    assert_eq!(run("Math.tanh(0);"), 0);
+    assert_eq!(run("Math.asinh(0);"), 0);
+    assert_eq!(run("Math.acosh(1);"), 0);
+    assert_eq!(run("Math.atanh(0);"), 0);
+    assert_eq!(run("Math.abs(Math.sin(Math.PI)) < 1e-15;"), 1);
+    assert_eq!(
+        run("Math.abs(Math.tanh(1) - Math.sinh(1) / Math.cosh(1)) < 1e-15;"),
+        1
+    );
+}
+
+#[test]
+fn math_integer_helpers() {
+    assert_eq!(run("Math.clz32(1);"), 31);
+    assert_eq!(run("Math.clz32(0);"), 32);
+    assert_eq!(run("Math.clz32(-1);"), 0);
+    assert_eq!(run("Math.imul(3, 4);"), 12);
+    assert_eq!(run("Math.imul(-1, 5) === -5;"), 1);
+    assert_eq!(run("Math.imul(0xffffffff, 5) === -5;"), 1);
+    assert_eq!(run("Math.sign(-3) === -1;"), 1);
+    assert_eq!(run("Math.sign(3);"), 1);
+    assert_eq!(run("Math.sign(0);"), 0);
+    assert_eq!(run("Number.isNaN(Math.sign(0 / 0));"), 1);
+}
+
+#[test]
+fn builtins_in_expressions() {
+    assert_eq!(run("var x = -4; Math.abs(x) + Math.max(x, 2);"), 6);
+    assert_eq!(
+        run("function f(n) { return Math.floor(Math.sqrt(n)); } f(10);"),
+        3
+    );
+    assert_eq!(
+        run("var i = 0; var s = 0; while (i < 3) { s = s + Math.pow(2, i); i = i + 1; } s;"),
+        7
+    );
+    assert_eq!(run("Math.max(Number.isNaN(1) ? 1 : 5, 2);"), 5);
+}
+
+#[test]
+fn builtins_shadowing_and_errors() {
+    assert_eq!(run("var Math = 7; Math;"), 7);
+    assert!(Engine::new().compile("Math.abs;").is_err());
+    assert!(Engine::new().compile("Math.nope(1);").is_err());
+    assert!(Engine::new().compile("Number.PI;").is_err());
+    assert!(Engine::new().compile("var m = Math;").is_err());
+    assert!(Engine::new().compile("Math['abs'](1);").is_err());
 }

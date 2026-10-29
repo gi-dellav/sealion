@@ -1,4 +1,4 @@
-//! A small JavaScript-to-native compiler for the 0.4.0 roadmap subset.
+//! A small JavaScript-to-native compiler for the 0.5.0 roadmap subset.
 //!
 //! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
@@ -11,10 +11,10 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! The 0.4.0 subset supports functions (declarations, expressions and arrow
+//! The 0.5.0 subset supports functions (declarations, expressions and arrow
 //! functions), closures, variables with block scoping, `if`/`else`, `while`,
-//! `break`/`continue`, `return`, the `undefined`/`null` literals, and the
-//! following operators:
+//! `break`/`continue`, `return`, the `undefined`/`null` literals, the `Math`
+//! and `Number` namespaces, and the following operators:
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
@@ -54,9 +54,24 @@
 //! - `function` declarations hoist to the enclosing function even when written
 //!   in a block, so they cannot see that block's `let`/`const` bindings.
 //!
+//! `Math` and `Number` are namespaces, not objects: every member is either a
+//! compile-time constant or a builtin function, so `Math.PI` folds to a
+//! literal, `Math.sqrt` becomes a libm call and `Math.clz32` a few
+//! instructions. Consequences:
+//!
+//! - `Math` and `Number` cannot be used as values (`var m = Math` is
+//!   rejected), and only the dot notation reaches them.
+//! - A local binding named `Math`, `Number`, `isNaN` or `isFinite` shadows the
+//!   builtin for reads, but `Math.abs(x)` still resolves to the builtin.
+//! - `isNaN`/`isFinite` are aliases of `Number.isNaN`/`Number.isFinite` rather
+//!   than coercing their argument, because there are no strings to coerce yet.
+//! - `Math.round` rounds halves towards `+Infinity` and `Math.fround` rounds
+//!   through an `f32`; the rest call libm directly.
+//!
 //! `switch`, objects, arrays, and strings are intentionally deferred to later
 //! roadmap versions.
 
+mod builtins;
 mod compiler;
 mod error;
 mod plan;
@@ -119,6 +134,7 @@ impl Engine {
 
         let obj_builder = ObjectBuilder::new(isa, "sealion_module", default_libcall_names())?;
         let mut module = ObjectModule::new(obj_builder);
+        let builtins = builtins::Builtins::new(&mut module, &mut interner)?;
 
         let js_sig = compiler::make_js_signature(&module);
         let calloc_sig = compiler::make_calloc_signature(&module);
@@ -137,14 +153,18 @@ impl Engine {
 
         let main_id = module.declare_function("main", Linkage::Export, &main_sig)?;
 
+        let imports = compiler::Imports {
+            calloc: calloc_id,
+            pow: pow_id,
+            fmod: fmod_id,
+        };
         let mut functions = compiler::compile_functions(
             &mut module,
             &program,
             &func_ids,
             &js_sig,
-            calloc_id,
-            pow_id,
-            fmod_id,
+            &imports,
+            &builtins,
         )?;
         functions.push(compiler::compile_main(
             &mut module,

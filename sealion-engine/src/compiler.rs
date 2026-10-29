@@ -4,6 +4,7 @@ use boa_ast::{
     Declaration, Span, Spanned, Statement, StatementList, StatementListItem,
     expression::{
         Expression,
+        access::{PropertyAccess, PropertyAccessField, SimplePropertyAccess},
         literal::LiteralKind,
         operator::{
             assign::{AssignOp, AssignTarget},
@@ -24,6 +25,7 @@ use cranelift_object::ObjectModule;
 
 use crate::{
     Error, IrFunction,
+    builtins::{self, Builtins},
     plan::{Program, ScopeId, node_key, resolve},
     value,
 };
@@ -46,6 +48,13 @@ pub fn make_calloc_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
+pub fn make_f64_unary_signature<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
 pub fn make_f64_binary_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::F64));
@@ -62,14 +71,20 @@ pub fn make_main_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
+/// The libc entry points every compiled function may call.
+pub struct Imports {
+    pub calloc: FuncId,
+    pub pow: FuncId,
+    pub fmod: FuncId,
+}
+
 pub fn compile_functions(
     module: &mut ObjectModule,
     program: &Program,
     func_ids: &[FuncId],
     js_sig: &Signature,
-    calloc_id: FuncId,
-    pow_id: FuncId,
-    fmod_id: FuncId,
+    imports: &Imports,
+    builtins: &Builtins,
 ) -> Result<Vec<IrFunction>, Error> {
     let mut raws = Vec::new();
 
@@ -77,9 +92,10 @@ pub fn compile_functions(
         let mut func =
             Function::with_name_signature(UserFuncName::user(0, plan.id as u32), js_sig.clone());
 
-        let calloc_ref = module.declare_func_in_func(calloc_id, &mut func);
-        let pow_ref = module.declare_func_in_func(pow_id, &mut func);
-        let fmod_ref = module.declare_func_in_func(fmod_id, &mut func);
+        let calloc_ref = module.declare_func_in_func(imports.calloc, &mut func);
+        let pow_ref = module.declare_func_in_func(imports.pow, &mut func);
+        let fmod_ref = module.declare_func_in_func(imports.fmod, &mut func);
+        let builtin_refs = builtins.declare_in(module, &mut func);
         let mut child_refs = HashMap::new();
         for &child in plan.children.iter().chain(plan.nested.values()) {
             let child_ref = module.declare_func_in_func(func_ids[child], &mut func);
@@ -143,6 +159,8 @@ pub fn compile_functions(
             fmod_ref,
             js_sig_ref,
             child_refs: &child_refs,
+            builtins,
+            builtin_refs: &builtin_refs,
         };
 
         let mut loops = Vec::new();
@@ -218,6 +236,8 @@ struct CodegenCtx<'a> {
     fmod_ref: FuncRef,
     js_sig_ref: SigRef,
     child_refs: &'a HashMap<usize, FuncRef>,
+    builtins: &'a Builtins,
+    builtin_refs: &'a HashMap<&'static str, FuncRef>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -233,6 +253,8 @@ impl<'a> CodegenCtx<'a> {
             fmod_ref: self.fmod_ref,
             js_sig_ref: self.js_sig_ref,
             child_refs: self.child_refs,
+            builtins: self.builtins,
+            builtin_refs: self.builtin_refs,
         }
     }
 }
@@ -587,6 +609,7 @@ fn compile_expr(
         Expression::Call(call) => compile_call(builder, ctx, call),
         Expression::FunctionExpression(func) => compile_closure(builder, ctx, func.span()),
         Expression::ArrowFunction(arrow) => compile_closure(builder, ctx, arrow.span()),
+        Expression::PropertyAccess(access) => compile_property_access(builder, ctx, access),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
@@ -918,11 +941,91 @@ fn compile_update(
     Ok(result.unwrap_or(new_value))
 }
 
+/// True when `sym` is not bound in scope, i.e. it names a global builtin.
+fn is_free_global(ctx: &CodegenCtx<'_>, sym: Sym) -> bool {
+    resolve(ctx.program, ctx.scope, sym).is_none()
+}
+
+/// Recognises `Math.member` and `Number.member`.
+fn builtin_member(
+    ctx: &CodegenCtx<'_>,
+    access: &SimplePropertyAccess,
+) -> Option<(builtins::Namespace, &'static str)> {
+    let Expression::Identifier(id) = access.target() else {
+        return None;
+    };
+    if !is_free_global(ctx, id.sym()) {
+        return None;
+    }
+    let namespace = ctx.builtins.namespace(id.sym())?;
+    let PropertyAccessField::Const(field) = access.field() else {
+        return None;
+    };
+    Some((namespace, ctx.builtins.property(field.sym())?))
+}
+
+/// Compiles `Math.foo(...)` / `Number.foo(...)`, including the global `isNaN`
+/// and `isFinite` aliases.
+fn compile_builtin_call(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    namespace: builtins::Namespace,
+    name: &'static str,
+    args: &[Expression],
+) -> Result<Value, Error> {
+    if ctx.builtins.constant(namespace, name).is_some() {
+        return Err(Error::Unsupported(format!("{name} is not a function")));
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(compile_expr(builder, ctx, arg)?);
+    }
+    builtins::call(builder, ctx.builtin_refs, ctx.fmod_ref, name, &values)
+}
+
+/// Recognises a call to a builtin: `Math.foo(...)`, `Number.foo(...)` or the
+/// global `isNaN`/`isFinite` aliases.
+fn builtin_callee(
+    ctx: &CodegenCtx<'_>,
+    callee: &Expression,
+) -> Option<(builtins::Namespace, &'static str)> {
+    match callee {
+        Expression::PropertyAccess(PropertyAccess::Simple(access)) => builtin_member(ctx, access),
+        Expression::Identifier(id) if is_free_global(ctx, id.sym()) => ctx
+            .builtins
+            .alias(id.sym())
+            .map(|name| (builtins::Namespace::Number, name)),
+        _ => None,
+    }
+}
+
+fn compile_property_access(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    access: &PropertyAccess,
+) -> Result<Value, Error> {
+    let constant = match access {
+        PropertyAccess::Simple(simple) => builtin_member(ctx, simple)
+            .and_then(|(namespace, name)| ctx.builtins.constant(namespace, name)),
+        _ => None,
+    };
+    match constant {
+        Some(value) => Ok(builder.ins().f64const(value)),
+        None => Err(Error::Unsupported(
+            "only Math and Number constants can be read as properties".to_string(),
+        )),
+    }
+}
+
 fn compile_call(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     call: &boa_ast::expression::Call,
 ) -> Result<Value, Error> {
+    if let Some(builtin) = builtin_callee(ctx, call.function()) {
+        return compile_builtin_call(builder, ctx, builtin.0, builtin.1, call.args());
+    }
+
     if call.args().len() > MAX_ARGS {
         return Err(Error::Unsupported(format!(
             "calls with more than {MAX_ARGS} arguments are not supported"

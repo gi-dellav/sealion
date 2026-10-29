@@ -59,7 +59,7 @@ fn tag_of(builder: &mut FunctionBuilder, value: Value) -> Value {
     builder.ins().ushr_imm(bits, 48)
 }
 
-fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
+pub fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
     let tag = tag_of(builder, value);
     let low = builder.ins().iconst(types::I64, TAG_UNDEFINED as i64);
     let high = builder.ins().iconst(types::I64, TAG_FUNCTION as i64);
@@ -70,6 +70,28 @@ fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, tag, high);
     builder.ins().band(ge, le)
+}
+
+pub fn not_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let tagged = is_tagged(builder, value);
+    builder.ins().icmp_imm(IntCC::Equal, tagged, 0)
+}
+
+/// `true` when the value is a number that is `NaN`; tagged values are quiet
+/// NaNs too, so they have to be excluded explicitly.
+pub fn is_nan(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let unordered = builder.ins().fcmp(FloatCC::Unordered, value, value);
+    let number = not_tagged(builder, value);
+    builder.ins().band(unordered, number)
+}
+
+/// `true` for numbers that are neither `NaN` nor `±Infinity`.
+pub fn is_finite(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let abs = builder.ins().fabs(value);
+    let inf = builder.ins().f64const(f64::INFINITY);
+    let finite = builder.ins().fcmp(FloatCC::LessThan, abs, inf);
+    let number = not_tagged(builder, value);
+    builder.ins().band(finite, number)
 }
 
 pub fn from_bool(builder: &mut FunctionBuilder, value: Value) -> Value {

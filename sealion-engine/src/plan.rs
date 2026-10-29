@@ -15,6 +15,7 @@ use std::{collections::HashMap, rc::Rc};
 use boa_ast::{
     Declaration, Expression, Script, Span, Spanned, Statement, StatementList, StatementListItem,
     declaration::{Binding, VariableList},
+    expression::access::{PropertyAccess, PropertyAccessField},
     function::{FormalParameterList, FunctionBody, FunctionDeclaration},
 };
 use boa_interner::Sym;
@@ -370,6 +371,12 @@ impl Planner {
                 self.scan_expression(plan_id, scope, call.function())?;
                 for arg in call.args() {
                     self.scan_expression(plan_id, scope, arg)?;
+                }
+            }
+            Expression::PropertyAccess(PropertyAccess::Simple(simple)) => {
+                self.scan_expression(plan_id, scope, simple.target())?;
+                if let PropertyAccessField::Expr(field) = simple.field() {
+                    self.scan_expression(plan_id, scope, field)?;
                 }
             }
             _ => {}
