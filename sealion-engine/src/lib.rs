@@ -1,4 +1,4 @@
-//! A small JavaScript-to-native compiler for the 0.3.0 roadmap subset.
+//! A small JavaScript-to-native compiler for the 0.4.0 roadmap subset.
 //!
 //! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
@@ -11,9 +11,10 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! The 0.3.0 subset supports functions (named declarations), variables,
-//! `if`/`else`, `while`, `break`/`continue`, `return`, closures, the
-//! `undefined`/`null` literals, and the following operators:
+//! The 0.4.0 subset supports functions (declarations, expressions and arrow
+//! functions), closures, variables with block scoping, `if`/`else`, `while`,
+//! `break`/`continue`, `return`, the `undefined`/`null` literals, and the
+//! following operators:
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
@@ -35,8 +36,26 @@
 //! - Bitwise results are signed 32-bit values except for `>>>`, as per the spec.
 //! - String literals are rejected outright; strings arrive with the object work.
 //!
-//! Block scoping, anonymous/arrow functions, objects, arrays, and strings are
-//! intentionally deferred to later roadmap versions.
+//! Blocks are real lexical scopes: `let`/`const` shadow their enclosing scope
+//! and disappear at the closing brace, while `var` and function declarations
+//! hoist to the enclosing function. Each scope that owns bindings gets its own
+//! `calloc`ed environment record linked to its parent, so a closure captures
+//! whatever environment is current where the expression is evaluated (and a
+//! `let` inside a loop body yields a fresh environment per iteration).
+//!
+//! Consequences of the current environment model:
+//!
+//! - Environments are never freed; a block that runs in a loop allocates once
+//!   per iteration.
+//! - There is no temporal dead zone: a block-scoped binding reads as
+//!   `undefined` before its declaration executes.
+//! - Named function expressions ignore their inner name, so recursion has to go
+//!   through the assigned outer variable.
+//! - `function` declarations hoist to the enclosing function even when written
+//!   in a block, so they cannot see that block's `let`/`const` bindings.
+//!
+//! `switch`, objects, arrays, and strings are intentionally deferred to later
+//! roadmap versions.
 
 mod compiler;
 mod error;
@@ -85,7 +104,7 @@ impl Engine {
         let script = parser.parse_script(&scope, &mut interner)?;
 
         let undefined_sym = interner.get_or_intern("undefined");
-        let plans = build_program_plan(&script, undefined_sym)?;
+        let program = build_program_plan(&script, undefined_sym)?;
 
         let triple = Triple::host();
         let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
@@ -110,8 +129,8 @@ impl Engine {
         let pow_id = module.declare_function("pow", Linkage::Import, &f64_binary_sig)?;
         let fmod_id = module.declare_function("fmod", Linkage::Import, &f64_binary_sig)?;
 
-        let mut func_ids = Vec::with_capacity(plans.len());
-        for plan in &plans {
+        let mut func_ids = Vec::with_capacity(program.functions.len());
+        for plan in &program.functions {
             let id = module.declare_function(&plan.name, Linkage::Local, &js_sig)?;
             func_ids.push(id);
         }
@@ -120,7 +139,7 @@ impl Engine {
 
         let mut functions = compiler::compile_functions(
             &mut module,
-            &plans,
+            &program,
             &func_ids,
             &js_sig,
             calloc_id,

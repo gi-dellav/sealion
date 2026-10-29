@@ -331,3 +331,88 @@ fn loose_equality() {
     assert_eq!(run("1 != 2;"), 1);
     assert_eq!(run("null == null;"), 1);
 }
+
+#[test]
+fn block_scope_shadows() {
+    assert_eq!(run("var x = 1; { let x = 2; x = 3; } x;"), 1);
+    assert_eq!(run("let x = 1; { let x = 2; } x;"), 1);
+    assert_eq!(run("var x = 1; { var x = 2; } x;"), 2);
+}
+
+#[test]
+fn block_scope_does_not_leak() {
+    assert!(Engine::new().compile("{ let y = 1; } y;").is_err());
+    assert_eq!(run("var y = 0; { let y = 5; } y;"), 0);
+}
+
+#[test]
+fn block_scope_nested_blocks() {
+    assert_eq!(
+        run("let x = 1; { let x = 2; { let x = 3; } } x;"),
+        1
+    );
+    assert_eq!(
+        run("let x = 0; { let y = 1; x = y + 1; { let z = 5; x = x + z; } x = x + y; } x;"),
+        8
+    );
+}
+
+#[test]
+fn block_scope_per_iteration_capture() {
+    // Each iteration's `let` gets a fresh environment, so the closures keep
+    // distinct values.
+    assert_eq!(
+        run(
+            "var f = undefined; var g = undefined; var i = 0; while (i < 2) { let n = i; if (i === 0) { f = function () { return n; }; } else { g = function () { return n; }; } i = i + 1; } f() + g();"
+        ),
+        1
+    );
+}
+
+#[test]
+fn function_expressions() {
+    assert_eq!(run("var f = function (a) { return a + 1; }; f(2);"), 3);
+    assert_eq!(run("var f = function () { return 7; }; f();"), 7);
+    assert_eq!(
+        run("var add = function (a, b) { return a + b; }; add(2, 3);"),
+        5
+    );
+}
+
+#[test]
+fn arrow_functions() {
+    assert_eq!(run("var inc = (x) => x + 1; inc(4);"), 5);
+    assert_eq!(run("var add = (a, b) => a + b; add(2, 3);"), 5);
+    assert_eq!(run("var f = () => 9; f();"), 9);
+    assert_eq!(run("var f = (x) => { var y = x * 2; return y + 1; }; f(5);"), 11);
+    assert_eq!(run("var f = x => x; f(3);"), 3);
+}
+
+#[test]
+fn arrow_functions_capture_closures() {
+    assert_eq!(
+        run("function make(x) { return (y) => x + y; } var a = make(5); a(3);"),
+        8
+    );
+    assert_eq!(
+        run("function counter() { var n = 0; return () => { n = n + 1; return n; }; } var c = counter(); c(); c(); c();"),
+        3
+    );
+    assert_eq!(
+        run("function outer(x) { return () => { return () => x; }; } outer(7)()();"),
+        7
+    );
+    assert_eq!(
+        run("function apply(f, x) { return f(x); } apply((y) => y * 3, 4);"),
+        12
+    );
+}
+
+#[test]
+fn arrow_function_inside_block_scope() {
+    assert_eq!(
+        run("var f = undefined; { let a = 4; f = () => a * 2; } f();"),
+        8
+    );
+    assert_eq!(run("{ let a = 1; } var g = () => 2; g();"), 2);
+}

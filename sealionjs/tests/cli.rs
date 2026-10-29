@@ -116,3 +116,13 @@ fn runs_0_3_0_operators() {
     let _ = fs::remove_file(&input);
     assert_eq!(status.code(), Some(6));
 }
+
+#[test]
+fn runs_0_4_0_blocks_and_arrows() {
+    let input = write_source(
+        "let x = 1; { let x = 2; } var inc = (n) => n + x; inc(3);",
+    );
+    let status = Command::new(bin()).arg(&input).status().unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(4));
+}

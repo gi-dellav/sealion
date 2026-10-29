@@ -29,10 +29,8 @@
 
 ## 0.4.0
 
-- [ ] `switch, case, default` keywords
-- [ ] Block statements (`{ ... }`)
-- [ ] Anonymous functions
-- [ ] Array functions
+- [x] Block statements (`{ ... }`) — real block scoping, `let`/`const` shadow and do not leak
+- [x] Anonymous functions — function and arrow expressions, capturing closures
 
 ## 0.5.0
 
@@ -50,8 +48,16 @@
 
 ## 0.6.0
 
-- [ ] `Slice(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`)
-- [ ] `string`, which are based on sealion's Slice; the compiler offers a `--string-length` to define the static length, by default 255
+- [ ] `StaticArray(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`); inside the engine, it's a static container of `number` values
+- [ ] `Array`, JS's `array` type, based on sealion's StaticArray; the compiler offers a `--array-length` to define the static length, by default 1024
+- [ ] `string`, which are based on sealion's StaticArray; the compiler offers a `--string-length` to define the static length, by default 1024
+- [ ] `typeof` operand
+
+## 0.7.0
+
+- [ ] `switch, case, default`
+- [ ] `for` loops
+- [ ] `const` keyword
 
 ### Later
 
@@ -59,9 +65,6 @@
 - [ ] `Object` type
 - [ ] `array` type
 - [ ] `string` type
-
-- [ ] Anonymous functions
-- [ ] Array functions
 
 - [ ] `this` implementation
 - [ ] `__proto__` implementation

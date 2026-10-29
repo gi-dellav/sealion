@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use boa_ast::{
-    Declaration, Statement, StatementList, StatementListItem,
+    Declaration, Span, Spanned, Statement, StatementList, StatementListItem,
     expression::{
         Expression,
         literal::LiteralKind,
@@ -24,7 +24,7 @@ use cranelift_object::ObjectModule;
 
 use crate::{
     Error, IrFunction,
-    plan::{FunctionPlan, resolve},
+    plan::{Program, ScopeId, node_key, resolve},
     value,
 };
 
@@ -64,7 +64,7 @@ pub fn make_main_signature<M: Module>(module: &M) -> Signature {
 
 pub fn compile_functions(
     module: &mut ObjectModule,
-    plans: &[FunctionPlan],
+    program: &Program,
     func_ids: &[FuncId],
     js_sig: &Signature,
     calloc_id: FuncId,
@@ -73,7 +73,7 @@ pub fn compile_functions(
 ) -> Result<Vec<IrFunction>, Error> {
     let mut raws = Vec::new();
 
-    for plan in plans {
+    for plan in &program.functions {
         let mut func =
             Function::with_name_signature(UserFuncName::user(0, plan.id as u32), js_sig.clone());
 
@@ -81,7 +81,7 @@ pub fn compile_functions(
         let pow_ref = module.declare_func_in_func(pow_id, &mut func);
         let fmod_ref = module.declare_func_in_func(fmod_id, &mut func);
         let mut child_refs = HashMap::new();
-        for &child in &plan.children {
+        for &child in plan.children.iter().chain(plan.nested.values()) {
             let child_ref = module.declare_func_in_func(func_ids[child], &mut func);
             child_refs.insert(child, child_ref);
         }
@@ -96,16 +96,12 @@ pub fn compile_functions(
 
         let env_param = builder.block_params(entry)[0];
         let args_param = builder.block_params(entry)[1];
-        let env = alloc_env(&mut builder, calloc_ref, plan.slot_count(), env_param);
-
-        let undef = value::undefined(&mut builder);
-        for slot in 0..plan.slot_count() {
-            builder
-                .ins()
-                .store(MemFlags::new(), undef, env, (8 + 8 * slot) as i32);
-        }
+        let root_scope = program.scope(plan.root_scope);
+        let env = alloc_env(&mut builder, calloc_ref, root_scope.slot_count(), env_param);
+        init_slots(&mut builder, env, root_scope.slot_count());
 
         if !plan.is_script {
+            let undef = value::undefined(&mut builder);
             let len = builder
                 .ins()
                 .load(types::I64, MemFlags::new(), args_param, 0i32);
@@ -122,11 +118,11 @@ pub fn compile_functions(
         }
 
         for &child_id in &plan.children {
-            let child_plan = &plans[child_id];
+            let child_plan = program.function(child_id);
             let sym = child_plan
                 .binding_name
                 .ok_or_else(|| Error::Codegen("missing function binding".to_string()))?;
-            let slot = *plan
+            let slot = *root_scope
                 .bindings
                 .get(&sym)
                 .ok_or_else(|| Error::Codegen("missing function slot".to_string()))?;
@@ -138,13 +134,15 @@ pub fn compile_functions(
         }
 
         let ctx = CodegenCtx {
-            plans,
+            program,
             plan_id: plan.id,
+            scope: plan.root_scope,
             env,
             calloc_ref,
             pow_ref,
             fmod_ref,
             js_sig_ref,
+            child_refs: &child_refs,
         };
 
         let mut loops = Vec::new();
@@ -211,13 +209,32 @@ pub fn compile_main(
 }
 
 struct CodegenCtx<'a> {
-    plans: &'a [FunctionPlan],
+    program: &'a Program,
     plan_id: usize,
+    scope: ScopeId,
     env: Value,
     calloc_ref: FuncRef,
     pow_ref: FuncRef,
     fmod_ref: FuncRef,
     js_sig_ref: SigRef,
+    child_refs: &'a HashMap<usize, FuncRef>,
+}
+
+impl<'a> CodegenCtx<'a> {
+    /// The same function, entered through another scope's environment.
+    fn enter(&self, scope: ScopeId, env: Value) -> Self {
+        Self {
+            program: self.program,
+            plan_id: self.plan_id,
+            scope,
+            env,
+            calloc_ref: self.calloc_ref,
+            pow_ref: self.pow_ref,
+            fmod_ref: self.fmod_ref,
+            js_sig_ref: self.js_sig_ref,
+            child_refs: self.child_refs,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -257,6 +274,40 @@ fn new_closure(
     value::function(builder, ptr)
 }
 
+fn init_slots(builder: &mut FunctionBuilder, env: Value, slots: usize) {
+    let undef = value::undefined(builder);
+    for slot in 0..slots {
+        builder
+            .ins()
+            .store(MemFlags::new(), undef, env, (8 + 8 * slot) as i32);
+    }
+}
+
+/// Enters a block scope, allocating its environment when it owns bindings.
+fn compile_block(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    block: &boa_ast::statement::Block,
+    loops: &mut Vec<LoopTarget>,
+) -> Result<StmtOutcome, Error> {
+    let scope = *ctx
+        .program
+        .function(ctx.plan_id)
+        .blocks
+        .get(&node_key(block))
+        .ok_or_else(|| Error::Codegen("missing block scope".to_string()))?;
+    let plan = ctx.program.scope(scope);
+    if plan.allocated() {
+        let env = alloc_env(builder, ctx.calloc_ref, plan.slot_count(), ctx.env);
+        init_slots(builder, env, plan.slot_count());
+        let inner = ctx.enter(scope, env);
+        compile_statements(builder, &inner, block.statement_list(), loops)
+    } else {
+        let inner = ctx.enter(scope, ctx.env);
+        compile_statements(builder, &inner, block.statement_list(), loops)
+    }
+}
+
 struct LoopTarget {
     break_block: Block,
     continue_block: Block,
@@ -286,7 +337,7 @@ fn lvalue(
     ctx: &CodegenCtx<'_>,
     sym: Sym,
 ) -> Result<(Value, i32), Error> {
-    let (depth, slot) = resolve(ctx.plans, ctx.plan_id, sym)
+    let (depth, slot) = resolve(ctx.program, ctx.scope, sym)
         .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
     let mut ptr = ctx.env;
     for _ in 0..depth {
@@ -393,7 +444,7 @@ fn compile_statement(
     loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
     match stmt {
-        Statement::Block(block) => compile_statements(builder, ctx, block.statement_list(), loops),
+        Statement::Block(block) => compile_block(builder, ctx, block, loops),
         Statement::Var(var) => {
             compile_var_list(builder, ctx, &var.0)?;
             Ok(StmtOutcome::default())
@@ -534,6 +585,8 @@ fn compile_expr(
         Expression::Assign(assign) => compile_assign(builder, ctx, assign),
         Expression::Update(update) => compile_update(builder, ctx, update),
         Expression::Call(call) => compile_call(builder, ctx, call),
+        Expression::FunctionExpression(func) => compile_closure(builder, ctx, func.span()),
+        Expression::ArrowFunction(arrow) => compile_closure(builder, ctx, arrow.span()),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
@@ -900,4 +953,25 @@ fn compile_call(
         .ins()
         .call_indirect(ctx.js_sig_ref, code, &[captured_env, args_ptr]);
     Ok(builder.inst_results(call)[0])
+}
+
+/// Materialises a function or arrow expression as a closure over the current
+/// environment.
+fn compile_closure(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    span: Span,
+) -> Result<Value, Error> {
+    let child = *ctx
+        .program
+        .function(ctx.plan_id)
+        .nested
+        .get(&span)
+        .ok_or_else(|| Error::Codegen("missing anonymous function plan".to_string()))?;
+    let func_ref = *ctx
+        .child_refs
+        .get(&child)
+        .ok_or_else(|| Error::Codegen("missing anonymous function reference".to_string()))?;
+    let code = builder.ins().func_addr(types::I64, func_ref);
+    Ok(new_closure(builder, ctx.calloc_ref, code, ctx.env))
 }
