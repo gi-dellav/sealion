@@ -57,12 +57,17 @@ for src in "$ROOT"/testerjs/*.js; do
         continue
     fi
 
-    if "$out" >"$TMP/$name.run" 2>&1; then
-        ((passed++))
-        echo "OK   $name"
-    else
+    "$out" >"$TMP/$name.run" 2>&1
+    status=$?
+    # Exit code -1 (255 for the shell) is the only real failure; any other
+    # code is the test's own computed result.
+    if [ "$status" -eq 255 ]; then
         ((run_failed++))
-        echo "FAIL $name"
+        echo "FAIL $name (exit -1)"
+        sed 's/^/     | /' "$TMP/$name.run" >&2
+    else
+        ((passed++))
+        echo "OK   $name (exit $status)"
     fi
 done
 
