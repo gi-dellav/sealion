@@ -251,3 +251,83 @@ fn exponentiation() {
     assert_eq!(run("2 ** 2 ** 2;"), 16);
     assert_eq!(run("var x = 2; x **= 3; x;"), 8);
 }
+
+#[test]
+fn ternary_operator() {
+    assert_eq!(run("1 ? 2 : 3;"), 2);
+    assert_eq!(run("0 ? 2 : 3;"), 3);
+    assert_eq!(run("0 ? 1 : 0 ? 2 : 3;"), 3);
+    assert_eq!(run("var x = 0; 0 ? (x = 1) : (x = 2); x;"), 2);
+    assert_eq!(run("var x = 0; 1 ? (x = 1) : (x = 2); x;"), 1);
+}
+
+#[test]
+fn comma_operator_sequences() {
+    assert_eq!(run("var x = (1, 2); x;"), 2);
+    assert_eq!(run("var x = 0; var y = (x = 5, 7); x + y;"), 12);
+}
+
+#[test]
+fn nullish_coalescing() {
+    assert_eq!(run("null ?? 5;"), 5);
+    assert_eq!(run("undefined ?? 7;"), 7);
+    assert_eq!(run("0 ?? 5;"), 0);
+    assert_eq!(run("var x = 0; 1 ?? (x = 1); x;"), 0);
+    assert_eq!(run("var x = 0; null ?? (x = 1); x;"), 1);
+}
+
+#[test]
+fn bitwise_operators() {
+    assert_eq!(run("1 & 3;"), 1);
+    assert_eq!(run("1 | 4;"), 5);
+    assert_eq!(run("5 ^ 1;"), 4);
+    assert_eq!(run("1 << 4;"), 16);
+    assert_eq!(run("(-8 >> 2) === -2;"), 1);
+    assert_eq!(run("1 << 32;"), 1);
+    assert_eq!(run("(~0) === -1;"), 1);
+    assert_eq!(run("(~undefined) === -1;"), 1);
+    assert_eq!(run("(-1 >>> 0) === 4294967295;"), 1);
+    assert_eq!(run("(1e10 | 0) === 1410065408;"), 1);
+}
+
+#[test]
+fn assignment_operators() {
+    assert_eq!(run("var x = 7; x &= 3; x;"), 3);
+    assert_eq!(run("var x = 3; x |= 8; x;"), 11);
+    assert_eq!(run("var x = 6; x ^= 1; x;"), 7);
+    assert_eq!(run("var x = 1; x <<= 4; x;"), 16);
+    assert_eq!(run("var x = 64; x >>= 2; x;"), 16);
+    assert_eq!(run("var x = -1; (x >>>= 28) === 15;"), 1);
+    assert_eq!(run("var x = 2; x **= 3; x;"), 8);
+    assert_eq!(run("var x = 10; x %= 3; x;"), 1);
+}
+
+#[test]
+fn logical_assignment_operators() {
+    assert_eq!(run("var x = 0; x ||= 5; x;"), 5);
+    assert_eq!(run("var x = 1; x &&= 7; x;"), 7);
+    assert_eq!(run("var x = null; x ??= 3; x;"), 3);
+    assert_eq!(run("var x = 4; x ??= 3; x;"), 4);
+    assert_eq!(run("var a = 1; a ||= (a = 9); a;"), 1);
+    assert_eq!(run("var a = 0; a &&= (a = 9); a;"), 0);
+}
+
+#[test]
+fn compound_assignment_reads_old_value_first() {
+    assert_eq!(run("var x = 1; x += (x = 10); x;"), 11);
+    assert_eq!(run("var x = 1; x *= (x = 3); x;"), 3);
+}
+
+#[test]
+fn loose_equality() {
+    assert_eq!(run("null == undefined;"), 1);
+    assert_eq!(run("undefined == null;"), 1);
+    assert_eq!(run("null != undefined;"), 0);
+    assert_eq!(run("null === undefined;"), 0);
+    assert_eq!(run("0 == null;"), 0);
+    assert_eq!(run("undefined == 0;"), 0);
+    assert_eq!(run("1 == 1;"), 1);
+    assert_eq!(run("1 == 2;"), 0);
+    assert_eq!(run("1 != 2;"), 1);
+    assert_eq!(run("null == null;"), 1);
+}

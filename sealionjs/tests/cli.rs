@@ -108,3 +108,11 @@ fn reports_errors() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("sealionjs:"));
 }
+
+#[test]
+fn runs_0_3_0_operators() {
+    let input = write_source("var x = 1 ? (6 & 3) : 9; x |= 4; ~0 === -1 ? x : 0;");
+    let status = Command::new(bin()).arg(&input).status().unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(6));
+}

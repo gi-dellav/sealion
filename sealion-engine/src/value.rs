@@ -15,13 +15,16 @@
 //! documented deviation until the object string/prototype work lands.
 
 use cranelift_codegen::ir::{
-    InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
+    FuncRef, InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
 use cranelift_frontend::FunctionBuilder;
 
 pub const TAG_UNDEFINED: u64 = 0x7FF9;
 pub const TAG_NULL: u64 = 0x7FFA;
 pub const TAG_FUNCTION: u64 = 0x7FFD;
+
+/// `2**32`, the modulus used by `ToInt32`/`ToUint32`.
+const TWO_POW_32: f64 = 4_294_967_296.0;
 
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
@@ -98,4 +101,49 @@ pub fn strict_equal(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Va
     let either_tagged = builder.ins().bor(lhs_tagged, rhs_tagged);
     let result = builder.ins().select(either_tagged, bits_eq, num_eq);
     from_bool(builder, result)
+}
+
+/// `true` when the value is `undefined` or `null`.
+pub fn is_nullish(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let tag = tag_of(builder, value);
+    let undef = builder.ins().iconst(types::I64, TAG_UNDEFINED as i64);
+    let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+    let is_undef = builder.ins().icmp(IntCC::Equal, tag, undef);
+    let is_null = builder.ins().icmp(IntCC::Equal, tag, null);
+    builder.ins().bor(is_undef, is_null)
+}
+
+/// `==` for the current value domain (numbers, booleans, `undefined`, `null`,
+/// functions): strict equality plus `null == undefined`. Strings and objects
+/// would need coercions that do not exist yet.
+pub fn loose_equal(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+    let strict = strict_equal(builder, lhs, rhs);
+    let lhs_nullish = is_nullish(builder, lhs);
+    let rhs_nullish = is_nullish(builder, rhs);
+    let both_nullish = builder.ins().band(lhs_nullish, rhs_nullish);
+    let zero = builder.ins().f64const(0.0);
+    let strict_true = builder.ins().fcmp(FloatCC::OrderedNotEqual, strict, zero);
+    let result = builder.ins().bor(strict_true, both_nullish);
+    from_bool(builder, result)
+}
+
+/// ECMAScript `ToInt32`: `x` modulo `2**32`, truncated toward zero, reinterpreted
+/// as a two's-complement 32-bit integer. `fmod` yields `NaN` for `NaN`/`±Inf` and
+/// the saturating conversion maps `NaN` to `0`, exactly as the spec requires.
+/// Tagged values are quiet NaNs, so `undefined`, `null` and functions become `0`.
+pub fn to_int32(builder: &mut FunctionBuilder, fmod_ref: FuncRef, value: Value) -> Value {
+    let modulus = builder.ins().f64const(TWO_POW_32);
+    let call = builder.ins().call(fmod_ref, &[value, modulus]);
+    let remainder = builder.inst_results(call)[0];
+    let wide = builder.ins().fcvt_to_sint_sat(types::I64, remainder);
+    builder.ins().ireduce(types::I32, wide)
+}
+
+pub fn from_int32(builder: &mut FunctionBuilder, value: Value) -> Value {
+    builder.ins().fcvt_from_sint(types::F64, value)
+}
+
+pub fn from_uint32(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let wide = builder.ins().uextend(types::I64, value);
+    builder.ins().fcvt_from_uint(types::F64, wide)
 }

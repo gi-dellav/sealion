@@ -7,7 +7,7 @@ use boa_ast::{
         literal::LiteralKind,
         operator::{
             assign::{AssignOp, AssignTarget},
-            binary::{ArithmeticOp, BinaryOp, LogicalOp, RelationalOp},
+            binary::{ArithmeticOp, BinaryOp, BitwiseOp, LogicalOp, RelationalOp},
             unary::UnaryOp,
             update::{UpdateOp, UpdateTarget},
         },
@@ -46,7 +46,7 @@ pub fn make_calloc_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
-pub fn make_pow_signature<M: Module>(module: &M) -> Signature {
+pub fn make_f64_binary_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::F64));
     sig.params.push(AbiParam::new(types::F64));
@@ -69,6 +69,7 @@ pub fn compile_functions(
     js_sig: &Signature,
     calloc_id: FuncId,
     pow_id: FuncId,
+    fmod_id: FuncId,
 ) -> Result<Vec<IrFunction>, Error> {
     let mut raws = Vec::new();
 
@@ -78,6 +79,7 @@ pub fn compile_functions(
 
         let calloc_ref = module.declare_func_in_func(calloc_id, &mut func);
         let pow_ref = module.declare_func_in_func(pow_id, &mut func);
+        let fmod_ref = module.declare_func_in_func(fmod_id, &mut func);
         let mut child_refs = HashMap::new();
         for &child in &plan.children {
             let child_ref = module.declare_func_in_func(func_ids[child], &mut func);
@@ -141,6 +143,7 @@ pub fn compile_functions(
             env,
             calloc_ref,
             pow_ref,
+            fmod_ref,
             js_sig_ref,
         };
 
@@ -213,6 +216,7 @@ struct CodegenCtx<'a> {
     env: Value,
     calloc_ref: FuncRef,
     pow_ref: FuncRef,
+    fmod_ref: FuncRef,
     js_sig_ref: SigRef,
 }
 
@@ -258,21 +262,50 @@ struct LoopTarget {
     continue_block: Block,
 }
 
-fn call_pow(builder: &mut FunctionBuilder, pow_ref: FuncRef, lhs: Value, rhs: Value) -> Value {
-    let call = builder.ins().call(pow_ref, &[lhs, rhs]);
+fn call_f64_binary(
+    builder: &mut FunctionBuilder,
+    func_ref: FuncRef,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let call = builder.ins().call(func_ref, &[lhs, rhs]);
     builder.inst_results(call)[0]
 }
 
-fn load_var(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Value, Error> {
+fn call_pow(builder: &mut FunctionBuilder, pow_ref: FuncRef, lhs: Value, rhs: Value) -> Value {
+    call_f64_binary(builder, pow_ref, lhs, rhs)
+}
+
+fn call_fmod(builder: &mut FunctionBuilder, fmod_ref: FuncRef, lhs: Value, rhs: Value) -> Value {
+    call_f64_binary(builder, fmod_ref, lhs, rhs)
+}
+
+/// Resolves an identifier to the environment holding it and the slot offset.
+fn lvalue(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    sym: Sym,
+) -> Result<(Value, i32), Error> {
     let (depth, slot) = resolve(ctx.plans, ctx.plan_id, sym)
         .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
     let mut ptr = ctx.env;
     for _ in 0..depth {
         ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
     }
-    Ok(builder
-        .ins()
-        .load(types::F64, MemFlags::new(), ptr, (8 + 8 * slot) as i32))
+    Ok((ptr, (8 + 8 * slot) as i32))
+}
+
+fn load_at(builder: &mut FunctionBuilder, ptr: Value, offset: i32) -> Value {
+    builder.ins().load(types::F64, MemFlags::new(), ptr, offset)
+}
+
+fn store_at(builder: &mut FunctionBuilder, ptr: Value, offset: i32, value: Value) {
+    builder.ins().store(MemFlags::new(), value, ptr, offset);
+}
+
+fn load_var(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Value, Error> {
+    let (ptr, offset) = lvalue(builder, ctx, sym)?;
+    Ok(load_at(builder, ptr, offset))
 }
 
 fn store_var(
@@ -281,15 +314,8 @@ fn store_var(
     sym: Sym,
     value: Value,
 ) -> Result<(), Error> {
-    let (depth, slot) = resolve(ctx.plans, ctx.plan_id, sym)
-        .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
-    let mut ptr = ctx.env;
-    for _ in 0..depth {
-        ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
-    }
-    builder
-        .ins()
-        .store(MemFlags::new(), value, ptr, (8 + 8 * slot) as i32);
+    let (ptr, offset) = lvalue(builder, ctx, sym)?;
+    store_at(builder, ptr, offset, value);
     Ok(())
 }
 
@@ -503,6 +529,7 @@ fn compile_expr(
         Expression::Identifier(id) => load_var(builder, ctx, id.sym()),
         Expression::Parenthesized(paren) => compile_expr(builder, ctx, paren.expression()),
         Expression::Binary(binary) => compile_binary(builder, ctx, binary),
+        Expression::Conditional(conditional) => compile_conditional(builder, ctx, conditional),
         Expression::Unary(unary) => compile_unary(builder, ctx, unary),
         Expression::Assign(assign) => compile_assign(builder, ctx, assign),
         Expression::Update(update) => compile_update(builder, ctx, update),
@@ -537,44 +564,73 @@ fn compile_binary(
     ctx: &CodegenCtx<'_>,
     binary: &boa_ast::expression::operator::Binary,
 ) -> Result<Value, Error> {
+    if let BinaryOp::Logical(op) = binary.op() {
+        let lhs = compile_expr(builder, ctx, binary.lhs())?;
+        return compile_logical(builder, ctx, lhs, binary.rhs(), op);
+    }
+
+    let lhs = compile_expr(builder, ctx, binary.lhs())?;
+    let rhs = compile_expr(builder, ctx, binary.rhs())?;
     match binary.op() {
-        BinaryOp::Logical(LogicalOp::And) => {
-            let lhs = compile_expr(builder, ctx, binary.lhs())?;
-            compile_logical(builder, ctx, lhs, binary.rhs(), true)
-        }
-        BinaryOp::Logical(LogicalOp::Or) => {
-            let lhs = compile_expr(builder, ctx, binary.lhs())?;
-            compile_logical(builder, ctx, lhs, binary.rhs(), false)
-        }
-        op => {
-            let lhs = compile_expr(builder, ctx, binary.lhs())?;
-            let rhs = compile_expr(builder, ctx, binary.rhs())?;
-            match op {
-                BinaryOp::Arithmetic(arith) => compile_arithmetic(builder, ctx, arith, lhs, rhs),
-                BinaryOp::Relational(rel) => compile_relational(builder, rel, lhs, rhs),
-                BinaryOp::Comma => Ok(rhs),
-                other => Err(Error::Unsupported(format!(
-                    "binary operator not supported: {other:?}"
-                ))),
-            }
-        }
+        BinaryOp::Arithmetic(arith) => compile_arithmetic(builder, ctx, arith, lhs, rhs),
+        BinaryOp::Bitwise(bitwise) => Ok(compile_bitwise(builder, ctx, bitwise, lhs, rhs)),
+        BinaryOp::Relational(rel) => compile_relational(builder, rel, lhs, rhs),
+        BinaryOp::Comma => Ok(rhs),
+        other => Err(Error::Unsupported(format!(
+            "binary operator not supported: {other:?}"
+        ))),
     }
 }
 
+/// Compiles `cond ? if_true : if_false`, evaluating exactly one branch.
+fn compile_conditional(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    conditional: &boa_ast::expression::operator::Conditional,
+) -> Result<Value, Error> {
+    let cond_value = compile_expr(builder, ctx, conditional.condition())?;
+    let cond = value::truthy(builder, cond_value);
+
+    let result_var = builder.declare_var(types::F64);
+    let true_block = builder.create_block();
+    let false_block = builder.create_block();
+    let join_block = builder.create_block();
+    builder.ins().brif(cond, true_block, &[], false_block, &[]);
+
+    builder.switch_to_block(true_block);
+    let if_true = compile_expr(builder, ctx, conditional.if_true())?;
+    builder.def_var(result_var, if_true);
+    builder.ins().jump(join_block, &[]);
+
+    builder.switch_to_block(false_block);
+    let if_false = compile_expr(builder, ctx, conditional.if_false())?;
+    builder.def_var(result_var, if_false);
+    builder.ins().jump(join_block, &[]);
+
+    builder.switch_to_block(join_block);
+    Ok(builder.use_var(result_var))
+}
+
+/// The short-circuiting operators: `&&`, `||` and `??`.
 fn compile_logical(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     lhs: Value,
     rhs_expr: &Expression,
-    is_and: bool,
+    op: LogicalOp,
 ) -> Result<Value, Error> {
+    let (cond, rhs_when_true) = match op {
+        LogicalOp::And => (value::truthy(builder, lhs), true),
+        LogicalOp::Or => (value::truthy(builder, lhs), false),
+        LogicalOp::Coalesce => (value::is_nullish(builder, lhs), true),
+    };
+
     let result_var = builder.declare_var(types::F64);
     let rhs_block = builder.create_block();
     let join_block = builder.create_block();
 
     builder.def_var(result_var, lhs);
-    let cond = value::truthy(builder, lhs);
-    if is_and {
+    if rhs_when_true {
         builder.ins().brif(cond, rhs_block, &[], join_block, &[]);
     } else {
         builder.ins().brif(cond, join_block, &[], rhs_block, &[]);
@@ -601,15 +657,42 @@ fn compile_arithmetic(
         ArithmeticOp::Sub => builder.ins().fsub(lhs, rhs),
         ArithmeticOp::Mul => builder.ins().fmul(lhs, rhs),
         ArithmeticOp::Div => builder.ins().fdiv(lhs, rhs),
-        ArithmeticOp::Mod => {
-            let q = builder.ins().fdiv(lhs, rhs);
-            let t = builder.ins().trunc(q);
-            let m = builder.ins().fmul(t, rhs);
-            builder.ins().fsub(lhs, m)
-        }
+        ArithmeticOp::Mod => call_fmod(builder, ctx.fmod_ref, lhs, rhs),
         ArithmeticOp::Exp => call_pow(builder, ctx.pow_ref, lhs, rhs),
     };
     Ok(value)
+}
+
+/// Bitwise operators work on `ToInt32`/`ToUint32` views of the operands.
+fn compile_bitwise(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    op: BitwiseOp,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let lhs = value::to_int32(builder, ctx.fmod_ref, lhs);
+    let rhs = value::to_int32(builder, ctx.fmod_ref, rhs);
+
+    let result = match op {
+        BitwiseOp::And => builder.ins().band(lhs, rhs),
+        BitwiseOp::Or => builder.ins().bor(lhs, rhs),
+        BitwiseOp::Xor => builder.ins().bxor(lhs, rhs),
+        BitwiseOp::Shl => {
+            let shift = builder.ins().band_imm(rhs, 31);
+            builder.ins().ishl(lhs, shift)
+        }
+        BitwiseOp::Shr => {
+            let shift = builder.ins().band_imm(rhs, 31);
+            builder.ins().sshr(lhs, shift)
+        }
+        BitwiseOp::UShr => {
+            let shift = builder.ins().band_imm(rhs, 31);
+            let shifted = builder.ins().ushr(lhs, shift);
+            return value::from_uint32(builder, shifted);
+        }
+    };
+    value::from_int32(builder, result)
 }
 
 fn compile_relational(
@@ -619,11 +702,14 @@ fn compile_relational(
     rhs: Value,
 ) -> Result<Value, Error> {
     let cc = match op {
-        RelationalOp::Equal | RelationalOp::StrictEqual => {
-            return Ok(value::strict_equal(builder, lhs, rhs));
-        }
+        RelationalOp::Equal => return Ok(value::loose_equal(builder, lhs, rhs)),
+        RelationalOp::StrictEqual => return Ok(value::strict_equal(builder, lhs, rhs)),
         RelationalOp::NotEqual | RelationalOp::StrictNotEqual => {
-            let eq = value::strict_equal(builder, lhs, rhs);
+            let eq = if op == RelationalOp::NotEqual {
+                value::loose_equal(builder, lhs, rhs)
+            } else {
+                value::strict_equal(builder, lhs, rhs)
+            };
             let zero = builder.ins().f64const(0.0);
             let cmp = builder.ins().fcmp(FloatCC::Equal, eq, zero);
             return Ok(value::from_bool(builder, cmp));
@@ -657,6 +743,11 @@ fn compile_unary(
             let one = builder.ins().f64const(1.0);
             Ok(builder.ins().select(cond, zero, one))
         }
+        UnaryOp::Tilde => {
+            let int = value::to_int32(builder, ctx.fmod_ref, target);
+            let inverted = builder.ins().bxor_imm(int, -1);
+            Ok(value::from_int32(builder, inverted))
+        }
         UnaryOp::Void => Ok(value::undefined(builder)),
         other => Err(Error::Unsupported(format!(
             "unary operator not supported: {other:?}"
@@ -677,43 +768,75 @@ fn compile_assign(
             ));
         }
     };
+    let (ptr, offset) = lvalue(builder, ctx, sym)?;
+    let op = assign.op();
+
+    // The logical assignment operators only evaluate and store the right-hand
+    // side when the current value calls for it.
+    let short_circuit = match op {
+        AssignOp::BoolAnd => Some((true, true)),
+        AssignOp::BoolOr => Some((false, true)),
+        AssignOp::Coalesce => Some((true, false)),
+        _ => None,
+    };
+    if let Some((rhs_when_truthy, use_truthy)) = short_circuit {
+        let old = load_at(builder, ptr, offset);
+        let cond = if use_truthy {
+            value::truthy(builder, old)
+        } else {
+            value::is_nullish(builder, old)
+        };
+
+        let result_var = builder.declare_var(types::F64);
+        let rhs_block = builder.create_block();
+        let join_block = builder.create_block();
+        builder.def_var(result_var, old);
+        if rhs_when_truthy {
+            builder.ins().brif(cond, rhs_block, &[], join_block, &[]);
+        } else {
+            builder.ins().brif(cond, join_block, &[], rhs_block, &[]);
+        }
+
+        builder.switch_to_block(rhs_block);
+        let rhs = compile_expr(builder, ctx, assign.rhs())?;
+        store_at(builder, ptr, offset, rhs);
+        builder.def_var(result_var, rhs);
+        builder.ins().jump(join_block, &[]);
+
+        builder.switch_to_block(join_block);
+        return Ok(builder.use_var(result_var));
+    }
+
+    if op == AssignOp::Assign {
+        let rhs = compile_expr(builder, ctx, assign.rhs())?;
+        store_at(builder, ptr, offset, rhs);
+        return Ok(rhs);
+    }
+
+    // Compound assignment reads the old value before evaluating the right-hand
+    // side, matching the evaluation order of the specification.
+    let old = load_at(builder, ptr, offset);
     let rhs = compile_expr(builder, ctx, assign.rhs())?;
-    let value = match assign.op() {
-        AssignOp::Assign => rhs,
-        AssignOp::Add => {
-            let old = load_var(builder, ctx, sym)?;
-            builder.ins().fadd(old, rhs)
-        }
-        AssignOp::Sub => {
-            let old = load_var(builder, ctx, sym)?;
-            builder.ins().fsub(old, rhs)
-        }
-        AssignOp::Mul => {
-            let old = load_var(builder, ctx, sym)?;
-            builder.ins().fmul(old, rhs)
-        }
-        AssignOp::Div => {
-            let old = load_var(builder, ctx, sym)?;
-            builder.ins().fdiv(old, rhs)
-        }
-        AssignOp::Mod => {
-            let old = load_var(builder, ctx, sym)?;
-            let q = builder.ins().fdiv(old, rhs);
-            let t = builder.ins().trunc(q);
-            let m = builder.ins().fmul(t, rhs);
-            builder.ins().fsub(old, m)
-        }
-        AssignOp::Exp => {
-            let old = load_var(builder, ctx, sym)?;
-            call_pow(builder, ctx.pow_ref, old, rhs)
-        }
+    let value = match op {
+        AssignOp::Add => compile_arithmetic(builder, ctx, ArithmeticOp::Add, old, rhs)?,
+        AssignOp::Sub => compile_arithmetic(builder, ctx, ArithmeticOp::Sub, old, rhs)?,
+        AssignOp::Mul => compile_arithmetic(builder, ctx, ArithmeticOp::Mul, old, rhs)?,
+        AssignOp::Div => compile_arithmetic(builder, ctx, ArithmeticOp::Div, old, rhs)?,
+        AssignOp::Mod => compile_arithmetic(builder, ctx, ArithmeticOp::Mod, old, rhs)?,
+        AssignOp::Exp => compile_arithmetic(builder, ctx, ArithmeticOp::Exp, old, rhs)?,
+        AssignOp::And => compile_bitwise(builder, ctx, BitwiseOp::And, old, rhs),
+        AssignOp::Or => compile_bitwise(builder, ctx, BitwiseOp::Or, old, rhs),
+        AssignOp::Xor => compile_bitwise(builder, ctx, BitwiseOp::Xor, old, rhs),
+        AssignOp::Shl => compile_bitwise(builder, ctx, BitwiseOp::Shl, old, rhs),
+        AssignOp::Shr => compile_bitwise(builder, ctx, BitwiseOp::Shr, old, rhs),
+        AssignOp::Ushr => compile_bitwise(builder, ctx, BitwiseOp::UShr, old, rhs),
         other => {
             return Err(Error::Unsupported(format!(
                 "assignment operator not supported: {other:?}"
             )));
         }
     };
-    store_var(builder, ctx, sym, value)?;
+    store_at(builder, ptr, offset, value);
     Ok(value)
 }
 

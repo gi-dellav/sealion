@@ -1,4 +1,4 @@
-//! A small JavaScript-to-native compiler for the 0.2.0 roadmap subset.
+//! A small JavaScript-to-native compiler for the 0.3.0 roadmap subset.
 //!
 //! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
@@ -11,9 +11,15 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! The 0.2.0 subset supports functions (named declarations), variables,
-//! arithmetic, `if`/`else`, `while`, `break`/`continue`, `return`, closures,
-//! the `undefined`/`null` literals, and the `void` operator.
+//! The 0.3.0 subset supports functions (named declarations), variables,
+//! `if`/`else`, `while`, `break`/`continue`, `return`, closures, the
+//! `undefined`/`null` literals, and the following operators:
+//!
+//! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
+//! - bitwise `& | ^ ~ << >> >>>`,
+//! - logical `&& || ?? !` and the ternary `? :`,
+//! - comparison `=== !== == != < > <= >=`,
+//! - assignment `=` plus every compound form, including `&&=`, `||=` and `??=`.
 //!
 //! Values are NaN-boxed `f64`s: numbers are plain IEEE-754, while `undefined`,
 //! `null` and closures live in reserved quiet-NaN tag ranges.
@@ -21,8 +27,12 @@
 //!
 //! - `===`/`!==` distinguish the tagged values, but booleans are still plain
 //!   `0`/`1` numbers, so `true === 1` holds.
+//! - `==`/`!=` implement strict equality plus `null == undefined`; the coercions
+//!   that need strings or objects arrive with those types.
 //! - Arithmetic on tagged values yields a NaN rather than coercing, so
-//!   `undefined + 1` is not `NaN` by spec rules yet.
+//!   `undefined + 1` is not `NaN` by spec rules yet, while the bitwise operators
+//!   do convert through `ToInt32` (`undefined | 0` is `0`).
+//! - Bitwise results are signed 32-bit values except for `>>>`, as per the spec.
 //! - String literals are rejected outright; strings arrive with the object work.
 //!
 //! Block scoping, anonymous/arrow functions, objects, arrays, and strings are
@@ -93,11 +103,12 @@ impl Engine {
 
         let js_sig = compiler::make_js_signature(&module);
         let calloc_sig = compiler::make_calloc_signature(&module);
-        let pow_sig = compiler::make_pow_signature(&module);
+        let f64_binary_sig = compiler::make_f64_binary_signature(&module);
         let main_sig = compiler::make_main_signature(&module);
 
         let calloc_id = module.declare_function("calloc", Linkage::Import, &calloc_sig)?;
-        let pow_id = module.declare_function("pow", Linkage::Import, &pow_sig)?;
+        let pow_id = module.declare_function("pow", Linkage::Import, &f64_binary_sig)?;
+        let fmod_id = module.declare_function("fmod", Linkage::Import, &f64_binary_sig)?;
 
         let mut func_ids = Vec::with_capacity(plans.len());
         for plan in &plans {
@@ -114,6 +125,7 @@ impl Engine {
             &js_sig,
             calloc_id,
             pow_id,
+            fmod_id,
         )?;
         functions.push(compiler::compile_main(
             &mut module,

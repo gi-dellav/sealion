@@ -746,7 +746,7 @@ checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "sealion-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "boa_ast",
  "boa_interner",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "sealionjs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "sealion-engine",
