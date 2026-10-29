@@ -10,28 +10,36 @@
 
 ## 0.2.0
 
+- [ ] `undefined` type
+- [ ] `null` type
+- [ ] `typeof`
+- [ ] `void`
+- [ ] `break` statement
+- [ ] `continue` statement
+
+## 0.3.0
+
+- [ ] Ternary operator (`? :`)
+- [ ] Comma operator (`,`)
+- [ ] Arithmetic operators: `+, -, *, /, %, **, ++, --`
+- [ ] Bitwise operators: `&, |, ^, ~, <<, >>, >>>`
+- [ ] Logical operators: `&&, ||, ??, !`
+- [ ] Comparison operators: `===, !==, ==, !=, <, >, <=, >=`
+- [ ] Assignment operators: `=, +=, -=, *=, /=, %=, **=, <<=, >>=, >>>=, &=, ^=, |=, &&=, ||=, ??=`
+
+### Later
+
 - [ ] `Object` type
 - [ ] `array` type
 - [ ] `string` type
-- [ ] `undefined` type
-- [ ] `null` type
-- [ ] For loops
-
-## 0.3.0
 
 - [ ] Anonymous functions
 - [ ] Array functions
 
-## 0.4.0
-
 - [ ] `this` implementation
 - [ ] `__proto__` implementation
 
-## 0.5.0
-
 - [ ] `Math` module
 - [ ] `Date` module
-
-## 0.6.0
 
 - [ ] Error handling
