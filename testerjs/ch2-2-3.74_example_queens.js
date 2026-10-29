@@ -1,0 +1,1 @@
+length(queens(8));

@@ -1,0 +1,1 @@
+length(primitive_functions);
