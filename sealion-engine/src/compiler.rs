@@ -1,21 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use boa_ast::{
-    Declaration, Span, Spanned, Statement, StatementList, StatementListItem,
-    expression::{
-        Expression,
-        access::{PropertyAccess, PropertyAccessField, SimplePropertyAccess},
-        literal::LiteralKind,
-        operator::{
-            assign::{AssignOp, AssignTarget},
-            binary::{ArithmeticOp, BinaryOp, BitwiseOp, LogicalOp, RelationalOp},
-            unary::UnaryOp,
-            update::{UpdateOp, UpdateTarget},
-        },
-    },
-    statement::{Labelled, LabelledItem, iteration::ForLoopInitializer},
-};
-use boa_interner::Sym;
 use cranelift_codegen::ir::{
     AbiParam, Block, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature, TrapCode,
     UserFuncName, Value, condcodes::FloatCC, condcodes::IntCC, types,
@@ -23,6 +7,14 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};
 use cranelift_object::ObjectModule;
+use oxc_ast::ast::{
+    Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression,
+    BinaryOperator, BindingPattern, BlockStatement, CallExpression, ConditionalExpression,
+    DoWhileStatement, Expression, ForStatement, ForStatementInit, IfStatement, LabeledStatement,
+    LogicalOperator, SimpleAssignmentTarget, Statement, StaticMemberExpression, SwitchStatement,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
+    VariableDeclarationKind, WhileStatement,
+};
 
 use crate::{
     Error, IrFunction,
@@ -82,13 +74,13 @@ pub struct Imports {
     pub fmod: FuncId,
 }
 
-pub fn compile_functions(
+pub fn compile_functions<'a>(
     module: &mut ObjectModule,
-    program: &Program,
+    program: &'a Program<'a>,
     func_ids: &[FuncId],
     js_sig: &Signature,
     imports: &Imports,
-    builtins: &Builtins,
+    builtins: &'a Builtins,
 ) -> Result<Vec<IrFunction>, Error> {
     let numeric = analyze_numeric_bindings(program, builtins);
     let mut raws = Vec::new();
@@ -145,8 +137,8 @@ pub fn compile_functions(
             numeric: &numeric,
         };
 
-        if let Some(self_sym) = plan.self_binding {
-            store_var(&mut builder, &ctx, self_sym, self_param)?;
+        if let Some(self_name) = plan.self_binding {
+            store_var(&mut builder, &ctx, self_name, self_param)?;
         }
 
         if !plan.is_script {
@@ -166,22 +158,22 @@ pub fn compile_functions(
                     Some(init) => compile_default(&mut builder, &ctx, arg, init)?,
                     None => arg,
                 };
-                store_var(&mut builder, &ctx, param.sym, value)?;
+                store_var(&mut builder, &ctx, param.name, value)?;
             }
         }
 
         for &child_id in &plan.children {
             let child_plan = program.function(child_id);
-            let sym = child_plan
+            let name = child_plan
                 .binding_name
                 .ok_or_else(|| Error::Codegen("missing function binding".to_string()))?;
             let code = builder.ins().func_addr(types::I64, child_refs[&child_id]);
             let closure = new_closure(&mut builder, calloc_ref, code, ctx.env);
-            store_var(&mut builder, &ctx, sym, closure)?;
+            store_var(&mut builder, &ctx, name, closure)?;
         }
 
         let mut loops = Vec::new();
-        let out = compile_statements(&mut builder, &ctx, &plan.body, &mut loops)?;
+        let out = compile_statements(&mut builder, &ctx, plan.body, &mut loops)?;
         if !out.terminated {
             let ret = match out.last {
                 Some(value) => value,
@@ -247,59 +239,52 @@ pub fn compile_main(
 
 /// True when a builtin call always returns a plain number.
 fn numeric_builtin_call(
-    program: &Program,
+    program: &Program<'_>,
     builtins: &Builtins,
     scope: ScopeId,
-    call: &boa_ast::expression::Call,
+    call: &CallExpression<'_>,
 ) -> bool {
-    match call.function() {
-        Expression::PropertyAccess(PropertyAccess::Simple(access)) => {
-            let Expression::Identifier(id) = access.target() else {
+    match &call.callee {
+        Expression::StaticMemberExpression(access) => {
+            let Expression::Identifier(id) = &access.object else {
                 return false;
             };
-            if resolve_binding(program, scope, id.sym()).is_some() {
+            if resolve_binding(program, scope, id.name.as_str()).is_some() {
                 return false;
             }
-            let Some(namespace) = builtins.namespace(id.sym()) else {
+            let Some(namespace) = builtins.namespace(id.name.as_str()) else {
                 return false;
             };
-            let PropertyAccessField::Const(field) = access.field() else {
-                return false;
-            };
-            let Some(name) = builtins.property(field.sym()) else {
+            let Some(name) = builtins.property(access.property.name.as_str()) else {
                 return false;
             };
             builtins.has(namespace, name) && matches!(namespace, builtins::Namespace::Math)
         }
-        Expression::Identifier(id) if resolve_binding(program, scope, id.sym()).is_none() => {
-            matches!(builtins.global_function(id.sym()), Some("Number"))
+        Expression::Identifier(id)
+            if resolve_binding(program, scope, id.name.as_str()).is_none() =>
+        {
+            matches!(builtins.global_function(id.name.as_str()), Some("Number"))
         }
         _ => false,
     }
 }
 
 fn numeric_property(
-    program: &Program,
+    program: &Program<'_>,
     builtins: &Builtins,
     scope: ScopeId,
-    access: &PropertyAccess,
+    access: &StaticMemberExpression<'_>,
 ) -> bool {
-    let PropertyAccess::Simple(access) = access else {
+    let Expression::Identifier(id) = &access.object else {
         return false;
     };
-    let Expression::Identifier(id) = access.target() else {
-        return false;
-    };
-    if resolve_binding(program, scope, id.sym()).is_some() {
+    if resolve_binding(program, scope, id.name.as_str()).is_some() {
         return false;
     }
-    let Some(namespace) = builtins.namespace(id.sym()) else {
+    let Some(namespace) = builtins.namespace(id.name.as_str()) else {
         return false;
     };
-    let PropertyAccessField::Const(field) = access.field() else {
-        return false;
-    };
-    let Some(name) = builtins.property(field.sym()) else {
+    let Some(name) = builtins.property(access.property.name.as_str()) else {
         return false;
     };
     builtins.constant(namespace, name).is_some()
@@ -307,53 +292,60 @@ fn numeric_property(
 
 /// True when evaluating `expr` is guaranteed to produce an untagged number.
 fn known_number_expr(
-    program: &Program,
+    program: &Program<'_>,
     builtins: &Builtins,
     numeric: &HashSet<(ScopeId, usize)>,
     scope: ScopeId,
-    expr: &Expression,
+    expr: &Expression<'_>,
 ) -> bool {
     match expr {
-        Expression::Literal(lit) => {
-            matches!(lit.kind(), LiteralKind::Num(_) | LiteralKind::Int(_))
+        Expression::NumericLiteral(_) => true,
+        Expression::ParenthesizedExpression(paren) => {
+            known_number_expr(program, builtins, numeric, scope, &paren.expression)
         }
-        Expression::Parenthesized(paren) => {
-            known_number_expr(program, builtins, numeric, scope, paren.expression())
-        }
-        Expression::Identifier(id) => match resolve_binding(program, scope, id.sym()) {
+        Expression::Identifier(id) => match resolve_binding(program, scope, id.name.as_str()) {
             Some(key) => numeric.contains(&key),
-            None => builtins.global_constant(id.sym()).is_some(),
+            None => builtins.global_constant(id.name.as_str()).is_some(),
         },
-        Expression::Binary(binary) => match binary.op() {
-            BinaryOp::Arithmetic(_) | BinaryOp::Bitwise(_) => true,
-            BinaryOp::Comma => known_number_expr(program, builtins, numeric, scope, binary.rhs()),
-            _ => false,
-        },
-        Expression::Unary(unary) => {
-            matches!(unary.op(), UnaryOp::Minus | UnaryOp::Plus | UnaryOp::Tilde)
+        Expression::BinaryExpression(binary) => {
+            binary.operator.is_arithmetic() || binary.operator.is_bitwise()
         }
-        Expression::Conditional(conditional) => {
-            known_number_expr(program, builtins, numeric, scope, conditional.if_true())
-                && known_number_expr(program, builtins, numeric, scope, conditional.if_false())
+        Expression::UnaryExpression(unary) => matches!(
+            unary.operator,
+            UnaryOperator::UnaryPlus | UnaryOperator::UnaryNegation | UnaryOperator::BitwiseNot
+        ),
+        Expression::ConditionalExpression(conditional) => {
+            known_number_expr(program, builtins, numeric, scope, &conditional.consequent)
+                && known_number_expr(program, builtins, numeric, scope, &conditional.alternate)
         }
-        Expression::Assign(assign) => match assign.op() {
-            AssignOp::Assign => known_number_expr(program, builtins, numeric, scope, assign.rhs()),
-            AssignOp::BoolAnd | AssignOp::BoolOr | AssignOp::Coalesce => false,
+        Expression::AssignmentExpression(assign) => match assign.operator {
+            AssignmentOperator::Assign => {
+                known_number_expr(program, builtins, numeric, scope, &assign.right)
+            }
+            AssignmentOperator::LogicalAnd
+            | AssignmentOperator::LogicalOr
+            | AssignmentOperator::LogicalNullish => false,
             _ => true,
         },
-        Expression::Update(_) => true,
-        Expression::Call(call) => numeric_builtin_call(program, builtins, scope, call),
-        Expression::PropertyAccess(access) => numeric_property(program, builtins, scope, access),
+        Expression::UpdateExpression(_) => true,
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .is_some_and(|expr| known_number_expr(program, builtins, numeric, scope, expr)),
+        Expression::CallExpression(call) => numeric_builtin_call(program, builtins, scope, call),
+        Expression::StaticMemberExpression(access) => {
+            numeric_property(program, builtins, scope, access)
+        }
         _ => false,
     }
 }
 
-fn expr_is_number(ctx: &CodegenCtx<'_>, expr: &Expression) -> bool {
+fn expr_is_number<'a>(ctx: &CodegenCtx<'a>, expr: &Expression<'a>) -> bool {
     known_number_expr(ctx.program, ctx.builtins, ctx.numeric, ctx.scope, expr)
 }
 
-fn binding_is_number(ctx: &CodegenCtx<'_>, sym: Sym) -> bool {
-    resolve_binding(ctx.program, ctx.scope, sym).is_some_and(|key| ctx.numeric.contains(&key))
+fn binding_is_number(ctx: &CodegenCtx<'_>, name: &str) -> bool {
+    resolve_binding(ctx.program, ctx.scope, name).is_some_and(|key| ctx.numeric.contains(&key))
 }
 
 fn number_value(builder: &mut FunctionBuilder, value: Value, known: bool) -> Value {
@@ -367,15 +359,18 @@ fn number_value(builder: &mut FunctionBuilder, value: Value, known: bool) -> Val
 /// The value a write stores is numeric for plain assignments when the RHS is
 /// numeric, and always for arithmetic/bitwise compound assignments.
 fn assignment_write_is_numeric(
-    program: &Program,
+    program: &Program<'_>,
     builtins: &Builtins,
     numeric: &HashSet<(ScopeId, usize)>,
     scope: ScopeId,
-    op: AssignOp,
-    rhs: &Expression,
+    op: AssignmentOperator,
+    rhs: &Expression<'_>,
 ) -> bool {
     match op {
-        AssignOp::Assign | AssignOp::BoolAnd | AssignOp::BoolOr | AssignOp::Coalesce => {
+        AssignmentOperator::Assign
+        | AssignmentOperator::LogicalAnd
+        | AssignmentOperator::LogicalOr
+        | AssignmentOperator::LogicalNullish => {
             known_number_expr(program, builtins, numeric, scope, rhs)
         }
         _ => true,
@@ -383,21 +378,16 @@ fn assignment_write_is_numeric(
 }
 
 struct NumericWalker<'a> {
-    program: &'a Program,
+    program: &'a Program<'a>,
     builtins: &'a Builtins,
     numeric: &'a HashSet<(ScopeId, usize)>,
     removed: &'a mut HashSet<(ScopeId, usize)>,
 }
 
 impl<'a> NumericWalker<'a> {
-    fn statements(&mut self, plan_id: usize, scope: ScopeId, list: &StatementList) {
-        for item in list.statements() {
-            match item {
-                StatementListItem::Statement(stmt) => self.statement(plan_id, scope, stmt),
-                StatementListItem::Declaration(decl) => {
-                    self.declaration(plan_id, scope, decl);
-                }
-            }
+    fn statements(&mut self, plan_id: usize, scope: ScopeId, list: &[Statement<'a>]) {
+        for stmt in list {
+            self.statement(plan_id, scope, stmt);
         }
     }
 
@@ -410,173 +400,159 @@ impl<'a> NumericWalker<'a> {
             .unwrap_or(scope)
     }
 
-    fn declaration(&mut self, plan_id: usize, scope: ScopeId, decl: &Declaration) {
-        match decl {
-            Declaration::FunctionDeclaration(_) => {}
-            Declaration::Lexical(lex) => {
-                self.variable_list(plan_id, scope, lex.variable_list(), true);
-            }
-            _ => {}
-        }
-    }
-
-    fn variable_list(
-        &mut self,
-        plan_id: usize,
-        scope: ScopeId,
-        list: &boa_ast::declaration::VariableList,
-        lexical: bool,
-    ) {
-        for var in list.as_ref() {
-            let init = var.init();
-            if lexical {
-                if let boa_ast::declaration::Binding::Identifier(id) = var.binding() {
-                    if let Some(key) = resolve_binding(self.program, scope, id.sym()) {
-                        if self.numeric.contains(&key) {
-                            let numeric = init.is_some_and(|expr| {
-                                known_number_expr(
-                                    self.program,
-                                    self.builtins,
-                                    self.numeric,
-                                    scope,
-                                    expr,
-                                )
-                            });
-                            if !numeric {
-                                self.removed.insert(key);
-                            }
-                        }
-                    }
+    fn variable_list(&mut self, scope: ScopeId, decl: &VariableDeclaration<'a>) {
+        let lexical = decl.kind != VariableDeclarationKind::Var;
+        for var in &decl.declarations {
+            let init = &var.init;
+            if lexical
+                && let BindingPattern::BindingIdentifier(id) = &var.id
+                && let Some(key) = resolve_binding(self.program, scope, id.name.as_str())
+                && self.numeric.contains(&key)
+            {
+                let numeric = init.as_ref().is_some_and(|expr| {
+                    known_number_expr(self.program, self.builtins, self.numeric, scope, expr)
+                });
+                if !numeric {
+                    self.removed.insert(key);
                 }
             }
             if let Some(expr) = init {
-                self.expr(plan_id, scope, expr);
+                self.expr(scope, expr);
             }
         }
     }
 
-    fn statement(&mut self, plan_id: usize, scope: ScopeId, stmt: &Statement) {
+    fn statement(&mut self, plan_id: usize, scope: ScopeId, stmt: &Statement<'a>) {
         match stmt {
-            Statement::Block(block) => {
-                let inner = self.node_scope(plan_id, scope, node_key(block));
-                self.statements(plan_id, inner, block.statement_list());
+            Statement::BlockStatement(block) => {
+                let inner = self.node_scope(plan_id, scope, node_key(&**block));
+                self.statements(plan_id, inner, block.body.as_slice());
             }
-            Statement::Var(var) => {
-                self.variable_list(plan_id, scope, &var.0, false);
+            Statement::VariableDeclaration(decl) => {
+                self.variable_list(scope, decl);
             }
-            Statement::Expression(expr) => self.expr(plan_id, scope, expr),
-            Statement::If(if_stmt) => {
-                self.expr(plan_id, scope, if_stmt.cond());
-                self.statement(plan_id, scope, if_stmt.body());
-                if let Some(else_node) = if_stmt.else_node() {
+            Statement::ExpressionStatement(expr) => self.expr(scope, &expr.expression),
+            Statement::IfStatement(if_stmt) => {
+                self.expr(scope, &if_stmt.test);
+                self.statement(plan_id, scope, &if_stmt.consequent);
+                if let Some(else_node) = &if_stmt.alternate {
                     self.statement(plan_id, scope, else_node);
                 }
             }
-            Statement::WhileLoop(while_stmt) => {
-                self.expr(plan_id, scope, while_stmt.condition());
-                self.statement(plan_id, scope, while_stmt.body());
+            Statement::WhileStatement(while_stmt) => {
+                self.expr(scope, &while_stmt.test);
+                self.statement(plan_id, scope, &while_stmt.body);
             }
-            Statement::DoWhileLoop(do_while) => {
-                self.statement(plan_id, scope, do_while.body());
-                self.expr(plan_id, scope, do_while.cond());
+            Statement::DoWhileStatement(do_while) => {
+                self.statement(plan_id, scope, &do_while.body);
+                self.expr(scope, &do_while.test);
             }
-            Statement::ForLoop(for_stmt) => {
+            Statement::ForStatement(for_stmt) => {
                 let mut loop_scope = scope;
-                match for_stmt.init() {
-                    Some(ForLoopInitializer::Lexical(lex)) => {
-                        loop_scope = self.node_scope(plan_id, scope, node_key(for_stmt));
-                        self.variable_list(
-                            plan_id,
-                            loop_scope,
-                            lex.declaration().variable_list(),
-                            true,
-                        );
+                match &for_stmt.init {
+                    Some(ForStatementInit::VariableDeclaration(decl))
+                        if decl.kind != VariableDeclarationKind::Var =>
+                    {
+                        loop_scope = self.node_scope(plan_id, scope, node_key(&**for_stmt));
+                        self.variable_list(loop_scope, decl);
                     }
-                    Some(ForLoopInitializer::Var(var)) => {
-                        self.variable_list(plan_id, loop_scope, &var.0, false);
+                    Some(ForStatementInit::VariableDeclaration(decl)) => {
+                        self.variable_list(loop_scope, decl);
                     }
-                    Some(ForLoopInitializer::Expression(expr)) => {
-                        self.expr(plan_id, loop_scope, expr);
+                    Some(init) => {
+                        if let Some(expr) = init.as_expression() {
+                            self.expr(loop_scope, expr);
+                        }
                     }
                     None => {}
                 }
-                if let Some(condition) = for_stmt.condition() {
-                    self.expr(plan_id, loop_scope, condition);
+                if let Some(condition) = &for_stmt.test {
+                    self.expr(loop_scope, condition);
                 }
-                if let Some(update) = for_stmt.final_expr() {
-                    self.expr(plan_id, loop_scope, update);
+                if let Some(update) = &for_stmt.update {
+                    self.expr(loop_scope, update);
                 }
-                self.statement(plan_id, loop_scope, for_stmt.body());
+                self.statement(plan_id, loop_scope, &for_stmt.body);
             }
-            Statement::Switch(switch_stmt) => {
-                let inner = self.node_scope(plan_id, scope, node_key(switch_stmt));
-                self.expr(plan_id, scope, switch_stmt.val());
-                for case in switch_stmt.cases() {
-                    if let Some(condition) = case.condition() {
-                        self.expr(plan_id, inner, condition);
+            Statement::SwitchStatement(switch_stmt) => {
+                let inner = self.node_scope(plan_id, scope, node_key(&**switch_stmt));
+                self.expr(scope, &switch_stmt.discriminant);
+                for case in &switch_stmt.cases {
+                    if let Some(condition) = &case.test {
+                        self.expr(inner, condition);
                     }
-                    self.statements(plan_id, inner, case.body());
+                    self.statements(plan_id, inner, case.consequent.as_slice());
                 }
             }
-            Statement::Return(ret) => {
-                if let Some(target) = ret.target() {
-                    self.expr(plan_id, scope, target);
+            Statement::ReturnStatement(ret) => {
+                if let Some(target) = &ret.argument {
+                    self.expr(scope, target);
                 }
             }
-            Statement::Labelled(labelled) => {
-                if let LabelledItem::Statement(inner) = labelled.item() {
-                    self.statement(plan_id, scope, inner);
-                }
+            Statement::LabeledStatement(labelled) => {
+                self.statement(plan_id, scope, &labelled.body);
             }
             _ => {}
         }
     }
 
-    fn expr(&mut self, plan_id: usize, scope: ScopeId, expr: &Expression) {
+    fn expr(&mut self, scope: ScopeId, expr: &Expression<'a>) {
         match expr {
-            Expression::Parenthesized(paren) => self.expr(plan_id, scope, paren.expression()),
-            Expression::Binary(binary) => {
-                self.expr(plan_id, scope, binary.lhs());
-                self.expr(plan_id, scope, binary.rhs());
+            Expression::ParenthesizedExpression(paren) => {
+                self.expr(scope, &paren.expression);
             }
-            Expression::Unary(unary) => self.expr(plan_id, scope, unary.target()),
-            Expression::Conditional(conditional) => {
-                self.expr(plan_id, scope, conditional.condition());
-                self.expr(plan_id, scope, conditional.if_true());
-                self.expr(plan_id, scope, conditional.if_false());
+            Expression::BinaryExpression(binary) => {
+                self.expr(scope, &binary.left);
+                self.expr(scope, &binary.right);
             }
-            Expression::Assign(assign) => {
-                if let AssignTarget::Identifier(id) = assign.lhs() {
-                    if let Some(key) = resolve_binding(self.program, scope, id.sym()) {
-                        if self.numeric.contains(&key)
-                            && !assignment_write_is_numeric(
-                                self.program,
-                                self.builtins,
-                                self.numeric,
-                                scope,
-                                assign.op(),
-                                assign.rhs(),
-                            )
-                        {
-                            self.removed.insert(key);
-                        }
+            Expression::LogicalExpression(logical) => {
+                self.expr(scope, &logical.left);
+                self.expr(scope, &logical.right);
+            }
+            Expression::UnaryExpression(unary) => self.expr(scope, &unary.argument),
+            Expression::ConditionalExpression(conditional) => {
+                self.expr(scope, &conditional.test);
+                self.expr(scope, &conditional.consequent);
+                self.expr(scope, &conditional.alternate);
+            }
+            Expression::AssignmentExpression(assign) => {
+                if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
+                    && let Some(key) = resolve_binding(self.program, scope, id.name.as_str())
+                    && self.numeric.contains(&key)
+                    && !assignment_write_is_numeric(
+                        self.program,
+                        self.builtins,
+                        self.numeric,
+                        scope,
+                        assign.operator,
+                        &assign.right,
+                    )
+                {
+                    self.removed.insert(key);
+                }
+                self.expr(scope, &assign.right);
+            }
+            Expression::SequenceExpression(sequence) => {
+                for expr in &sequence.expressions {
+                    self.expr(scope, expr);
+                }
+            }
+            Expression::CallExpression(call) => {
+                self.expr(scope, &call.callee);
+                for arg in &call.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.expr(scope, expr);
                     }
                 }
-                self.expr(plan_id, scope, assign.rhs());
             }
-            Expression::Call(call) => {
-                self.expr(plan_id, scope, call.function());
-                for arg in call.args() {
-                    self.expr(plan_id, scope, arg);
-                }
+            Expression::StaticMemberExpression(simple) => {
+                self.expr(scope, &simple.object);
             }
-            Expression::PropertyAccess(PropertyAccess::Simple(simple)) => {
-                self.expr(plan_id, scope, simple.target());
-                if let PropertyAccessField::Expr(field) = simple.field() {
-                    self.expr(plan_id, scope, field);
-                }
+            Expression::ComputedMemberExpression(computed) => {
+                self.expr(scope, &computed.object);
+                self.expr(scope, &computed.expression);
             }
-            Expression::FunctionExpression(_) | Expression::ArrowFunction(_) => {}
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {}
             _ => {}
         }
     }
@@ -585,7 +561,10 @@ impl<'a> NumericWalker<'a> {
 /// Greatest fixed point of bindings that always hold numbers. Only lexical
 /// bindings are considered: `var` can be read as `undefined` before its
 /// initializer, and parameters may be missing.
-fn analyze_numeric_bindings(program: &Program, builtins: &Builtins) -> HashSet<(ScopeId, usize)> {
+fn analyze_numeric_bindings<'a>(
+    program: &'a Program<'a>,
+    builtins: &'a Builtins,
+) -> HashSet<(ScopeId, usize)> {
     let mut numeric = HashSet::new();
     for (index, scope) in program.scopes.iter().enumerate() {
         for &slot in &scope.tdz {
@@ -594,7 +573,7 @@ fn analyze_numeric_bindings(program: &Program, builtins: &Builtins) -> HashSet<(
     }
     for plan in &program.functions {
         for param in &plan.params {
-            if let Some(key) = resolve_binding(program, plan.root_scope, param.sym) {
+            if let Some(key) = resolve_binding(program, plan.root_scope, param.name) {
                 numeric.remove(&key);
             }
         }
@@ -610,11 +589,11 @@ fn analyze_numeric_bindings(program: &Program, builtins: &Builtins) -> HashSet<(
                 removed: &mut removed,
             };
             for param in &plan.params {
-                if let Some(init) = &param.init {
-                    walker.expr(plan.id, plan.root_scope, init);
+                if let Some(init) = param.init {
+                    walker.expr(plan.root_scope, init);
                 }
             }
-            walker.statements(plan.id, plan.root_scope, &plan.body);
+            walker.statements(plan.id, plan.root_scope, plan.body);
         }
         if removed.is_empty() {
             break;
@@ -628,7 +607,7 @@ fn analyze_numeric_bindings(program: &Program, builtins: &Builtins) -> HashSet<(
 
 #[derive(Clone, Copy)]
 struct CodegenCtx<'a> {
-    program: &'a Program,
+    program: &'a Program<'a>,
     plan_id: usize,
     scope: ScopeId,
     env: Value,
@@ -701,7 +680,7 @@ fn new_closure(
     value::function(builder, ptr)
 }
 
-fn init_slots(builder: &mut FunctionBuilder, env: Value, scope: &ScopePlan) {
+fn init_slots(builder: &mut FunctionBuilder, env: Value, scope: &ScopePlan<'_>) {
     for slot in 0..scope.slot_count() {
         let initial = if scope.tdz.contains(&slot) {
             value::uninitialized(builder)
@@ -718,7 +697,7 @@ fn init_slots(builder: &mut FunctionBuilder, env: Value, scope: &ScopePlan) {
 /// not captured by a closure.
 fn declare_vars(
     builder: &mut FunctionBuilder,
-    program: &Program,
+    program: &Program<'_>,
     plan_id: usize,
 ) -> HashMap<(ScopeId, usize), Variable> {
     let mut vars = HashMap::new();
@@ -736,7 +715,7 @@ fn init_local_slots(
     builder: &mut FunctionBuilder,
     vars: &HashMap<(ScopeId, usize), Variable>,
     scope_id: ScopeId,
-    scope: &ScopePlan,
+    scope: &ScopePlan<'_>,
 ) {
     for slot in 0..scope.slot_count() {
         let initial = if scope.tdz.contains(&slot) {
@@ -750,11 +729,11 @@ fn init_local_slots(
 }
 
 /// Evaluates a parameter initializer only when the argument is `undefined`.
-fn compile_default(
+fn compile_default<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
+    ctx: &CodegenCtx<'a>,
     arg: Value,
-    init: &Expression,
+    init: &'a Expression<'a>,
 ) -> Result<Value, Error> {
     let missing = value::is_undefined(builder, arg);
     let result_var = builder.declare_var(types::F64);
@@ -821,33 +800,33 @@ fn copy_env(
 }
 
 /// Enters a block scope, allocating its environment when it owns bindings.
-fn compile_block(
+fn compile_block<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    block: &boa_ast::statement::Block,
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    block: &'a BlockStatement<'a>,
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     let scope = node_scope(ctx, node_key(block))?;
     let inner = enter_scope(builder, ctx, scope);
-    compile_statements(builder, &inner, block.statement_list(), loops)
+    compile_statements(builder, &inner, block.body.as_slice(), loops)
 }
 
-struct LoopTarget {
-    labels: Vec<Sym>,
+struct LoopTarget<'a> {
+    labels: Vec<&'a str>,
     break_block: Block,
     continue_block: Option<Block>,
     /// `break;` without a label may target this entry (loops and `switch`).
     breakable: bool,
 }
 
-fn break_target(loops: &[LoopTarget], label: Option<Sym>) -> Result<Block, Error> {
+fn break_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<Block, Error> {
     if let Some(label) = label {
         loops
             .iter()
             .rev()
             .find(|target| target.labels.contains(&label))
             .map(|target| target.break_block)
-            .ok_or_else(|| Error::Scope(format!("unknown break label: {label:?}")))
+            .ok_or_else(|| Error::Scope(format!("unknown break label: {label}")))
     } else {
         loops
             .iter()
@@ -858,13 +837,13 @@ fn break_target(loops: &[LoopTarget], label: Option<Sym>) -> Result<Block, Error
     }
 }
 
-fn continue_target(loops: &[LoopTarget], label: Option<Sym>) -> Result<Block, Error> {
+fn continue_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<Block, Error> {
     if let Some(label) = label {
         let target = loops
             .iter()
             .rev()
             .find(|target| target.labels.contains(&label))
-            .ok_or_else(|| Error::Scope(format!("unknown continue label: {label:?}")))?;
+            .ok_or_else(|| Error::Scope(format!("unknown continue label: {label}")))?;
         target
             .continue_block
             .ok_or_else(|| Error::Scope("continue label does not target a loop".to_string()))
@@ -903,12 +882,12 @@ enum Place {
 
 /// Resolves an identifier to either a slot in an environment record or a
 /// register-backed local variable.
-fn place(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Place, Error> {
-    let (home, slot) = resolve_binding(ctx.program, ctx.scope, sym)
-        .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
+fn place(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, name: &str) -> Result<Place, Error> {
+    let (home, slot) = resolve_binding(ctx.program, ctx.scope, name)
+        .ok_or_else(|| Error::Scope(format!("unresolved identifier: {name}")))?;
     if ctx.program.scope(home).has_env() {
-        let (depth, _) = resolve(ctx.program, ctx.scope, sym)
-            .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
+        let (depth, _) = resolve(ctx.program, ctx.scope, name)
+            .ok_or_else(|| Error::Scope(format!("unresolved identifier: {name}")))?;
         let mut ptr = ctx.env;
         for _ in 0..depth {
             ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
@@ -955,10 +934,14 @@ fn check_tdz(builder: &mut FunctionBuilder, value: Value) {
         .trapnz(uninitialized, TrapCode::unwrap_user(1));
 }
 
-fn load_var(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Value, Error> {
-    let place = place(builder, ctx, sym)?;
+fn load_var(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    name: &str,
+) -> Result<Value, Error> {
+    let place = place(builder, ctx, name)?;
     let value = load_place(builder, place);
-    if needs_tdz_check(ctx.program, ctx.scope, sym) {
+    if needs_tdz_check(ctx.program, ctx.scope, name) {
         check_tdz(builder, value);
     }
     Ok(value)
@@ -967,26 +950,23 @@ fn load_var(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Re
 fn store_var(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
-    sym: Sym,
+    name: &str,
     value: Value,
 ) -> Result<(), Error> {
-    let place = place(builder, ctx, sym)?;
+    let place = place(builder, ctx, name)?;
     store_place(builder, place, value);
     Ok(())
 }
 
-fn compile_statements(
+fn compile_statements<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    list: &StatementList,
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    list: &'a [Statement<'a>],
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     let mut last = None;
-    for item in list.statements() {
-        let out = match item {
-            StatementListItem::Statement(stmt) => compile_statement(builder, ctx, stmt, loops)?,
-            StatementListItem::Declaration(decl) => compile_declaration(builder, ctx, decl)?,
-        };
+    for stmt in list {
+        let out = compile_statement(builder, ctx, stmt, loops)?;
         if out.last.is_some() {
             last = out.last;
         }
@@ -1003,93 +983,87 @@ fn compile_statements(
     })
 }
 
-fn compile_declaration(
+fn compile_var_list<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    decl: &Declaration,
-) -> Result<StmtOutcome, Error> {
-    match decl {
-        Declaration::FunctionDeclaration(_) => Ok(StmtOutcome::default()),
-        Declaration::Lexical(lex) => {
-            compile_var_list(builder, ctx, lex.variable_list(), true)?;
-            Ok(StmtOutcome::default())
-        }
-        other => Err(Error::Unsupported(format!(
-            "declaration not supported: {other:?}"
-        ))),
-    }
-}
-
-fn compile_var_list(
-    builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    list: &boa_ast::declaration::VariableList,
-    lexical: bool,
+    ctx: &CodegenCtx<'a>,
+    decl: &'a VariableDeclaration<'a>,
 ) -> Result<(), Error> {
-    for var in list.as_ref() {
-        let sym = match var.binding() {
-            boa_ast::declaration::Binding::Identifier(id) => id.sym(),
-            boa_ast::declaration::Binding::Pattern(_) => {
-                return Err(Error::Unsupported(
-                    "destructuring is not supported".to_string(),
-                ));
-            }
+    let lexical = decl.kind != VariableDeclarationKind::Var;
+    for var in &decl.declarations {
+        let BindingPattern::BindingIdentifier(id) = &var.id else {
+            return Err(Error::Unsupported(
+                "destructuring is not supported".to_string(),
+            ));
         };
-        if let Some(init) = var.init() {
+        let name = id.name.as_str();
+        if let Some(init) = &var.init {
             let value = compile_expr(builder, ctx, init)?;
-            store_var(builder, ctx, sym, value)?;
+            store_var(builder, ctx, name, value)?;
         } else if lexical {
             let value = value::undefined(builder);
-            store_var(builder, ctx, sym, value)?;
+            store_var(builder, ctx, name, value)?;
         }
     }
     Ok(())
 }
 
-fn compile_statement(
+fn compile_statement<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    stmt: &Statement,
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    stmt: &'a Statement<'a>,
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     match stmt {
-        Statement::Block(block) => compile_block(builder, ctx, block, loops),
-        Statement::Var(var) => {
-            compile_var_list(builder, ctx, &var.0, false)?;
+        Statement::BlockStatement(block) => compile_block(builder, ctx, block, loops),
+        Statement::VariableDeclaration(decl) => {
+            compile_var_list(builder, ctx, decl)?;
             Ok(StmtOutcome::default())
         }
-        Statement::Empty | Statement::Debugger => Ok(StmtOutcome::default()),
-        Statement::Expression(expr) => {
-            let value = compile_expr(builder, ctx, expr)?;
+        Statement::FunctionDeclaration(_)
+        | Statement::EmptyStatement(_)
+        | Statement::DebuggerStatement(_) => Ok(StmtOutcome::default()),
+        Statement::ExpressionStatement(expr) => {
+            let value = compile_expr(builder, ctx, &expr.expression)?;
             Ok(StmtOutcome {
                 last: Some(value),
                 terminated: false,
             })
         }
-        Statement::If(if_stmt) => compile_if(builder, ctx, if_stmt, loops),
-        Statement::WhileLoop(while_stmt) => compile_while(builder, ctx, while_stmt, &[], loops),
-        Statement::DoWhileLoop(do_while) => compile_do_while(builder, ctx, do_while, &[], loops),
-        Statement::ForLoop(for_stmt) => compile_for(builder, ctx, for_stmt, &[], loops),
-        Statement::Switch(switch_stmt) => compile_switch(builder, ctx, switch_stmt, &[], loops),
-        Statement::Labelled(labelled) => compile_labelled(builder, ctx, labelled, loops),
-        Statement::Break(break_stmt) => {
-            let target = break_target(loops, break_stmt.label())?;
+        Statement::IfStatement(if_stmt) => compile_if(builder, ctx, if_stmt, loops),
+        Statement::WhileStatement(while_stmt) => {
+            compile_while(builder, ctx, while_stmt, &[], loops)
+        }
+        Statement::DoWhileStatement(do_while) => {
+            compile_do_while(builder, ctx, do_while, &[], loops)
+        }
+        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &[], loops),
+        Statement::SwitchStatement(switch_stmt) => {
+            compile_switch(builder, ctx, switch_stmt, &[], loops)
+        }
+        Statement::LabeledStatement(labelled) => compile_labelled(builder, ctx, labelled, loops),
+        Statement::BreakStatement(break_stmt) => {
+            let label = break_stmt.label.as_ref().map(|label| label.name.as_str());
+            let target = break_target(loops, label)?;
             builder.ins().jump(target, &[]);
             Ok(StmtOutcome {
                 last: None,
                 terminated: true,
             })
         }
-        Statement::Continue(continue_stmt) => {
-            let target = continue_target(loops, continue_stmt.label())?;
+        Statement::ContinueStatement(continue_stmt) => {
+            let label = continue_stmt
+                .label
+                .as_ref()
+                .map(|label| label.name.as_str());
+            let target = continue_target(loops, label)?;
             builder.ins().jump(target, &[]);
             Ok(StmtOutcome {
                 last: None,
                 terminated: true,
             })
         }
-        Statement::Return(ret) => {
-            let value = if let Some(target) = ret.target() {
+        Statement::ReturnStatement(ret) => {
+            let value = if let Some(target) = &ret.argument {
                 compile_expr(builder, ctx, target)?
             } else {
                 value::undefined(builder)
@@ -1106,40 +1080,30 @@ fn compile_statement(
     }
 }
 
-fn compile_condition(
+fn compile_condition<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    expr: &Expression,
+    ctx: &CodegenCtx<'a>,
+    expr: &'a Expression<'a>,
 ) -> Result<Value, Error> {
     match expr {
-        Expression::Parenthesized(paren) => compile_condition(builder, ctx, paren.expression()),
-        Expression::Unary(unary) if unary.op() == UnaryOp::Not => {
-            let cond = compile_condition(builder, ctx, unary.target())?;
+        Expression::ParenthesizedExpression(paren) => {
+            compile_condition(builder, ctx, &paren.expression)
+        }
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+            let cond = compile_condition(builder, ctx, &unary.argument)?;
             Ok(builder.ins().icmp_imm(IntCC::Equal, cond, 0))
         }
-        Expression::Binary(binary)
-            if matches!(
-                binary.op(),
-                BinaryOp::Relational(
-                    RelationalOp::GreaterThan
-                        | RelationalOp::GreaterThanOrEqual
-                        | RelationalOp::LessThan
-                        | RelationalOp::LessThanOrEqual
-                )
-            ) =>
-        {
-            let BinaryOp::Relational(op) = binary.op() else {
-                unreachable!()
-            };
-            let lhs = compile_expr(builder, ctx, binary.lhs())?;
-            let rhs = compile_expr(builder, ctx, binary.rhs())?;
-            let lhs = number_value(builder, lhs, expr_is_number(ctx, binary.lhs()));
-            let rhs = number_value(builder, rhs, expr_is_number(ctx, binary.rhs()));
+        Expression::BinaryExpression(binary) if binary.operator.is_compare() => {
+            let op = binary.operator;
+            let lhs = compile_expr(builder, ctx, &binary.left)?;
+            let rhs = compile_expr(builder, ctx, &binary.right)?;
+            let lhs = number_value(builder, lhs, expr_is_number(ctx, &binary.left));
+            let rhs = number_value(builder, rhs, expr_is_number(ctx, &binary.right));
             let cc = match op {
-                RelationalOp::GreaterThan => FloatCC::GreaterThan,
-                RelationalOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
-                RelationalOp::LessThan => FloatCC::LessThan,
-                RelationalOp::LessThanOrEqual => FloatCC::LessThanOrEqual,
+                BinaryOperator::GreaterThan => FloatCC::GreaterThan,
+                BinaryOperator::GreaterEqualThan => FloatCC::GreaterThanOrEqual,
+                BinaryOperator::LessThan => FloatCC::LessThan,
+                BinaryOperator::LessEqualThan => FloatCC::LessThanOrEqual,
                 _ => unreachable!(),
             };
             Ok(builder.ins().fcmp(cc, lhs, rhs))
@@ -1151,13 +1115,13 @@ fn compile_condition(
     }
 }
 
-fn compile_if(
+fn compile_if<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    if_stmt: &boa_ast::statement::If,
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    if_stmt: &'a IfStatement<'a>,
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
-    let cond = compile_condition(builder, ctx, if_stmt.cond())?;
+    let cond = compile_condition(builder, ctx, &if_stmt.test)?;
 
     let then_block = builder.create_block();
     let else_block = builder.create_block();
@@ -1165,13 +1129,13 @@ fn compile_if(
     builder.ins().brif(cond, then_block, &[], else_block, &[]);
 
     builder.switch_to_block(then_block);
-    let then_out = compile_statement(builder, ctx, if_stmt.body(), loops)?;
+    let then_out = compile_statement(builder, ctx, &if_stmt.consequent, loops)?;
     if !then_out.terminated {
         builder.ins().jump(join_block, &[]);
     }
 
     builder.switch_to_block(else_block);
-    let else_out = if let Some(else_node) = if_stmt.else_node() {
+    let else_out = if let Some(else_node) = &if_stmt.alternate {
         compile_statement(builder, ctx, else_node, loops)?
     } else {
         StmtOutcome::default()
@@ -1191,12 +1155,12 @@ fn compile_if(
     }
 }
 
-fn compile_while(
+fn compile_while<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    while_stmt: &boa_ast::statement::iteration::WhileLoop,
-    labels: &[Sym],
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    while_stmt: &'a WhileStatement<'a>,
+    labels: &[&'a str],
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     let header = builder.create_block();
     let body = builder.create_block();
@@ -1205,7 +1169,7 @@ fn compile_while(
     builder.ins().jump(header, &[]);
     builder.switch_to_block(header);
 
-    let cond = compile_condition(builder, ctx, while_stmt.condition())?;
+    let cond = compile_condition(builder, ctx, &while_stmt.test)?;
     builder.ins().brif(cond, body, &[], exit, &[]);
 
     builder.switch_to_block(body);
@@ -1215,7 +1179,7 @@ fn compile_while(
         continue_block: Some(header),
         breakable: true,
     });
-    let body_out = compile_statement(builder, ctx, while_stmt.body(), loops)?;
+    let body_out = compile_statement(builder, ctx, &while_stmt.body, loops)?;
     loops.pop();
     if !body_out.terminated {
         builder.ins().jump(header, &[]);
@@ -1225,12 +1189,12 @@ fn compile_while(
     Ok(StmtOutcome::default())
 }
 
-fn compile_do_while(
+fn compile_do_while<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    do_while: &boa_ast::statement::iteration::DoWhileLoop,
-    labels: &[Sym],
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    do_while: &'a DoWhileStatement<'a>,
+    labels: &[&'a str],
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     let body_block = builder.create_block();
     let condition_block = builder.create_block();
@@ -1244,14 +1208,14 @@ fn compile_do_while(
         continue_block: Some(condition_block),
         breakable: true,
     });
-    let body_out = compile_statement(builder, ctx, do_while.body(), loops)?;
+    let body_out = compile_statement(builder, ctx, &do_while.body, loops)?;
     loops.pop();
     if !body_out.terminated {
         builder.ins().jump(condition_block, &[]);
     }
 
     builder.switch_to_block(condition_block);
-    let cond = compile_condition(builder, ctx, do_while.cond())?;
+    let cond = compile_condition(builder, ctx, &do_while.test)?;
     builder.ins().brif(cond, body_block, &[], exit, &[]);
 
     builder.switch_to_block(exit);
@@ -1260,35 +1224,36 @@ fn compile_do_while(
 
 /// Compiles a label chain. Labels attached to loops become extra names for the
 /// loop target; any other labelled statement gets a break-only target.
-fn compile_labelled(
+fn compile_labelled<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    labelled: &Labelled,
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    labelled: &'a LabeledStatement<'a>,
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
-    let mut labels = vec![labelled.label()];
-    let mut item = labelled.item();
-    while let LabelledItem::Statement(Statement::Labelled(inner)) = item {
-        labels.push(inner.label());
-        item = inner.item();
+    let mut labels = vec![labelled.label.name.as_str()];
+    let mut stmt = &labelled.body;
+    while let Statement::LabeledStatement(inner) = stmt {
+        labels.push(inner.label.name.as_str());
+        stmt = &inner.body;
     }
 
-    let stmt = match item {
-        LabelledItem::Statement(stmt) => stmt,
-        LabelledItem::FunctionDeclaration(_) => {
-            return Err(Error::Unsupported(
-                "labelled function declarations are not supported".to_string(),
-            ));
-        }
-    };
+    if matches!(stmt, Statement::FunctionDeclaration(_)) {
+        return Err(Error::Unsupported(
+            "labelled function declarations are not supported".to_string(),
+        ));
+    }
 
     match stmt {
-        Statement::WhileLoop(while_stmt) => compile_while(builder, ctx, while_stmt, &labels, loops),
-        Statement::DoWhileLoop(do_while) => {
+        Statement::WhileStatement(while_stmt) => {
+            compile_while(builder, ctx, while_stmt, &labels, loops)
+        }
+        Statement::DoWhileStatement(do_while) => {
             compile_do_while(builder, ctx, do_while, &labels, loops)
         }
-        Statement::ForLoop(for_stmt) => compile_for(builder, ctx, for_stmt, &labels, loops),
-        Statement::Switch(switch_stmt) => compile_switch(builder, ctx, switch_stmt, &labels, loops),
+        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &labels, loops),
+        Statement::SwitchStatement(switch_stmt) => {
+            compile_switch(builder, ctx, switch_stmt, &labels, loops)
+        }
         stmt => {
             let join = builder.create_block();
             loops.push(LoopTarget {
@@ -1310,17 +1275,22 @@ fn compile_labelled(
 
 /// `for (init; condition; update) body`. A lexical initializer gets one
 /// environment per iteration so each iteration's bindings are distinct.
-fn compile_for(
+fn compile_for<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    for_stmt: &boa_ast::statement::iteration::ForLoop,
-    labels: &[Sym],
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    for_stmt: &'a ForStatement<'a>,
+    labels: &[&'a str],
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
     let parent_env = ctx.env;
     let mut ctx = *ctx;
     let mut fresh: Option<(usize, Value)> = None;
-    if let Some(ForLoopInitializer::Lexical(_)) = for_stmt.init() {
+    let has_lexical_init = matches!(
+        &for_stmt.init,
+        Some(ForStatementInit::VariableDeclaration(decl))
+            if decl.kind != VariableDeclarationKind::Var
+    );
+    if has_lexical_init {
         let scope = node_scope(&ctx, node_key(for_stmt))?;
         let plan = ctx.program.scope(scope);
         let slots = plan.slot_count();
@@ -1331,13 +1301,15 @@ fn compile_for(
         }
     }
 
-    match for_stmt.init() {
-        Some(ForLoopInitializer::Expression(expr)) => {
-            compile_expr(builder, &ctx, expr)?;
+    match &for_stmt.init {
+        Some(ForStatementInit::VariableDeclaration(decl)) => {
+            compile_var_list(builder, &ctx, decl)?;
         }
-        Some(ForLoopInitializer::Var(var)) => compile_var_list(builder, &ctx, &var.0, false)?,
-        Some(ForLoopInitializer::Lexical(lex)) => {
-            compile_var_list(builder, &ctx, lex.declaration().variable_list(), true)?;
+        Some(init) => {
+            let expr = init.as_expression().ok_or_else(|| {
+                Error::Unsupported("for-loop initializer is not supported".to_string())
+            })?;
+            compile_expr(builder, &ctx, expr)?;
         }
         None => {}
     }
@@ -1360,7 +1332,7 @@ fn compile_for(
     } else {
         ctx
     };
-    match for_stmt.condition() {
+    match &for_stmt.test {
         Some(condition) => {
             let cond = compile_condition(builder, &header_ctx, condition)?;
             builder.ins().brif(cond, body_block, &[], exit, &[]);
@@ -1382,7 +1354,7 @@ fn compile_for(
         continue_block: Some(step),
         breakable: true,
     });
-    let body_out = compile_statement(builder, &body_ctx, for_stmt.body(), loops)?;
+    let body_out = compile_statement(builder, &body_ctx, &for_stmt.body, loops)?;
     loops.pop();
     if !body_out.terminated {
         builder.ins().jump(step, &[]);
@@ -1397,7 +1369,7 @@ fn compile_for(
     } else {
         ctx
     };
-    if let Some(update) = for_stmt.final_expr() {
+    if let Some(update) = &for_stmt.update {
         compile_expr(builder, &step_ctx, update)?;
     }
     builder.ins().jump(header, &[]);
@@ -1407,32 +1379,32 @@ fn compile_for(
 }
 
 /// `switch (value) { case c: ... default: ... }` with fall-through.
-fn compile_switch(
+fn compile_switch<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    switch_stmt: &boa_ast::statement::Switch,
-    labels: &[Sym],
-    loops: &mut Vec<LoopTarget>,
+    ctx: &CodegenCtx<'a>,
+    switch_stmt: &'a SwitchStatement<'a>,
+    labels: &[&'a str],
+    loops: &mut Vec<LoopTarget<'a>>,
 ) -> Result<StmtOutcome, Error> {
-    let value = compile_expr(builder, ctx, switch_stmt.val())?;
+    let value = compile_expr(builder, ctx, &switch_stmt.discriminant)?;
     let scope = node_scope(ctx, node_key(switch_stmt))?;
     let inner = enter_scope(builder, ctx, scope);
 
     let value_var = builder.declare_var(types::F64);
     builder.def_var(value_var, value);
 
-    let cases = switch_stmt.cases();
+    let cases = &switch_stmt.cases;
     let exit = builder.create_block();
     let case_blocks: Vec<Block> = cases.iter().map(|_| builder.create_block()).collect();
     let no_match = cases
         .iter()
-        .position(|case| case.is_default())
+        .position(|case| case.test.is_none())
         .map_or(exit, |i| case_blocks[i]);
 
-    let tests: Vec<(usize, &Expression)> = cases
+    let tests: Vec<(usize, &Expression<'a>)> = cases
         .iter()
         .enumerate()
-        .filter_map(|(i, case)| case.condition().map(|cond| (i, cond)))
+        .filter_map(|(i, case)| case.test.as_ref().map(|cond| (i, cond)))
         .collect();
 
     if tests.is_empty() {
@@ -1463,7 +1435,7 @@ fn compile_switch(
     });
     for (i, case) in cases.iter().enumerate() {
         builder.switch_to_block(case_blocks[i]);
-        let out = compile_statements(builder, &inner, case.body(), loops)?;
+        let out = compile_statements(builder, &inner, case.consequent.as_slice(), loops)?;
         if !out.terminated {
             let next = case_blocks.get(i + 1).copied().unwrap_or(exit);
             builder.ins().jump(next, &[]);
@@ -1475,101 +1447,107 @@ fn compile_switch(
     Ok(StmtOutcome::default())
 }
 
-fn compile_expr(
+fn compile_expr<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    expr: &Expression,
+    ctx: &CodegenCtx<'a>,
+    expr: &'a Expression<'a>,
 ) -> Result<Value, Error> {
     match expr {
-        Expression::Literal(lit) => compile_literal(builder, lit.kind()),
+        Expression::NumericLiteral(lit) => Ok(builder.ins().f64const(lit.value)),
+        Expression::BooleanLiteral(lit) => Ok(value::boolean(builder, lit.value)),
+        Expression::NullLiteral(_) => Ok(value::null(builder)),
+        Expression::StringLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::TemplateLiteral(_) => Err(Error::Unsupported(
+            "string and bigint literals are not supported".to_string(),
+        )),
         Expression::Identifier(id) => {
-            if is_free_global(ctx, id.sym()) {
-                if ctx.builtins.is_undefined(id.sym()) {
+            let name = id.name.as_str();
+            if is_free_global(ctx, name) {
+                if ctx.builtins.is_undefined(name) {
                     return Ok(value::undefined(builder));
                 }
-                if let Some(constant) = ctx.builtins.global_constant(id.sym()) {
+                if let Some(constant) = ctx.builtins.global_constant(name) {
                     return Ok(builder.ins().f64const(constant));
                 }
             }
-            load_var(builder, ctx, id.sym())
+            load_var(builder, ctx, name)
         }
-        Expression::Parenthesized(paren) => compile_expr(builder, ctx, paren.expression()),
-        Expression::Binary(binary) => compile_binary(builder, ctx, binary),
-        Expression::Conditional(conditional) => compile_conditional(builder, ctx, conditional),
-        Expression::Unary(unary) => compile_unary(builder, ctx, unary),
-        Expression::Assign(assign) => compile_assign(builder, ctx, assign),
-        Expression::Update(update) => compile_update(builder, ctx, update),
-        Expression::Call(call) => compile_call(builder, ctx, call),
-        Expression::FunctionExpression(func) => compile_closure(builder, ctx, func.span()),
-        Expression::ArrowFunction(arrow) => compile_closure(builder, ctx, arrow.span()),
-        Expression::PropertyAccess(access) => compile_property_access(builder, ctx, access),
+        Expression::ParenthesizedExpression(paren) => compile_expr(builder, ctx, &paren.expression),
+        Expression::BinaryExpression(binary) => compile_binary(builder, ctx, binary),
+        Expression::LogicalExpression(logical) => {
+            let lhs = compile_expr(builder, ctx, &logical.left)?;
+            compile_logical(builder, ctx, lhs, &logical.right, logical.operator)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            compile_conditional(builder, ctx, conditional)
+        }
+        Expression::UnaryExpression(unary) => compile_unary(builder, ctx, unary),
+        Expression::AssignmentExpression(assign) => compile_assign(builder, ctx, assign),
+        Expression::UpdateExpression(update) => compile_update(builder, ctx, update),
+        Expression::SequenceExpression(sequence) => {
+            let mut result = value::undefined(builder);
+            for expr in &sequence.expressions {
+                result = compile_expr(builder, ctx, expr)?;
+            }
+            Ok(result)
+        }
+        Expression::CallExpression(call) => compile_call(builder, ctx, call),
+        Expression::FunctionExpression(func) => compile_closure(builder, ctx, node_key(&**func)),
+        Expression::ArrowFunctionExpression(arrow) => {
+            compile_closure(builder, ctx, node_key(&**arrow))
+        }
+        Expression::StaticMemberExpression(access) => compile_property_access(builder, ctx, access),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
     }
 }
 
-fn compile_literal(builder: &mut FunctionBuilder, kind: &LiteralKind) -> Result<Value, Error> {
-    let value = match kind {
-        LiteralKind::Num(n) => builder.ins().f64const(*n),
-        LiteralKind::Int(i) => builder.ins().f64const(*i as f64),
-        LiteralKind::Bool(b) => value::boolean(builder, *b),
-        LiteralKind::Null => value::null(builder),
-        LiteralKind::Undefined => value::undefined(builder),
-        LiteralKind::String(_) | LiteralKind::BigInt(_) => {
-            return Err(Error::Unsupported(
-                "string and bigint literals are not supported".to_string(),
-            ));
-        }
-    };
-    Ok(value)
-}
-
-fn compile_binary(
+fn compile_binary<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    binary: &boa_ast::expression::operator::Binary,
+    ctx: &CodegenCtx<'a>,
+    binary: &'a BinaryExpression<'a>,
 ) -> Result<Value, Error> {
-    if let BinaryOp::Logical(op) = binary.op() {
-        let lhs = compile_expr(builder, ctx, binary.lhs())?;
-        return compile_logical(builder, ctx, lhs, binary.rhs(), op);
-    }
-
-    let lhs = compile_expr(builder, ctx, binary.lhs())?;
-    let rhs = compile_expr(builder, ctx, binary.rhs())?;
-    match binary.op() {
-        BinaryOp::Arithmetic(arith) => compile_arithmetic(
+    let lhs = compile_expr(builder, ctx, &binary.left)?;
+    let rhs = compile_expr(builder, ctx, &binary.right)?;
+    let op = binary.operator;
+    if op.is_arithmetic() {
+        compile_arithmetic(
             builder,
             ctx,
-            arith,
+            op,
             lhs,
             rhs,
-            expr_is_number(ctx, binary.lhs()),
-            expr_is_number(ctx, binary.rhs()),
-        ),
-        BinaryOp::Bitwise(bitwise) => Ok(compile_bitwise(builder, ctx, bitwise, lhs, rhs)),
-        BinaryOp::Relational(rel) => compile_relational(
+            expr_is_number(ctx, &binary.left),
+            expr_is_number(ctx, &binary.right),
+        )
+    } else if op.is_bitwise() {
+        Ok(compile_bitwise(builder, ctx, op, lhs, rhs))
+    } else if op.is_equality() || op.is_compare() {
+        compile_relational(
             builder,
-            rel,
+            op,
             lhs,
             rhs,
-            expr_is_number(ctx, binary.lhs()),
-            expr_is_number(ctx, binary.rhs()),
-        ),
-        BinaryOp::Comma => Ok(rhs),
-        other => Err(Error::Unsupported(format!(
-            "binary operator not supported: {other:?}"
-        ))),
+            expr_is_number(ctx, &binary.left),
+            expr_is_number(ctx, &binary.right),
+        )
+    } else {
+        Err(Error::Unsupported(format!(
+            "binary operator not supported: {op:?}"
+        )))
     }
 }
 
 /// Compiles `cond ? if_true : if_false`, evaluating exactly one branch.
-fn compile_conditional(
+fn compile_conditional<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    conditional: &boa_ast::expression::operator::Conditional,
+    ctx: &CodegenCtx<'a>,
+    conditional: &'a ConditionalExpression<'a>,
 ) -> Result<Value, Error> {
-    let cond = compile_condition(builder, ctx, conditional.condition())?;
+    let cond = compile_condition(builder, ctx, &conditional.test)?;
 
     let result_var = builder.declare_var(types::F64);
     let true_block = builder.create_block();
@@ -1578,12 +1556,12 @@ fn compile_conditional(
     builder.ins().brif(cond, true_block, &[], false_block, &[]);
 
     builder.switch_to_block(true_block);
-    let if_true = compile_expr(builder, ctx, conditional.if_true())?;
+    let if_true = compile_expr(builder, ctx, &conditional.consequent)?;
     builder.def_var(result_var, if_true);
     builder.ins().jump(join_block, &[]);
 
     builder.switch_to_block(false_block);
-    let if_false = compile_expr(builder, ctx, conditional.if_false())?;
+    let if_false = compile_expr(builder, ctx, &conditional.alternate)?;
     builder.def_var(result_var, if_false);
     builder.ins().jump(join_block, &[]);
 
@@ -1592,17 +1570,17 @@ fn compile_conditional(
 }
 
 /// The short-circuiting operators: `&&`, `||` and `??`.
-fn compile_logical(
+fn compile_logical<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
+    ctx: &CodegenCtx<'a>,
     lhs: Value,
-    rhs_expr: &Expression,
-    op: LogicalOp,
+    rhs_expr: &'a Expression<'a>,
+    op: LogicalOperator,
 ) -> Result<Value, Error> {
     let (cond, rhs_when_true) = match op {
-        LogicalOp::And => (value::truthy(builder, lhs), true),
-        LogicalOp::Or => (value::truthy(builder, lhs), false),
-        LogicalOp::Coalesce => (value::is_nullish(builder, lhs), true),
+        LogicalOperator::And => (value::truthy(builder, lhs), true),
+        LogicalOperator::Or => (value::truthy(builder, lhs), false),
+        LogicalOperator::Coalesce => (value::is_nullish(builder, lhs), true),
     };
 
     let result_var = builder.declare_var(types::F64);
@@ -1628,7 +1606,7 @@ fn compile_logical(
 fn compile_arithmetic(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
-    op: ArithmeticOp,
+    op: BinaryOperator,
     lhs: Value,
     rhs: Value,
     lhs_numeric: bool,
@@ -1637,12 +1615,17 @@ fn compile_arithmetic(
     let lhs = number_value(builder, lhs, lhs_numeric);
     let rhs = number_value(builder, rhs, rhs_numeric);
     let value = match op {
-        ArithmeticOp::Add => builder.ins().fadd(lhs, rhs),
-        ArithmeticOp::Sub => builder.ins().fsub(lhs, rhs),
-        ArithmeticOp::Mul => builder.ins().fmul(lhs, rhs),
-        ArithmeticOp::Div => builder.ins().fdiv(lhs, rhs),
-        ArithmeticOp::Mod => call_fmod(builder, ctx.fmod_ref, lhs, rhs),
-        ArithmeticOp::Exp => call_pow(builder, ctx.pow_ref, lhs, rhs),
+        BinaryOperator::Addition => builder.ins().fadd(lhs, rhs),
+        BinaryOperator::Subtraction => builder.ins().fsub(lhs, rhs),
+        BinaryOperator::Multiplication => builder.ins().fmul(lhs, rhs),
+        BinaryOperator::Division => builder.ins().fdiv(lhs, rhs),
+        BinaryOperator::Remainder => call_fmod(builder, ctx.fmod_ref, lhs, rhs),
+        BinaryOperator::Exponential => call_pow(builder, ctx.pow_ref, lhs, rhs),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "arithmetic operator not supported: {other:?}"
+            )));
+        }
     };
     Ok(value)
 }
@@ -1651,7 +1634,7 @@ fn compile_arithmetic(
 fn compile_bitwise(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
-    op: BitwiseOp,
+    op: BinaryOperator,
     lhs: Value,
     rhs: Value,
 ) -> Value {
@@ -1659,39 +1642,40 @@ fn compile_bitwise(
     let rhs = value::to_int32(builder, ctx.fmod_ref, rhs);
 
     let result = match op {
-        BitwiseOp::And => builder.ins().band(lhs, rhs),
-        BitwiseOp::Or => builder.ins().bor(lhs, rhs),
-        BitwiseOp::Xor => builder.ins().bxor(lhs, rhs),
-        BitwiseOp::Shl => {
+        BinaryOperator::BitwiseAnd => builder.ins().band(lhs, rhs),
+        BinaryOperator::BitwiseOR => builder.ins().bor(lhs, rhs),
+        BinaryOperator::BitwiseXOR => builder.ins().bxor(lhs, rhs),
+        BinaryOperator::ShiftLeft => {
             let shift = builder.ins().band_imm(rhs, 31);
             builder.ins().ishl(lhs, shift)
         }
-        BitwiseOp::Shr => {
+        BinaryOperator::ShiftRight => {
             let shift = builder.ins().band_imm(rhs, 31);
             builder.ins().sshr(lhs, shift)
         }
-        BitwiseOp::UShr => {
+        BinaryOperator::ShiftRightZeroFill => {
             let shift = builder.ins().band_imm(rhs, 31);
             let shifted = builder.ins().ushr(lhs, shift);
             return value::from_uint32(builder, shifted);
         }
+        _ => unreachable!(),
     };
     value::from_int32(builder, result)
 }
 
 fn compile_relational(
     builder: &mut FunctionBuilder,
-    op: RelationalOp,
+    op: BinaryOperator,
     lhs: Value,
     rhs: Value,
     lhs_numeric: bool,
     rhs_numeric: bool,
 ) -> Result<Value, Error> {
     match op {
-        RelationalOp::Equal => Ok(value::loose_equal(builder, lhs, rhs)),
-        RelationalOp::StrictEqual => Ok(value::strict_equal(builder, lhs, rhs)),
-        RelationalOp::NotEqual | RelationalOp::StrictNotEqual => {
-            let eq = if op == RelationalOp::NotEqual {
+        BinaryOperator::Equality => Ok(value::loose_equal(builder, lhs, rhs)),
+        BinaryOperator::StrictEquality => Ok(value::strict_equal(builder, lhs, rhs)),
+        BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+            let eq = if op == BinaryOperator::Inequality {
                 value::loose_equal(builder, lhs, rhs)
             } else {
                 value::strict_equal(builder, lhs, rhs)
@@ -1700,17 +1684,17 @@ fn compile_relational(
             let not = builder.ins().icmp_imm(IntCC::Equal, eq, 0);
             Ok(value::from_bool(builder, not))
         }
-        RelationalOp::GreaterThan
-        | RelationalOp::GreaterThanOrEqual
-        | RelationalOp::LessThan
-        | RelationalOp::LessThanOrEqual => {
+        BinaryOperator::GreaterThan
+        | BinaryOperator::GreaterEqualThan
+        | BinaryOperator::LessThan
+        | BinaryOperator::LessEqualThan => {
             let lhs = number_value(builder, lhs, lhs_numeric);
             let rhs = number_value(builder, rhs, rhs_numeric);
             let cc = match op {
-                RelationalOp::GreaterThan => FloatCC::GreaterThan,
-                RelationalOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
-                RelationalOp::LessThan => FloatCC::LessThan,
-                RelationalOp::LessThanOrEqual => FloatCC::LessThanOrEqual,
+                BinaryOperator::GreaterThan => FloatCC::GreaterThan,
+                BinaryOperator::GreaterEqualThan => FloatCC::GreaterThanOrEqual,
+                BinaryOperator::LessThan => FloatCC::LessThan,
+                BinaryOperator::LessEqualThan => FloatCC::LessThanOrEqual,
                 _ => unreachable!(),
             };
             let cmp = builder.ins().fcmp(cc, lhs, rhs);
@@ -1722,67 +1706,67 @@ fn compile_relational(
     }
 }
 
-fn compile_unary(
+fn compile_unary<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    unary: &boa_ast::expression::operator::Unary,
+    ctx: &CodegenCtx<'a>,
+    unary: &'a UnaryExpression<'a>,
 ) -> Result<Value, Error> {
-    let target = compile_expr(builder, ctx, unary.target())?;
-    match unary.op() {
-        UnaryOp::Minus => {
-            let target = number_value(builder, target, expr_is_number(ctx, unary.target()));
+    let target = compile_expr(builder, ctx, &unary.argument)?;
+    match unary.operator {
+        UnaryOperator::UnaryNegation => {
+            let target = number_value(builder, target, expr_is_number(ctx, &unary.argument));
             Ok(builder.ins().fneg(target))
         }
-        UnaryOp::Plus => Ok(number_value(
+        UnaryOperator::UnaryPlus => Ok(number_value(
             builder,
             target,
-            expr_is_number(ctx, unary.target()),
+            expr_is_number(ctx, &unary.argument),
         )),
-        UnaryOp::Not => {
+        UnaryOperator::LogicalNot => {
             let cond = value::truthy(builder, target);
             let not = builder.ins().icmp_imm(IntCC::Equal, cond, 0);
             Ok(value::from_bool(builder, not))
         }
-        UnaryOp::Tilde => {
+        UnaryOperator::BitwiseNot => {
             let int = value::to_int32(builder, ctx.fmod_ref, target);
             let inverted = builder.ins().bxor_imm(int, -1);
             Ok(value::from_int32(builder, inverted))
         }
-        UnaryOp::Void => Ok(value::undefined(builder)),
+        UnaryOperator::Void => Ok(value::undefined(builder)),
         other => Err(Error::Unsupported(format!(
             "unary operator not supported: {other:?}"
         ))),
     }
 }
 
-fn compile_assign(
+fn compile_assign<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    assign: &boa_ast::expression::operator::Assign,
+    ctx: &CodegenCtx<'a>,
+    assign: &'a AssignmentExpression<'a>,
 ) -> Result<Value, Error> {
-    let sym = match assign.lhs() {
-        AssignTarget::Identifier(id) => id.sym(),
+    let name = match &assign.left {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str(),
         _ => {
             return Err(Error::Unsupported(
                 "only identifier assignment is supported".to_string(),
             ));
         }
     };
-    if is_const(ctx.program, ctx.scope, sym) {
+    if is_const(ctx.program, ctx.scope, name) {
         return Err(Error::Scope(
             "assignment to a constant variable".to_string(),
         ));
     }
-    let place = place(builder, ctx, sym)?;
-    let tdz = needs_tdz_check(ctx.program, ctx.scope, sym);
-    let op = assign.op();
+    let place = place(builder, ctx, name)?;
+    let tdz = needs_tdz_check(ctx.program, ctx.scope, name);
+    let op = assign.operator;
 
     // The logical assignment operators only evaluate and store the right-hand
     // side when the current value calls for it.
     let short_circuit = match op {
-        AssignOp::BoolAnd => Some((true, true)),
-        AssignOp::BoolOr => Some((false, true)),
-        AssignOp::Coalesce => Some((true, false)),
+        AssignmentOperator::LogicalAnd => Some((true, true)),
+        AssignmentOperator::LogicalOr => Some((false, true)),
+        AssignmentOperator::LogicalNullish => Some((true, false)),
         _ => None,
     };
     if let Some((rhs_when_truthy, use_truthy)) = short_circuit {
@@ -1807,7 +1791,7 @@ fn compile_assign(
         }
 
         builder.switch_to_block(rhs_block);
-        let rhs = compile_expr(builder, ctx, assign.rhs())?;
+        let rhs = compile_expr(builder, ctx, &assign.right)?;
         store_place(builder, place, rhs);
         builder.def_var(result_var, rhs);
         builder.ins().jump(join_block, &[]);
@@ -1816,8 +1800,8 @@ fn compile_assign(
         return Ok(builder.use_var(result_var));
     }
 
-    if op == AssignOp::Assign {
-        let rhs = compile_expr(builder, ctx, assign.rhs())?;
+    if op == AssignmentOperator::Assign {
+        let rhs = compile_expr(builder, ctx, &assign.right)?;
         if tdz {
             let current = load_place(builder, place);
             check_tdz(builder, current);
@@ -1832,130 +1816,76 @@ fn compile_assign(
     if tdz {
         check_tdz(builder, old);
     }
-    let rhs = compile_expr(builder, ctx, assign.rhs())?;
-    let value = match op {
-        AssignOp::Add => compile_arithmetic(
+    let rhs = compile_expr(builder, ctx, &assign.right)?;
+    let binary = op
+        .to_binary_operator()
+        .ok_or_else(|| Error::Unsupported(format!("assignment operator not supported: {op:?}")))?;
+    let value = if binary.is_arithmetic() {
+        compile_arithmetic(
             builder,
             ctx,
-            ArithmeticOp::Add,
+            binary,
             old,
             rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::Sub => compile_arithmetic(
-            builder,
-            ctx,
-            ArithmeticOp::Sub,
-            old,
-            rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::Mul => compile_arithmetic(
-            builder,
-            ctx,
-            ArithmeticOp::Mul,
-            old,
-            rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::Div => compile_arithmetic(
-            builder,
-            ctx,
-            ArithmeticOp::Div,
-            old,
-            rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::Mod => compile_arithmetic(
-            builder,
-            ctx,
-            ArithmeticOp::Mod,
-            old,
-            rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::Exp => compile_arithmetic(
-            builder,
-            ctx,
-            ArithmeticOp::Exp,
-            old,
-            rhs,
-            binding_is_number(ctx, sym),
-            expr_is_number(ctx, assign.rhs()),
-        )?,
-        AssignOp::And => compile_bitwise(builder, ctx, BitwiseOp::And, old, rhs),
-        AssignOp::Or => compile_bitwise(builder, ctx, BitwiseOp::Or, old, rhs),
-        AssignOp::Xor => compile_bitwise(builder, ctx, BitwiseOp::Xor, old, rhs),
-        AssignOp::Shl => compile_bitwise(builder, ctx, BitwiseOp::Shl, old, rhs),
-        AssignOp::Shr => compile_bitwise(builder, ctx, BitwiseOp::Shr, old, rhs),
-        AssignOp::Ushr => compile_bitwise(builder, ctx, BitwiseOp::UShr, old, rhs),
-        other => {
-            return Err(Error::Unsupported(format!(
-                "assignment operator not supported: {other:?}"
-            )));
-        }
+            binding_is_number(ctx, name),
+            expr_is_number(ctx, &assign.right),
+        )?
+    } else {
+        compile_bitwise(builder, ctx, binary, old, rhs)
     };
     store_place(builder, place, value);
     Ok(value)
 }
 
-fn compile_update(
+fn compile_update<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    update: &boa_ast::expression::operator::Update,
+    ctx: &CodegenCtx<'a>,
+    update: &'a UpdateExpression<'a>,
 ) -> Result<Value, Error> {
-    let sym = match update.target() {
-        UpdateTarget::Identifier(id) => id.sym(),
+    let name = match &update.argument {
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str(),
         _ => {
             return Err(Error::Unsupported(
                 "only identifier updates are supported".to_string(),
             ));
         }
     };
-    if is_const(ctx.program, ctx.scope, sym) {
+    if is_const(ctx.program, ctx.scope, name) {
         return Err(Error::Scope(
             "assignment to a constant variable".to_string(),
         ));
     }
-    let old = load_var(builder, ctx, sym)?;
-    let old = number_value(builder, old, binding_is_number(ctx, sym));
+    let old = load_var(builder, ctx, name)?;
+    let old = number_value(builder, old, binding_is_number(ctx, name));
     let one = builder.ins().f64const(1.0);
-    let (new_value, result) = match update.op() {
-        UpdateOp::IncrementPre => (builder.ins().fadd(old, one), None),
-        UpdateOp::IncrementPost => (builder.ins().fadd(old, one), Some(old)),
-        UpdateOp::DecrementPre => (builder.ins().fsub(old, one), None),
-        UpdateOp::DecrementPost => (builder.ins().fsub(old, one), Some(old)),
+    let new_value = match update.operator {
+        UpdateOperator::Increment => builder.ins().fadd(old, one),
+        UpdateOperator::Decrement => builder.ins().fsub(old, one),
     };
-    store_var(builder, ctx, sym, new_value)?;
+    let result = if update.prefix { None } else { Some(old) };
+    store_var(builder, ctx, name, new_value)?;
     Ok(result.unwrap_or(new_value))
 }
 
-/// True when `sym` is not bound in scope, i.e. it names a global builtin.
-fn is_free_global(ctx: &CodegenCtx<'_>, sym: Sym) -> bool {
-    resolve(ctx.program, ctx.scope, sym).is_none()
+/// True when `name` is not bound in scope, i.e. it names a global builtin.
+fn is_free_global(ctx: &CodegenCtx<'_>, name: &str) -> bool {
+    resolve(ctx.program, ctx.scope, name).is_none()
 }
 
 /// Recognises `Math.member`, `Number.member` and `Object.member`.
 fn builtin_member(
     ctx: &CodegenCtx<'_>,
-    access: &SimplePropertyAccess,
+    access: &StaticMemberExpression<'_>,
 ) -> Option<(builtins::Namespace, &'static str)> {
-    let Expression::Identifier(id) = access.target() else {
+    let Expression::Identifier(id) = &access.object else {
         return None;
     };
-    if !is_free_global(ctx, id.sym()) {
+    let name = id.name.as_str();
+    if !is_free_global(ctx, name) {
         return None;
     }
-    let namespace = ctx.builtins.namespace(id.sym())?;
-    let PropertyAccessField::Const(field) = access.field() else {
-        return None;
-    };
-    let name = ctx.builtins.property(field.sym())?;
+    let namespace = ctx.builtins.namespace(name)?;
+    let name = ctx.builtins.property(access.property.name.as_str())?;
     ctx.builtins
         .has(namespace, name)
         .then_some((namespace, name))
@@ -1968,11 +1898,11 @@ enum BuiltinCallee {
 
 /// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)` and the
 /// global conversion/predicate functions.
-fn compile_builtin_call(
+fn compile_builtin_call<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
+    ctx: &CodegenCtx<'a>,
     callee: BuiltinCallee,
-    args: &[Expression],
+    args: &'a [Argument<'a>],
 ) -> Result<Value, Error> {
     let (namespace, name) = match callee {
         BuiltinCallee::Global(name) => (None, name),
@@ -1987,8 +1917,13 @@ fn compile_builtin_call(
     let mut values = Vec::with_capacity(args.len());
     let mut known_numbers = Vec::with_capacity(args.len());
     for arg in args {
-        values.push(compile_expr(builder, ctx, arg)?);
-        known_numbers.push(expr_is_number(ctx, arg));
+        let Some(expr) = arg.as_expression() else {
+            return Err(Error::Unsupported(
+                "spread arguments are not supported".to_string(),
+            ));
+        };
+        values.push(compile_expr(builder, ctx, expr)?);
+        known_numbers.push(expr_is_number(ctx, expr));
     }
     builtins::call(
         builder,
@@ -2002,13 +1937,13 @@ fn compile_builtin_call(
 }
 
 /// Recognises a call to a builtin member or a free global builtin.
-fn builtin_callee(ctx: &CodegenCtx<'_>, callee: &Expression) -> Option<BuiltinCallee> {
+fn builtin_callee(ctx: &CodegenCtx<'_>, callee: &Expression<'_>) -> Option<BuiltinCallee> {
     match callee {
-        Expression::PropertyAccess(PropertyAccess::Simple(access)) => builtin_member(ctx, access)
+        Expression::StaticMemberExpression(access) => builtin_member(ctx, access)
             .map(|(namespace, name)| BuiltinCallee::Member(namespace, name)),
-        Expression::Identifier(id) if is_free_global(ctx, id.sym()) => ctx
+        Expression::Identifier(id) if is_free_global(ctx, id.name.as_str()) => ctx
             .builtins
-            .global_function(id.sym())
+            .global_function(id.name.as_str())
             .map(BuiltinCallee::Global),
         _ => None,
     }
@@ -2017,13 +1952,10 @@ fn builtin_callee(ctx: &CodegenCtx<'_>, callee: &Expression) -> Option<BuiltinCa
 fn compile_property_access(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
-    access: &PropertyAccess,
+    access: &StaticMemberExpression<'_>,
 ) -> Result<Value, Error> {
-    let constant = match access {
-        PropertyAccess::Simple(simple) => builtin_member(ctx, simple)
-            .and_then(|(namespace, name)| ctx.builtins.constant(namespace, name)),
-        _ => None,
-    };
+    let constant = builtin_member(ctx, access)
+        .and_then(|(namespace, name)| ctx.builtins.constant(namespace, name));
     match constant {
         Some(value) => Ok(builder.ins().f64const(value)),
         None => Err(Error::Unsupported(
@@ -2032,22 +1964,22 @@ fn compile_property_access(
     }
 }
 
-fn compile_call(
+fn compile_call<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    call: &boa_ast::expression::Call,
+    ctx: &CodegenCtx<'a>,
+    call: &'a CallExpression<'a>,
 ) -> Result<Value, Error> {
-    if let Some(builtin) = builtin_callee(ctx, call.function()) {
-        return compile_builtin_call(builder, ctx, builtin, call.args());
+    if let Some(builtin) = builtin_callee(ctx, &call.callee) {
+        return compile_builtin_call(builder, ctx, builtin, call.arguments.as_slice());
     }
 
-    if call.args().len() > MAX_ARGS {
+    if call.arguments.len() > MAX_ARGS {
         return Err(Error::Unsupported(format!(
             "calls with more than {MAX_ARGS} arguments are not supported"
         )));
     }
 
-    let callee = compile_expr(builder, ctx, call.function())?;
+    let callee = compile_expr(builder, ctx, &call.callee)?;
     let callee_ptr = value::payload(builder, callee);
     let code = builder
         .ins()
@@ -2057,11 +1989,18 @@ fn compile_call(
         .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
 
     let args_ptr = call_calloc(builder, ctx.calloc_ref, 8 + 8 * MAX_ARGS as i64);
-    let len = builder.ins().iconst(types::I64, call.args().len() as i64);
+    let len = builder
+        .ins()
+        .iconst(types::I64, call.arguments.len() as i64);
     builder.ins().store(MemFlags::new(), len, args_ptr, 0i32);
 
-    for (i, arg) in call.args().iter().enumerate() {
-        let value = compile_expr(builder, ctx, arg)?;
+    for (i, arg) in call.arguments.iter().enumerate() {
+        let Some(expr) = arg.as_expression() else {
+            return Err(Error::Unsupported(
+                "spread arguments are not supported".to_string(),
+            ));
+        };
+        let value = compile_expr(builder, ctx, expr)?;
         builder
             .ins()
             .store(MemFlags::new(), value, args_ptr, (8 + 8 * i) as i32);
@@ -2078,13 +2017,13 @@ fn compile_call(
 fn compile_closure(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
-    span: Span,
+    key: usize,
 ) -> Result<Value, Error> {
     let child = *ctx
         .program
         .function(ctx.plan_id)
         .nested
-        .get(&span)
+        .get(&key)
         .ok_or_else(|| Error::Codegen("missing anonymous function plan".to_string()))?;
     let func_ref = *ctx
         .child_refs

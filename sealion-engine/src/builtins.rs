@@ -9,9 +9,8 @@
 //! Because there are no objects yet, the namespaces cannot be used as values:
 //! only `Math.member`, `Number.member` and `Object.member` are accepted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use boa_interner::{Interner, Sym};
 use cranelift_codegen::ir::{
     FuncRef, Function, InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
@@ -79,21 +78,13 @@ const NUMBER_CONSTANTS: &[(&str, f64)] = &[
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 pub struct Builtins {
-    math: Sym,
-    number: Sym,
-    object: Sym,
-    undefined: Sym,
-    nan: Sym,
-    infinity: Sym,
     /// Property names, so that a member expression can be recognised.
-    names: HashMap<Sym, &'static str>,
-    /// Free global function names.
-    globals: HashMap<Sym, &'static str>,
+    names: HashSet<&'static str>,
     funcs: HashMap<&'static str, FuncId>,
 }
 
 impl Builtins {
-    pub fn new(module: &mut ObjectModule, interner: &mut Interner) -> Result<Self, Error> {
+    pub fn new(module: &mut ObjectModule) -> Result<Self, Error> {
         let unary_sig = make_f64_unary_signature(module);
         let binary_sig = make_f64_binary_signature(module);
         let mut funcs = HashMap::new();
@@ -106,8 +97,7 @@ impl Builtins {
             funcs.insert(name, id);
         }
 
-        let mut names = HashMap::new();
-        let all = MATH_CONSTANTS
+        let names = MATH_CONSTANTS
             .iter()
             .map(|(name, _)| *name)
             .chain(NUMBER_CONSTANTS.iter().map(|(name, _)| *name))
@@ -115,69 +105,48 @@ impl Builtins {
             .chain(BINARY_LIBM.iter().copied())
             .chain(MATH_INLINE.iter().copied())
             .chain(NUMBER_INLINE.iter().copied())
-            .chain(OBJECT_INLINE.iter().copied());
-        for name in all {
-            names.insert(interner.get_or_intern(name), name);
-        }
+            .chain(OBJECT_INLINE.iter().copied())
+            .collect();
 
-        let is_nan = interner.get_or_intern("isNaN");
-        let is_finite = interner.get_or_intern("isFinite");
-        let boolean = interner.get_or_intern("Boolean");
-        let number = interner.get_or_intern("Number");
-        let mut globals = HashMap::new();
-        globals.insert(is_nan, "isNaN");
-        globals.insert(is_finite, "isFinite");
-        globals.insert(boolean, "Boolean");
-        globals.insert(number, "Number");
-
-        Ok(Self {
-            math: interner.get_or_intern("Math"),
-            number,
-            object: interner.get_or_intern("Object"),
-            undefined: interner.get_or_intern("undefined"),
-            nan: interner.get_or_intern("NaN"),
-            infinity: interner.get_or_intern("Infinity"),
-            names,
-            globals,
-            funcs,
-        })
+        Ok(Self { names, funcs })
     }
 
     /// The namespace a bare identifier names.
-    pub fn namespace(&self, sym: Sym) -> Option<Namespace> {
-        if sym == self.math {
-            Some(Namespace::Math)
-        } else if sym == self.number {
-            Some(Namespace::Number)
-        } else if sym == self.object {
-            Some(Namespace::Object)
-        } else {
-            None
+    pub fn namespace(&self, name: &str) -> Option<Namespace> {
+        match name {
+            "Math" => Some(Namespace::Math),
+            "Number" => Some(Namespace::Number),
+            "Object" => Some(Namespace::Object),
+            _ => None,
         }
     }
 
     /// A free global function such as `isNaN` or `Boolean`.
-    pub fn global_function(&self, sym: Sym) -> Option<&'static str> {
-        self.globals.get(&sym).copied()
-    }
-
-    /// A free global constant such as `NaN` or `Infinity`.
-    pub fn global_constant(&self, sym: Sym) -> Option<f64> {
-        if sym == self.nan {
-            Some(f64::NAN)
-        } else if sym == self.infinity {
-            Some(f64::INFINITY)
-        } else {
-            None
+    pub fn global_function(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "isNaN" => Some("isNaN"),
+            "isFinite" => Some("isFinite"),
+            "Boolean" => Some("Boolean"),
+            "Number" => Some("Number"),
+            _ => None,
         }
     }
 
-    pub fn is_undefined(&self, sym: Sym) -> bool {
-        sym == self.undefined
+    /// A free global constant such as `NaN` or `Infinity`.
+    pub fn global_constant(&self, name: &str) -> Option<f64> {
+        match name {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            _ => None,
+        }
     }
 
-    pub fn property(&self, sym: Sym) -> Option<&'static str> {
-        self.names.get(&sym).copied()
+    pub fn is_undefined(&self, name: &str) -> bool {
+        name == "undefined"
+    }
+
+    pub fn property(&self, name: &str) -> Option<&'static str> {
+        self.names.get(name).copied()
     }
 
     /// True when `name` is a constant or function member of `namespace`.

@@ -2,13 +2,15 @@
 name = "sealion-engine"
 version = "0.6.0"
 edition = "2024"
+rust-version = "1.98"
 
 [dependencies]
-boa_ast = "0.22.0"
-boa_parser = "0.22.0"
-boa_interner = "0.22.0"
 cranelift-codegen = { version = "0.132.3", features = ["x86"] }
 cranelift-frontend = "0.132.3"
 cranelift-module = "0.132.3"
 cranelift-object = "0.132.3"
 target-lexicon = "0.13.3"
+oxc_allocator = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"

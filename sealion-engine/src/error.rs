@@ -31,12 +31,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<boa_parser::Error> for Error {
-    fn from(value: boa_parser::Error) -> Self {
-        Self::Parse(value.to_string())
-    }
-}
-
 impl From<cranelift_module::ModuleError> for Error {
     fn from(value: cranelift_module::ModuleError) -> Self {
         Self::Codegen(value.to_string())

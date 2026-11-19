@@ -10,19 +10,12 @@
 //! Closures capture the environment that is current where the function
 //! expression is evaluated.
 
-use std::{
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::collections::{HashMap, HashSet};
 
-use boa_ast::{
-    Declaration, Expression, Script, Span, Spanned, Statement, StatementList, StatementListItem,
-    declaration::{Binding, LexicalDeclaration, VariableList},
-    expression::access::{PropertyAccess, PropertyAccessField},
-    function::{FormalParameterList, FunctionBody, FunctionDeclaration},
-    statement::{LabelledItem, iteration::ForLoopInitializer},
+use oxc_ast::ast::{
+    BindingPattern, Expression, ForStatement, ForStatementInit, FormalParameters, Function,
+    FunctionBody, Statement, VariableDeclaration, VariableDeclarationKind,
 };
-use boa_interner::Sym;
 
 use crate::Error;
 
@@ -30,19 +23,19 @@ use crate::Error;
 pub struct ScopeId(pub usize);
 
 #[derive(Debug, Clone)]
-pub struct ParamPlan {
-    pub sym: Sym,
-    pub init: Option<Expression>,
+pub struct ParamPlan<'a> {
+    pub name: &'a str,
+    pub init: Option<&'a Expression<'a>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ScopePlan {
+pub struct ScopePlan<'a> {
     pub parent: Option<ScopeId>,
     /// The function plan that owns this scope.
     pub owner: usize,
-    pub bindings: HashMap<Sym, usize>,
+    pub bindings: HashMap<&'a str, usize>,
     /// Bindings declared with `const`, which may not be assigned to.
-    pub consts: HashSet<Sym>,
+    pub consts: HashSet<&'a str>,
     /// Slots that start in the temporal dead zone (`let`, `const`, parameters).
     pub tdz: HashSet<usize>,
     /// True when a nested function may capture bindings from this scope.
@@ -50,7 +43,7 @@ pub struct ScopePlan {
     pub captured: bool,
 }
 
-impl ScopePlan {
+impl ScopePlan<'_> {
     /// True when the scope needs a runtime environment record.
     pub fn has_env(&self) -> bool {
         self.captured
@@ -62,47 +55,49 @@ impl ScopePlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct FunctionPlan {
+pub struct FunctionPlan<'a> {
     pub id: usize,
     pub name: String,
     pub root_scope: ScopeId,
-    pub params: Vec<ParamPlan>,
-    pub body: Rc<StatementList>,
+    pub params: Vec<ParamPlan<'a>>,
+    pub body: &'a [Statement<'a>],
     /// Hoisted `function` declarations, evaluated at function entry.
     pub children: Vec<usize>,
-    /// Function and arrow expressions, keyed by the span of the expression.
-    pub nested: HashMap<Span, usize>,
+    /// Function and arrow expressions, keyed by the address of the AST node.
+    pub nested: HashMap<usize, usize>,
     /// Block scopes, keyed by the address of the block node itself.
     pub blocks: HashMap<usize, ScopeId>,
     pub is_script: bool,
-    pub binding_name: Option<Sym>,
+    pub binding_name: Option<&'a str>,
     /// Inner name of a named function expression, bound in the function's own
     /// environment and initialised from the call's callee value.
-    pub self_binding: Option<Sym>,
+    pub self_binding: Option<&'a str>,
 }
 
-pub struct Program {
-    pub functions: Vec<FunctionPlan>,
-    pub scopes: Vec<ScopePlan>,
+pub struct Program<'a> {
+    pub functions: Vec<FunctionPlan<'a>>,
+    pub scopes: Vec<ScopePlan<'a>>,
 }
 
-impl Program {
-    pub fn scope(&self, id: ScopeId) -> &ScopePlan {
+impl<'a> Program<'a> {
+    pub fn scope(&self, id: ScopeId) -> &ScopePlan<'a> {
         &self.scopes[id.0]
     }
 
-    pub fn function(&self, id: usize) -> &FunctionPlan {
+    pub fn function(&self, id: usize) -> &FunctionPlan<'a> {
         &self.functions[id]
     }
 }
 
-/// Stable identity for an AST node: the plans own the parsed tree, so node
+/// Stable identity for an AST node: the plans borrow the parsed tree, so node
 /// addresses do not change between planning and code generation.
 pub fn node_key<T>(node: &T) -> usize {
     std::ptr::from_ref(node) as usize
 }
 
-pub fn build_program_plan(script: &Script) -> Result<Program, Error> {
+pub fn build_program_plan<'a>(
+    program: &'a oxc_ast::ast::Program<'a>,
+) -> Result<Program<'a>, Error> {
     let mut planner = Planner {
         functions: Vec::new(),
         scopes: Vec::new(),
@@ -111,7 +106,7 @@ pub fn build_program_plan(script: &Script) -> Result<Program, Error> {
         None,
         "__script".to_string(),
         Vec::new(),
-        script.statements().clone(),
+        program.body.as_slice(),
         true,
         None,
     )?;
@@ -122,12 +117,12 @@ pub fn build_program_plan(script: &Script) -> Result<Program, Error> {
     })
 }
 
-struct Planner {
-    functions: Vec<FunctionPlan>,
-    scopes: Vec<ScopePlan>,
+struct Planner<'a> {
+    functions: Vec<FunctionPlan<'a>>,
+    scopes: Vec<ScopePlan<'a>>,
 }
 
-impl Planner {
+impl<'a> Planner<'a> {
     fn new_scope(&mut self, owner: usize, parent: Option<ScopeId>) -> ScopeId {
         let id = ScopeId(self.scopes.len());
         self.scopes.push(ScopePlan {
@@ -152,30 +147,37 @@ impl Planner {
         }
     }
 
-    fn add_binding(&mut self, scope: ScopeId, sym: Sym) -> usize {
+    fn add_binding(&mut self, scope: ScopeId, name: &'a str) -> usize {
         let bindings = &mut self.scopes[scope.0].bindings;
-        if let Some(slot) = bindings.get(&sym).copied() {
+        if let Some(slot) = bindings.get(name).copied() {
             return slot;
         }
         let slot = bindings.len();
-        bindings.insert(sym, slot);
+        bindings.insert(name, slot);
         slot
     }
 
-    fn add_lexical(&mut self, scope: ScopeId, decl: &LexicalDeclaration) -> Result<(), Error> {
-        self.add_variable_list(scope, decl.variable_list())?;
-        let is_const = decl.is_const();
+    fn add_variables(
+        &mut self,
+        scope: ScopeId,
+        decl: &'a VariableDeclaration<'a>,
+    ) -> Result<(), Error> {
+        let is_const = decl.kind == VariableDeclarationKind::Const;
         let mut tdz_slots = Vec::new();
         let mut consts = Vec::new();
-        for var in decl.variable_list().as_ref() {
-            if let Binding::Identifier(id) = var.binding() {
-                let sym = id.sym();
-                if let Some(slot) = self.scopes[scope.0].bindings.get(&sym).copied() {
-                    tdz_slots.push(slot);
-                }
-                if is_const {
-                    consts.push(sym);
-                }
+        for var in &decl.declarations {
+            let BindingPattern::BindingIdentifier(id) = &var.id else {
+                return Err(Error::Unsupported(
+                    "destructuring bindings are not supported".to_string(),
+                ));
+            };
+            let name = id.name.as_str();
+            let slot = self.add_binding(scope, name);
+            if decl.kind != VariableDeclarationKind::Var {
+                tdz_slots.push(slot);
+            }
+            if is_const {
+                consts.push(name);
             }
         }
         let scope_plan = &mut self.scopes[scope.0];
@@ -192,10 +194,10 @@ impl Planner {
         &mut self,
         parent_scope: Option<ScopeId>,
         name: String,
-        params: Vec<ParamPlan>,
-        body: StatementList,
+        params: Vec<ParamPlan<'a>>,
+        body: &'a [Statement<'a>],
         is_script: bool,
-        self_binding: Option<Sym>,
+        self_binding: Option<&'a str>,
     ) -> Result<usize, Error> {
         let id = self.functions.len();
         let root_scope = self.new_scope(id, parent_scope);
@@ -204,7 +206,7 @@ impl Planner {
             name,
             root_scope,
             params: Vec::new(),
-            body: Rc::new(body),
+            body,
             children: Vec::new(),
             nested: HashMap::new(),
             blocks: HashMap::new(),
@@ -214,20 +216,19 @@ impl Planner {
         });
 
         for param in &params {
-            let slot = self.add_binding(root_scope, param.sym);
+            let slot = self.add_binding(root_scope, param.name);
             self.scopes[root_scope.0].tdz.insert(slot);
         }
-        if let Some(sym) = self_binding {
-            self.add_binding(root_scope, sym);
+        if let Some(name) = self_binding {
+            self.add_binding(root_scope, name);
         }
 
-        let body = Rc::clone(&self.functions[id].body);
         for param in &params {
-            if let Some(init) = &param.init {
+            if let Some(init) = param.init {
                 self.scan_expression(id, root_scope, init)?;
             }
         }
-        self.scan_statements(id, root_scope, &body)?;
+        self.scan_statements(id, root_scope, body)?;
         self.functions[id].params = params;
         Ok(id)
     }
@@ -237,10 +238,10 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        span: Span,
-        params: &FormalParameterList,
-        body: &FunctionBody,
-        self_binding: Option<Sym>,
+        key: usize,
+        params: &'a FormalParameters<'a>,
+        body: &'a FunctionBody<'a>,
+        self_binding: Option<&'a str>,
     ) -> Result<(), Error> {
         let params = collect_params(params)?;
         let name = format!("js_fn_{}", self.functions.len());
@@ -248,12 +249,12 @@ impl Planner {
             Some(scope),
             name,
             params,
-            body.statement_list().clone(),
+            body.statements.as_slice(),
             false,
             self_binding,
         )?;
         self.mark_captured(scope);
-        self.functions[plan_id].nested.insert(span, child);
+        self.functions[plan_id].nested.insert(key, child);
         Ok(())
     }
 
@@ -261,15 +262,10 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        list: &StatementList,
+        list: &'a [Statement<'a>],
     ) -> Result<(), Error> {
-        for item in list.statements() {
-            match item {
-                StatementListItem::Statement(stmt) => self.scan_statement(plan_id, scope, stmt)?,
-                StatementListItem::Declaration(decl) => {
-                    self.scan_declaration(plan_id, scope, decl)?;
-                }
-            }
+        for stmt in list {
+            self.scan_statement(plan_id, scope, stmt)?;
         }
         Ok(())
     }
@@ -278,68 +274,77 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        stmt: &Statement,
+        stmt: &'a Statement<'a>,
     ) -> Result<(), Error> {
         match stmt {
-            Statement::Block(block) => {
+            Statement::BlockStatement(block) => {
                 let block_scope = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
-                    .insert(node_key(block), block_scope);
-                self.scan_statements(plan_id, block_scope, block.statement_list())?;
+                    .insert(node_key(&**block), block_scope);
+                self.scan_statements(plan_id, block_scope, block.body.as_slice())?;
             }
-            Statement::Var(var) => {
-                let root = self.root_scope(plan_id);
-                self.add_variable_list(root, &var.0)?;
-                self.scan_initializers(plan_id, scope, &var.0)?;
+            Statement::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    let root = self.root_scope(plan_id);
+                    self.add_variables(root, decl)?;
+                } else {
+                    self.add_variables(scope, decl)?;
+                }
+                self.scan_initializers(plan_id, scope, decl)?;
             }
-            Statement::Expression(expr) => self.scan_expression(plan_id, scope, expr)?,
-            Statement::If(if_stmt) => {
-                self.scan_expression(plan_id, scope, if_stmt.cond())?;
-                self.scan_statement(plan_id, scope, if_stmt.body())?;
-                if let Some(else_node) = if_stmt.else_node() {
+            Statement::FunctionDeclaration(func) => {
+                self.add_function_declaration(plan_id, func)?;
+            }
+            Statement::ExpressionStatement(expr) => {
+                self.scan_expression(plan_id, scope, &expr.expression)?;
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.scan_expression(plan_id, scope, &if_stmt.test)?;
+                self.scan_statement(plan_id, scope, &if_stmt.consequent)?;
+                if let Some(else_node) = &if_stmt.alternate {
                     self.scan_statement(plan_id, scope, else_node)?;
                 }
             }
-            Statement::WhileLoop(while_stmt) => {
-                self.scan_expression(plan_id, scope, while_stmt.condition())?;
-                self.scan_statement(plan_id, scope, while_stmt.body())?;
+            Statement::WhileStatement(while_stmt) => {
+                self.scan_expression(plan_id, scope, &while_stmt.test)?;
+                self.scan_statement(plan_id, scope, &while_stmt.body)?;
             }
-            Statement::DoWhileLoop(do_while) => {
-                self.scan_statement(plan_id, scope, do_while.body())?;
-                self.scan_expression(plan_id, scope, do_while.cond())?;
+            Statement::DoWhileStatement(do_while) => {
+                self.scan_statement(plan_id, scope, &do_while.body)?;
+                self.scan_expression(plan_id, scope, &do_while.test)?;
             }
-            Statement::ForLoop(for_stmt) => self.scan_for_loop(plan_id, scope, for_stmt)?,
-            Statement::Switch(switch_stmt) => {
+            Statement::ForStatement(for_stmt) => self.scan_for_loop(plan_id, scope, for_stmt)?,
+            Statement::SwitchStatement(switch_stmt) => {
                 let switch_scope = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
-                    .insert(node_key(switch_stmt), switch_scope);
-                self.scan_expression(plan_id, scope, switch_stmt.val())?;
-                for case in switch_stmt.cases() {
-                    if let Some(condition) = case.condition() {
+                    .insert(node_key(&**switch_stmt), switch_scope);
+                self.scan_expression(plan_id, scope, &switch_stmt.discriminant)?;
+                for case in &switch_stmt.cases {
+                    if let Some(condition) = &case.test {
                         self.scan_expression(plan_id, switch_scope, condition)?;
                     }
-                    self.scan_statements(plan_id, switch_scope, case.body())?;
+                    self.scan_statements(plan_id, switch_scope, case.consequent.as_slice())?;
                 }
             }
-            Statement::Return(ret) => {
-                if let Some(target) = ret.target() {
+            Statement::ReturnStatement(ret) => {
+                if let Some(target) = &ret.argument {
                     self.scan_expression(plan_id, scope, target)?;
                 }
             }
-            Statement::Labelled(labelled) => match labelled.item() {
-                LabelledItem::Statement(stmt) => self.scan_statement(plan_id, scope, stmt)?,
-                LabelledItem::FunctionDeclaration(_) => {
+            Statement::LabeledStatement(labelled) => {
+                if matches!(&labelled.body, Statement::FunctionDeclaration(_)) {
                     return Err(Error::Unsupported(
                         "labelled function declarations are not supported".to_string(),
                     ));
                 }
-            },
-            Statement::Empty
-            | Statement::Debugger
-            | Statement::Break(_)
-            | Statement::Continue(_) => {}
+                self.scan_statement(plan_id, scope, &labelled.body)?;
+            }
+            Statement::EmptyStatement(_)
+            | Statement::DebuggerStatement(_)
+            | Statement::BreakStatement(_)
+            | Statement::ContinueStatement(_) => {}
             other => {
                 return Err(Error::Unsupported(format!(
                     "statement not supported: {other:?}"
@@ -355,99 +360,73 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        for_stmt: &boa_ast::statement::iteration::ForLoop,
+        for_stmt: &'a ForStatement<'a>,
     ) -> Result<(), Error> {
         let mut loop_scope = scope;
-        match for_stmt.init() {
-            Some(ForLoopInitializer::Lexical(lex)) => {
+        match &for_stmt.init {
+            Some(ForStatementInit::VariableDeclaration(decl))
+                if decl.kind != VariableDeclarationKind::Var =>
+            {
                 let inner = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
                     .insert(node_key(for_stmt), inner);
-                self.add_lexical(inner, lex.declaration())?;
-                self.scan_initializers(plan_id, inner, lex.declaration().variable_list())?;
+                self.add_variables(inner, decl)?;
+                self.scan_initializers(plan_id, inner, decl)?;
                 loop_scope = inner;
             }
-            Some(ForLoopInitializer::Var(var)) => {
+            Some(ForStatementInit::VariableDeclaration(decl)) => {
                 let root = self.root_scope(plan_id);
-                self.add_variable_list(root, &var.0)?;
-                self.scan_initializers(plan_id, loop_scope, &var.0)?;
+                self.add_variables(root, decl)?;
+                self.scan_initializers(plan_id, loop_scope, decl)?;
             }
-            Some(ForLoopInitializer::Expression(expr)) => {
-                self.scan_expression(plan_id, loop_scope, expr)?;
+            Some(init) => {
+                if let Some(expr) = init.as_expression() {
+                    self.scan_expression(plan_id, loop_scope, expr)?;
+                }
             }
             None => {}
         }
-        if let Some(condition) = for_stmt.condition() {
+        if let Some(condition) = &for_stmt.test {
             self.scan_expression(plan_id, loop_scope, condition)?;
         }
-        if let Some(update) = for_stmt.final_expr() {
+        if let Some(update) = &for_stmt.update {
             self.scan_expression(plan_id, loop_scope, update)?;
         }
-        self.scan_statement(plan_id, loop_scope, for_stmt.body())?;
-        Ok(())
-    }
-
-    fn scan_declaration(
-        &mut self,
-        plan_id: usize,
-        scope: ScopeId,
-        decl: &Declaration,
-    ) -> Result<(), Error> {
-        match decl {
-            Declaration::FunctionDeclaration(func) => {
-                self.add_function_declaration(plan_id, func)?;
-            }
-            Declaration::Lexical(lex) => {
-                self.add_lexical(scope, lex)?;
-                self.scan_initializers(plan_id, scope, lex.variable_list())?;
-            }
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "declaration not supported: {other:?}"
-                )));
-            }
-        }
+        self.scan_statement(plan_id, loop_scope, &for_stmt.body)?;
         Ok(())
     }
 
     fn add_function_declaration(
         &mut self,
         plan_id: usize,
-        func: &FunctionDeclaration,
+        func: &'a Function<'a>,
     ) -> Result<(), Error> {
+        let id = func
+            .id
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("function declaration without a name".to_string()))?;
+        let name = id.name.as_str();
         let root = self.root_scope(plan_id);
-        self.add_binding(root, func.name().sym());
+        self.add_binding(root, name);
 
-        let params = collect_params(func.parameters())?;
-        let name = format!("js_fn_{}", self.functions.len());
+        let params = collect_params(&func.params)?;
+        let child_name = format!("js_fn_{}", self.functions.len());
+        let body = func
+            .body
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("function without a body".to_string()))?;
         let child = self.build_function_plan(
             Some(root),
-            name,
+            child_name,
             params,
-            func.body().statement_list().clone(),
+            body.statements.as_slice(),
             false,
             None,
         )?;
         self.mark_captured(root);
-        self.functions[child].binding_name = Some(func.name().sym());
+        self.functions[child].binding_name = Some(name);
         self.functions[plan_id].children.push(child);
-        Ok(())
-    }
-
-    fn add_variable_list(&mut self, scope: ScopeId, list: &VariableList) -> Result<(), Error> {
-        for var in list.as_ref() {
-            match var.binding() {
-                Binding::Identifier(id) => {
-                    self.add_binding(scope, id.sym());
-                }
-                Binding::Pattern(_) => {
-                    return Err(Error::Unsupported(
-                        "destructuring bindings are not supported".to_string(),
-                    ));
-                }
-            }
-        }
         Ok(())
     }
 
@@ -455,10 +434,10 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        list: &VariableList,
+        decl: &'a VariableDeclaration<'a>,
     ) -> Result<(), Error> {
-        for var in list.as_ref() {
-            if let Some(init) = var.init() {
+        for var in &decl.declarations {
+            if let Some(init) = &var.init {
                 self.scan_expression(plan_id, scope, init)?;
             }
         }
@@ -472,56 +451,75 @@ impl Planner {
         &mut self,
         plan_id: usize,
         scope: ScopeId,
-        expr: &Expression,
+        expr: &'a Expression<'a>,
     ) -> Result<(), Error> {
         match expr {
             Expression::FunctionExpression(func) => {
+                let body = func
+                    .body
+                    .as_ref()
+                    .ok_or_else(|| Error::Unsupported("function without a body".to_string()))?;
                 self.add_nested_function(
                     plan_id,
                     scope,
-                    func.span(),
-                    func.parameters(),
-                    func.body(),
-                    func.name().map(|id| id.sym()),
+                    node_key(&**func),
+                    &func.params,
+                    body,
+                    func.id.as_ref().map(|id| id.name.as_str()),
                 )?;
             }
-            Expression::ArrowFunction(arrow) => {
+            Expression::ArrowFunctionExpression(arrow) => {
                 self.add_nested_function(
                     plan_id,
                     scope,
-                    arrow.span(),
-                    arrow.parameters(),
-                    arrow.body(),
+                    node_key(&**arrow),
+                    &arrow.params,
+                    &arrow.body,
                     None,
                 )?;
             }
-            Expression::Parenthesized(paren) => {
-                self.scan_expression(plan_id, scope, paren.expression())?;
+            Expression::ParenthesizedExpression(paren) => {
+                self.scan_expression(plan_id, scope, &paren.expression)?;
             }
-            Expression::Binary(binary) => {
-                self.scan_expression(plan_id, scope, binary.lhs())?;
-                self.scan_expression(plan_id, scope, binary.rhs())?;
+            Expression::BinaryExpression(binary) => {
+                self.scan_expression(plan_id, scope, &binary.left)?;
+                self.scan_expression(plan_id, scope, &binary.right)?;
             }
-            Expression::Unary(unary) => self.scan_expression(plan_id, scope, unary.target())?,
-            Expression::Conditional(conditional) => {
-                self.scan_expression(plan_id, scope, conditional.condition())?;
-                self.scan_expression(plan_id, scope, conditional.if_true())?;
-                self.scan_expression(plan_id, scope, conditional.if_false())?;
+            Expression::LogicalExpression(logical) => {
+                self.scan_expression(plan_id, scope, &logical.left)?;
+                self.scan_expression(plan_id, scope, &logical.right)?;
             }
-            Expression::Assign(assign) => {
-                self.scan_expression(plan_id, scope, assign.rhs())?;
+            Expression::UnaryExpression(unary) => {
+                self.scan_expression(plan_id, scope, &unary.argument)?;
             }
-            Expression::Call(call) => {
-                self.scan_expression(plan_id, scope, call.function())?;
-                for arg in call.args() {
-                    self.scan_expression(plan_id, scope, arg)?;
+            Expression::UpdateExpression(_) => {}
+            Expression::ConditionalExpression(conditional) => {
+                self.scan_expression(plan_id, scope, &conditional.test)?;
+                self.scan_expression(plan_id, scope, &conditional.consequent)?;
+                self.scan_expression(plan_id, scope, &conditional.alternate)?;
+            }
+            Expression::AssignmentExpression(assign) => {
+                self.scan_expression(plan_id, scope, &assign.right)?;
+            }
+            Expression::SequenceExpression(sequence) => {
+                for expr in &sequence.expressions {
+                    self.scan_expression(plan_id, scope, expr)?;
                 }
             }
-            Expression::PropertyAccess(PropertyAccess::Simple(simple)) => {
-                self.scan_expression(plan_id, scope, simple.target())?;
-                if let PropertyAccessField::Expr(field) = simple.field() {
-                    self.scan_expression(plan_id, scope, field)?;
+            Expression::CallExpression(call) => {
+                self.scan_expression(plan_id, scope, &call.callee)?;
+                for arg in &call.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.scan_expression(plan_id, scope, expr)?;
+                    }
                 }
+            }
+            Expression::StaticMemberExpression(simple) => {
+                self.scan_expression(plan_id, scope, &simple.object)?;
+            }
+            Expression::ComputedMemberExpression(computed) => {
+                self.scan_expression(plan_id, scope, &computed.object)?;
+                self.scan_expression(plan_id, scope, &computed.expression)?;
             }
             _ => {}
         }
@@ -529,48 +527,46 @@ impl Planner {
     }
 }
 
-fn collect_params(params: &FormalParameterList) -> Result<Vec<ParamPlan>, Error> {
+fn collect_params<'a>(params: &'a FormalParameters<'a>) -> Result<Vec<ParamPlan<'a>>, Error> {
+    if params.rest.is_some() {
+        return Err(Error::Unsupported(
+            "rest parameters are not supported".to_string(),
+        ));
+    }
     let mut out = Vec::new();
-    for param in params.as_ref() {
-        if param.is_rest_param() {
+    for param in &params.items {
+        let BindingPattern::BindingIdentifier(id) = &param.pattern else {
             return Err(Error::Unsupported(
-                "rest parameters are not supported".to_string(),
+                "destructuring parameters are not supported".to_string(),
             ));
-        }
-        match param.variable().binding() {
-            Binding::Identifier(id) => out.push(ParamPlan {
-                sym: id.sym(),
-                init: param.init().cloned(),
-            }),
-            Binding::Pattern(_) => {
-                return Err(Error::Unsupported(
-                    "destructuring parameters are not supported".to_string(),
-                ));
-            }
-        }
+        };
+        out.push(ParamPlan {
+            name: id.name.as_str(),
+            init: param.initializer.as_deref(),
+        });
     }
     Ok(out)
 }
 
-/// True when `sym` resolves to a `const` binding in scope from `start`.
-pub fn is_const(program: &Program, start: ScopeId, sym: Sym) -> bool {
+/// True when `name` resolves to a `const` binding in scope from `start`.
+pub fn is_const(program: &Program<'_>, start: ScopeId, name: &str) -> bool {
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
-        if scope.bindings.contains_key(&sym) {
-            return scope.consts.contains(&sym);
+        if scope.bindings.contains_key(name) {
+            return scope.consts.contains(name);
         }
         current = scope.parent;
     }
     false
 }
 
-/// True when `sym` resolves to a binding that starts in the temporal dead zone.
-pub fn needs_tdz_check(program: &Program, start: ScopeId, sym: Sym) -> bool {
+/// True when `name` resolves to a binding that starts in the temporal dead zone.
+pub fn needs_tdz_check(program: &Program<'_>, start: ScopeId, name: &str) -> bool {
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
-        if let Some(&slot) = scope.bindings.get(&sym) {
+        if let Some(&slot) = scope.bindings.get(name) {
             return scope.tdz.contains(&slot);
         }
         current = scope.parent;
@@ -578,13 +574,17 @@ pub fn needs_tdz_check(program: &Program, start: ScopeId, sym: Sym) -> bool {
     false
 }
 
-/// Resolves `sym` from `start`, returning the scope that owns the binding and
+/// Resolves `name` from `start`, returning the scope that owns the binding and
 /// its slot.
-pub fn resolve_binding(program: &Program, start: ScopeId, sym: Sym) -> Option<(ScopeId, usize)> {
+pub fn resolve_binding(
+    program: &Program<'_>,
+    start: ScopeId,
+    name: &str,
+) -> Option<(ScopeId, usize)> {
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
-        if let Some(&slot) = scope.bindings.get(&sym) {
+        if let Some(&slot) = scope.bindings.get(name) {
             return Some((id, slot));
         }
         current = scope.parent;
@@ -592,14 +592,14 @@ pub fn resolve_binding(program: &Program, start: ScopeId, sym: Sym) -> Option<(S
     None
 }
 
-/// Resolves `sym` from `start`, returning how many environment pointers to
+/// Resolves `name` from `start`, returning how many environment pointers to
 /// follow and the slot inside that environment.
-pub fn resolve(program: &Program, start: ScopeId, sym: Sym) -> Option<(usize, usize)> {
+pub fn resolve(program: &Program<'_>, start: ScopeId, name: &str) -> Option<(usize, usize)> {
     let mut depth = 0usize;
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
-        if let Some(&slot) = scope.bindings.get(&sym) {
+        if let Some(&slot) = scope.bindings.get(name) {
             return Some((depth, slot));
         }
         if scope.has_env() {

@@ -1,6 +1,6 @@
 //! A small JavaScript-to-native compiler for the 0.6.0 roadmap subset.
 //!
-//! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
+//! The engine parses JavaScript with `oxc-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
 //!
 //! ```
@@ -102,9 +102,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use boa_ast::scope::Scope;
-use boa_interner::Interner;
-use boa_parser::{Parser, Source};
 use cranelift_codegen::{
     ir::Function,
     isa,
@@ -112,6 +109,9 @@ use cranelift_codegen::{
 };
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use oxc_allocator::Allocator;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
 use target_lexicon::Triple;
 
 use plan::build_program_plan;
@@ -130,12 +130,16 @@ impl Engine {
     }
 
     pub fn compile(&self, source: &str) -> Result<IrModule, Error> {
-        let mut interner = Interner::default();
-        let scope = Scope::new_global();
-        let mut parser = Parser::new(Source::from_bytes(source));
-        let script = parser.parse_script(&scope, &mut interner)?;
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
+        if let Some(error) = parsed.errors.first() {
+            return Err(Error::Parse(error.to_string()));
+        }
+        if parsed.panicked {
+            return Err(Error::Parse("parser aborted".to_string()));
+        }
 
-        let program = build_program_plan(&script)?;
+        let program = build_program_plan(&parsed.program)?;
 
         let triple = Triple::host();
         let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
@@ -153,7 +157,7 @@ impl Engine {
 
         let obj_builder = ObjectBuilder::new(isa, "sealion_module", default_libcall_names())?;
         let mut module = ObjectModule::new(obj_builder);
-        let builtins = builtins::Builtins::new(&mut module, &mut interner)?;
+        let builtins = builtins::Builtins::new(&mut module)?;
 
         let js_sig = compiler::make_js_signature(&module);
         let calloc_sig = compiler::make_calloc_signature(&module);
