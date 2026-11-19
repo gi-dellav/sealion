@@ -1,6 +1,8 @@
 # sealion
 Experimental JS engine built on Cranelift
 
+<img src="https://news.ucsc.edu/wp-content/uploads/2025/04/ronan-beats-humans-scaled.jpg" alt="Sealion" width="600">
+
 ## Try it out
 
 Requires latest Rust toolchain.
