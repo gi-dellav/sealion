@@ -40,15 +40,15 @@
 //!
 //! Blocks are real lexical scopes: `let`/`const` shadow their enclosing scope
 //! and disappear at the closing brace, while `var` and function declarations
-//! hoist to the enclosing function. Each scope that owns bindings gets its own
-//! `calloc`ed environment record linked to its parent, so a closure captures
-//! whatever environment is current where the expression is evaluated (and a
-//! `let` inside a loop body yields a fresh environment per iteration).
+//! hoist to the enclosing function. Scopes that a closure may capture get a
+//! `calloc`ed environment record linked to its parent; all other bindings stay
+//! in machine registers. A captured `let` in a loop body therefore gets a fresh
+//! environment per iteration, while an uncaptured one does not.
 //!
 //! Consequences of the current environment model:
 //!
-//! - Environments are never freed; a block that runs in a loop allocates once
-//!   per iteration.
+//! - Captured environments are never freed; a captured block that runs in a
+//!   loop allocates once per iteration.
 //! - `let`/`const` bindings and parameters start in the temporal dead zone;
 //!   reading one before its declaration runs traps instead of yielding
 //!   `undefined`.
@@ -142,6 +142,9 @@ impl Engine {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("is_pic", "true")
+            .map_err(|e| Error::Codegen(e.to_string()))?;
+        flag_builder
+            .set("opt_level", "speed")
             .map_err(|e| Error::Codegen(e.to_string()))?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder

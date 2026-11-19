@@ -3,12 +3,12 @@
 //! Every `let`/`const` declaration opens a block scope; `var` declarations and
 //! function declarations are hoisted to the root scope of their function.
 //!
-//! At runtime each scope that owns bindings gets its own environment record: a
-//! `calloc`ed block whose first word points at the enclosing environment, so
-//! name lookup walks a chain of environment pointers. Scopes without bindings
-//! share their parent's environment, which keeps the compiled code free of
-//! useless allocations. Closures capture the environment that is current where
-//! the function expression is evaluated.
+//! Scopes whose bindings may be captured by a closure get an environment
+//! record: a `calloc`ed block whose first word points at the enclosing
+//! environment, so name lookup walks a chain of environment pointers. Bindings
+//! in scopes that no closure can capture are kept in machine registers instead.
+//! Closures capture the environment that is current where the function
+//! expression is evaluated.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,7 +26,7 @@ use boa_interner::Sym;
 
 use crate::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub usize);
 
 #[derive(Debug, Clone)]
@@ -38,19 +38,22 @@ pub struct ParamPlan {
 #[derive(Debug, Clone)]
 pub struct ScopePlan {
     pub parent: Option<ScopeId>,
+    /// The function plan that owns this scope.
+    pub owner: usize,
     pub bindings: HashMap<Sym, usize>,
     /// Bindings declared with `const`, which may not be assigned to.
     pub consts: HashSet<Sym>,
     /// Slots that start in the temporal dead zone (`let`, `const`, parameters).
     pub tdz: HashSet<usize>,
-    /// Root scopes of a function always own an environment, so that the
-    /// function's own frame exists even when it declares nothing.
-    pub function_root: bool,
+    /// True when a nested function may capture bindings from this scope.
+    /// Non-captured bindings can live in registers instead of an environment.
+    pub captured: bool,
 }
 
 impl ScopePlan {
-    pub fn allocated(&self) -> bool {
-        self.function_root || !self.bindings.is_empty()
+    /// True when the scope needs a runtime environment record.
+    pub fn has_env(&self) -> bool {
+        self.captured
     }
 
     pub fn slot_count(&self) -> usize {
@@ -125,16 +128,28 @@ struct Planner {
 }
 
 impl Planner {
-    fn new_scope(&mut self, parent: Option<ScopeId>, function_root: bool) -> ScopeId {
+    fn new_scope(&mut self, owner: usize, parent: Option<ScopeId>) -> ScopeId {
         let id = ScopeId(self.scopes.len());
         self.scopes.push(ScopePlan {
             parent,
+            owner,
             bindings: HashMap::new(),
             consts: HashSet::new(),
             tdz: HashSet::new(),
-            function_root,
+            captured: false,
         });
         id
+    }
+
+    /// Marks a scope and every lexical ancestor as potentially captured by a
+    /// closure, so their bindings stay in environment records.
+    fn mark_captured(&mut self, start: ScopeId) {
+        let mut current = Some(start);
+        while let Some(id) = current {
+            let scope = &mut self.scopes[id.0];
+            scope.captured = true;
+            current = scope.parent;
+        }
     }
 
     fn add_binding(&mut self, scope: ScopeId, sym: Sym) -> usize {
@@ -183,7 +198,7 @@ impl Planner {
         self_binding: Option<Sym>,
     ) -> Result<usize, Error> {
         let id = self.functions.len();
-        let root_scope = self.new_scope(parent_scope, true);
+        let root_scope = self.new_scope(id, parent_scope);
         self.functions.push(FunctionPlan {
             id,
             name,
@@ -237,6 +252,7 @@ impl Planner {
             false,
             self_binding,
         )?;
+        self.mark_captured(scope);
         self.functions[plan_id].nested.insert(span, child);
         Ok(())
     }
@@ -266,7 +282,7 @@ impl Planner {
     ) -> Result<(), Error> {
         match stmt {
             Statement::Block(block) => {
-                let block_scope = self.new_scope(Some(scope), false);
+                let block_scope = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
                     .insert(node_key(block), block_scope);
@@ -295,7 +311,7 @@ impl Planner {
             }
             Statement::ForLoop(for_stmt) => self.scan_for_loop(plan_id, scope, for_stmt)?,
             Statement::Switch(switch_stmt) => {
-                let switch_scope = self.new_scope(Some(scope), false);
+                let switch_scope = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
                     .insert(node_key(switch_stmt), switch_scope);
@@ -344,7 +360,7 @@ impl Planner {
         let mut loop_scope = scope;
         match for_stmt.init() {
             Some(ForLoopInitializer::Lexical(lex)) => {
-                let inner = self.new_scope(Some(scope), false);
+                let inner = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
                     .blocks
                     .insert(node_key(for_stmt), inner);
@@ -413,6 +429,7 @@ impl Planner {
             false,
             None,
         )?;
+        self.mark_captured(root);
         self.functions[child].binding_name = Some(func.name().sym());
         self.functions[plan_id].children.push(child);
         Ok(())
@@ -561,18 +578,32 @@ pub fn needs_tdz_check(program: &Program, start: ScopeId, sym: Sym) -> bool {
     false
 }
 
-/// Resolves `sym` from `start`, returning how many environment pointers to
-/// follow and the slot inside that environment.
-pub fn resolve(program: &Program, start: ScopeId, sym: Sym) -> Option<(usize, usize)> {
-    let mut allocated = 0usize;
+/// Resolves `sym` from `start`, returning the scope that owns the binding and
+/// its slot.
+pub fn resolve_binding(program: &Program, start: ScopeId, sym: Sym) -> Option<(ScopeId, usize)> {
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
-        if scope.allocated() {
-            allocated += 1;
-        }
         if let Some(&slot) = scope.bindings.get(&sym) {
-            return Some((allocated - 1, slot));
+            return Some((id, slot));
+        }
+        current = scope.parent;
+    }
+    None
+}
+
+/// Resolves `sym` from `start`, returning how many environment pointers to
+/// follow and the slot inside that environment.
+pub fn resolve(program: &Program, start: ScopeId, sym: Sym) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut current = Some(start);
+    while let Some(id) = current {
+        let scope = &program.scopes[id.0];
+        if let Some(&slot) = scope.bindings.get(&sym) {
+            return Some((depth, slot));
+        }
+        if scope.has_env() {
+            depth += 1;
         }
         current = scope.parent;
     }

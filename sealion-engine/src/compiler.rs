@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use boa_ast::{
     Declaration, Span, Spanned, Statement, StatementList, StatementListItem,
@@ -20,14 +20,16 @@ use cranelift_codegen::ir::{
     AbiParam, Block, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature, TrapCode,
     UserFuncName, Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};
 use cranelift_object::ObjectModule;
 
 use crate::{
     Error, IrFunction,
     builtins::{self, Builtins},
-    plan::{Program, ScopeId, ScopePlan, is_const, needs_tdz_check, node_key, resolve},
+    plan::{
+        Program, ScopeId, ScopePlan, is_const, needs_tdz_check, node_key, resolve, resolve_binding,
+    },
     value,
 };
 
@@ -88,6 +90,7 @@ pub fn compile_functions(
     imports: &Imports,
     builtins: &Builtins,
 ) -> Result<Vec<IrFunction>, Error> {
+    let numeric = analyze_numeric_bindings(program, builtins);
     let mut raws = Vec::new();
 
     for plan in &program.functions {
@@ -116,8 +119,15 @@ pub fn compile_functions(
         let args_param = builder.block_params(entry)[1];
         let self_param = builder.block_params(entry)[2];
         let root_scope = program.scope(plan.root_scope);
-        let env = alloc_env(&mut builder, calloc_ref, root_scope.slot_count(), env_param);
-        init_slots(&mut builder, env, root_scope);
+        let vars = declare_vars(&mut builder, program, plan.id);
+        let env = if root_scope.has_env() {
+            let env = alloc_env(&mut builder, calloc_ref, root_scope.slot_count(), env_param);
+            init_slots(&mut builder, env, root_scope);
+            env
+        } else {
+            init_local_slots(&mut builder, &vars, plan.root_scope, root_scope);
+            env_param
+        };
 
         let ctx = CodegenCtx {
             program,
@@ -131,16 +141,12 @@ pub fn compile_functions(
             child_refs: &child_refs,
             builtins,
             builtin_refs: &builtin_refs,
+            vars: &vars,
+            numeric: &numeric,
         };
 
         if let Some(self_sym) = plan.self_binding {
-            let slot = *root_scope
-                .bindings
-                .get(&self_sym)
-                .ok_or_else(|| Error::Codegen("missing self binding slot".to_string()))?;
-            builder
-                .ins()
-                .store(MemFlags::new(), self_param, env, (8 + 8 * slot) as i32);
+            store_var(&mut builder, &ctx, self_sym, self_param)?;
         }
 
         if !plan.is_script {
@@ -149,10 +155,6 @@ pub fn compile_functions(
                 .ins()
                 .load(types::I64, MemFlags::new(), args_param, 0i32);
             for (i, param) in plan.params.iter().enumerate() {
-                let slot = *root_scope
-                    .bindings
-                    .get(&param.sym)
-                    .ok_or_else(|| Error::Codegen("missing parameter slot".to_string()))?;
                 let idx = builder.ins().iconst(types::I64, i as i64);
                 let present = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                 let loaded =
@@ -164,9 +166,7 @@ pub fn compile_functions(
                     Some(init) => compile_default(&mut builder, &ctx, arg, init)?,
                     None => arg,
                 };
-                builder
-                    .ins()
-                    .store(MemFlags::new(), value, env, (8 + 8 * slot) as i32);
+                store_var(&mut builder, &ctx, param.sym, value)?;
             }
         }
 
@@ -175,15 +175,9 @@ pub fn compile_functions(
             let sym = child_plan
                 .binding_name
                 .ok_or_else(|| Error::Codegen("missing function binding".to_string()))?;
-            let slot = *root_scope
-                .bindings
-                .get(&sym)
-                .ok_or_else(|| Error::Codegen("missing function slot".to_string()))?;
             let code = builder.ins().func_addr(types::I64, child_refs[&child_id]);
-            let closure = new_closure(&mut builder, calloc_ref, code, env);
-            builder
-                .ins()
-                .store(MemFlags::new(), closure, env, (8 + 8 * slot) as i32);
+            let closure = new_closure(&mut builder, calloc_ref, code, ctx.env);
+            store_var(&mut builder, &ctx, sym, closure)?;
         }
 
         let mut loops = Vec::new();
@@ -251,6 +245,387 @@ pub fn compile_main(
     Ok(raw)
 }
 
+/// True when a builtin call always returns a plain number.
+fn numeric_builtin_call(
+    program: &Program,
+    builtins: &Builtins,
+    scope: ScopeId,
+    call: &boa_ast::expression::Call,
+) -> bool {
+    match call.function() {
+        Expression::PropertyAccess(PropertyAccess::Simple(access)) => {
+            let Expression::Identifier(id) = access.target() else {
+                return false;
+            };
+            if resolve_binding(program, scope, id.sym()).is_some() {
+                return false;
+            }
+            let Some(namespace) = builtins.namespace(id.sym()) else {
+                return false;
+            };
+            let PropertyAccessField::Const(field) = access.field() else {
+                return false;
+            };
+            let Some(name) = builtins.property(field.sym()) else {
+                return false;
+            };
+            builtins.has(namespace, name) && matches!(namespace, builtins::Namespace::Math)
+        }
+        Expression::Identifier(id) if resolve_binding(program, scope, id.sym()).is_none() => {
+            matches!(builtins.global_function(id.sym()), Some("Number"))
+        }
+        _ => false,
+    }
+}
+
+fn numeric_property(
+    program: &Program,
+    builtins: &Builtins,
+    scope: ScopeId,
+    access: &PropertyAccess,
+) -> bool {
+    let PropertyAccess::Simple(access) = access else {
+        return false;
+    };
+    let Expression::Identifier(id) = access.target() else {
+        return false;
+    };
+    if resolve_binding(program, scope, id.sym()).is_some() {
+        return false;
+    }
+    let Some(namespace) = builtins.namespace(id.sym()) else {
+        return false;
+    };
+    let PropertyAccessField::Const(field) = access.field() else {
+        return false;
+    };
+    let Some(name) = builtins.property(field.sym()) else {
+        return false;
+    };
+    builtins.constant(namespace, name).is_some()
+}
+
+/// True when evaluating `expr` is guaranteed to produce an untagged number.
+fn known_number_expr(
+    program: &Program,
+    builtins: &Builtins,
+    numeric: &HashSet<(ScopeId, usize)>,
+    scope: ScopeId,
+    expr: &Expression,
+) -> bool {
+    match expr {
+        Expression::Literal(lit) => {
+            matches!(lit.kind(), LiteralKind::Num(_) | LiteralKind::Int(_))
+        }
+        Expression::Parenthesized(paren) => {
+            known_number_expr(program, builtins, numeric, scope, paren.expression())
+        }
+        Expression::Identifier(id) => match resolve_binding(program, scope, id.sym()) {
+            Some(key) => numeric.contains(&key),
+            None => builtins.global_constant(id.sym()).is_some(),
+        },
+        Expression::Binary(binary) => match binary.op() {
+            BinaryOp::Arithmetic(_) | BinaryOp::Bitwise(_) => true,
+            BinaryOp::Comma => known_number_expr(program, builtins, numeric, scope, binary.rhs()),
+            _ => false,
+        },
+        Expression::Unary(unary) => {
+            matches!(unary.op(), UnaryOp::Minus | UnaryOp::Plus | UnaryOp::Tilde)
+        }
+        Expression::Conditional(conditional) => {
+            known_number_expr(program, builtins, numeric, scope, conditional.if_true())
+                && known_number_expr(program, builtins, numeric, scope, conditional.if_false())
+        }
+        Expression::Assign(assign) => match assign.op() {
+            AssignOp::Assign => known_number_expr(program, builtins, numeric, scope, assign.rhs()),
+            AssignOp::BoolAnd | AssignOp::BoolOr | AssignOp::Coalesce => false,
+            _ => true,
+        },
+        Expression::Update(_) => true,
+        Expression::Call(call) => numeric_builtin_call(program, builtins, scope, call),
+        Expression::PropertyAccess(access) => numeric_property(program, builtins, scope, access),
+        _ => false,
+    }
+}
+
+fn expr_is_number(ctx: &CodegenCtx<'_>, expr: &Expression) -> bool {
+    known_number_expr(ctx.program, ctx.builtins, ctx.numeric, ctx.scope, expr)
+}
+
+fn binding_is_number(ctx: &CodegenCtx<'_>, sym: Sym) -> bool {
+    resolve_binding(ctx.program, ctx.scope, sym).is_some_and(|key| ctx.numeric.contains(&key))
+}
+
+fn number_value(builder: &mut FunctionBuilder, value: Value, known: bool) -> Value {
+    if known {
+        value
+    } else {
+        value::to_number(builder, value)
+    }
+}
+
+/// The value a write stores is numeric for plain assignments when the RHS is
+/// numeric, and always for arithmetic/bitwise compound assignments.
+fn assignment_write_is_numeric(
+    program: &Program,
+    builtins: &Builtins,
+    numeric: &HashSet<(ScopeId, usize)>,
+    scope: ScopeId,
+    op: AssignOp,
+    rhs: &Expression,
+) -> bool {
+    match op {
+        AssignOp::Assign | AssignOp::BoolAnd | AssignOp::BoolOr | AssignOp::Coalesce => {
+            known_number_expr(program, builtins, numeric, scope, rhs)
+        }
+        _ => true,
+    }
+}
+
+struct NumericWalker<'a> {
+    program: &'a Program,
+    builtins: &'a Builtins,
+    numeric: &'a HashSet<(ScopeId, usize)>,
+    removed: &'a mut HashSet<(ScopeId, usize)>,
+}
+
+impl<'a> NumericWalker<'a> {
+    fn statements(&mut self, plan_id: usize, scope: ScopeId, list: &StatementList) {
+        for item in list.statements() {
+            match item {
+                StatementListItem::Statement(stmt) => self.statement(plan_id, scope, stmt),
+                StatementListItem::Declaration(decl) => {
+                    self.declaration(plan_id, scope, decl);
+                }
+            }
+        }
+    }
+
+    fn node_scope(&self, plan_id: usize, scope: ScopeId, key: usize) -> ScopeId {
+        self.program
+            .function(plan_id)
+            .blocks
+            .get(&key)
+            .copied()
+            .unwrap_or(scope)
+    }
+
+    fn declaration(&mut self, plan_id: usize, scope: ScopeId, decl: &Declaration) {
+        match decl {
+            Declaration::FunctionDeclaration(_) => {}
+            Declaration::Lexical(lex) => {
+                self.variable_list(plan_id, scope, lex.variable_list(), true);
+            }
+            _ => {}
+        }
+    }
+
+    fn variable_list(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        list: &boa_ast::declaration::VariableList,
+        lexical: bool,
+    ) {
+        for var in list.as_ref() {
+            let init = var.init();
+            if lexical {
+                if let boa_ast::declaration::Binding::Identifier(id) = var.binding() {
+                    if let Some(key) = resolve_binding(self.program, scope, id.sym()) {
+                        if self.numeric.contains(&key) {
+                            let numeric = init.is_some_and(|expr| {
+                                known_number_expr(
+                                    self.program,
+                                    self.builtins,
+                                    self.numeric,
+                                    scope,
+                                    expr,
+                                )
+                            });
+                            if !numeric {
+                                self.removed.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(expr) = init {
+                self.expr(plan_id, scope, expr);
+            }
+        }
+    }
+
+    fn statement(&mut self, plan_id: usize, scope: ScopeId, stmt: &Statement) {
+        match stmt {
+            Statement::Block(block) => {
+                let inner = self.node_scope(plan_id, scope, node_key(block));
+                self.statements(plan_id, inner, block.statement_list());
+            }
+            Statement::Var(var) => {
+                self.variable_list(plan_id, scope, &var.0, false);
+            }
+            Statement::Expression(expr) => self.expr(plan_id, scope, expr),
+            Statement::If(if_stmt) => {
+                self.expr(plan_id, scope, if_stmt.cond());
+                self.statement(plan_id, scope, if_stmt.body());
+                if let Some(else_node) = if_stmt.else_node() {
+                    self.statement(plan_id, scope, else_node);
+                }
+            }
+            Statement::WhileLoop(while_stmt) => {
+                self.expr(plan_id, scope, while_stmt.condition());
+                self.statement(plan_id, scope, while_stmt.body());
+            }
+            Statement::DoWhileLoop(do_while) => {
+                self.statement(plan_id, scope, do_while.body());
+                self.expr(plan_id, scope, do_while.cond());
+            }
+            Statement::ForLoop(for_stmt) => {
+                let mut loop_scope = scope;
+                match for_stmt.init() {
+                    Some(ForLoopInitializer::Lexical(lex)) => {
+                        loop_scope = self.node_scope(plan_id, scope, node_key(for_stmt));
+                        self.variable_list(
+                            plan_id,
+                            loop_scope,
+                            lex.declaration().variable_list(),
+                            true,
+                        );
+                    }
+                    Some(ForLoopInitializer::Var(var)) => {
+                        self.variable_list(plan_id, loop_scope, &var.0, false);
+                    }
+                    Some(ForLoopInitializer::Expression(expr)) => {
+                        self.expr(plan_id, loop_scope, expr);
+                    }
+                    None => {}
+                }
+                if let Some(condition) = for_stmt.condition() {
+                    self.expr(plan_id, loop_scope, condition);
+                }
+                if let Some(update) = for_stmt.final_expr() {
+                    self.expr(plan_id, loop_scope, update);
+                }
+                self.statement(plan_id, loop_scope, for_stmt.body());
+            }
+            Statement::Switch(switch_stmt) => {
+                let inner = self.node_scope(plan_id, scope, node_key(switch_stmt));
+                self.expr(plan_id, scope, switch_stmt.val());
+                for case in switch_stmt.cases() {
+                    if let Some(condition) = case.condition() {
+                        self.expr(plan_id, inner, condition);
+                    }
+                    self.statements(plan_id, inner, case.body());
+                }
+            }
+            Statement::Return(ret) => {
+                if let Some(target) = ret.target() {
+                    self.expr(plan_id, scope, target);
+                }
+            }
+            Statement::Labelled(labelled) => {
+                if let LabelledItem::Statement(inner) = labelled.item() {
+                    self.statement(plan_id, scope, inner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expr(&mut self, plan_id: usize, scope: ScopeId, expr: &Expression) {
+        match expr {
+            Expression::Parenthesized(paren) => self.expr(plan_id, scope, paren.expression()),
+            Expression::Binary(binary) => {
+                self.expr(plan_id, scope, binary.lhs());
+                self.expr(plan_id, scope, binary.rhs());
+            }
+            Expression::Unary(unary) => self.expr(plan_id, scope, unary.target()),
+            Expression::Conditional(conditional) => {
+                self.expr(plan_id, scope, conditional.condition());
+                self.expr(plan_id, scope, conditional.if_true());
+                self.expr(plan_id, scope, conditional.if_false());
+            }
+            Expression::Assign(assign) => {
+                if let AssignTarget::Identifier(id) = assign.lhs() {
+                    if let Some(key) = resolve_binding(self.program, scope, id.sym()) {
+                        if self.numeric.contains(&key)
+                            && !assignment_write_is_numeric(
+                                self.program,
+                                self.builtins,
+                                self.numeric,
+                                scope,
+                                assign.op(),
+                                assign.rhs(),
+                            )
+                        {
+                            self.removed.insert(key);
+                        }
+                    }
+                }
+                self.expr(plan_id, scope, assign.rhs());
+            }
+            Expression::Call(call) => {
+                self.expr(plan_id, scope, call.function());
+                for arg in call.args() {
+                    self.expr(plan_id, scope, arg);
+                }
+            }
+            Expression::PropertyAccess(PropertyAccess::Simple(simple)) => {
+                self.expr(plan_id, scope, simple.target());
+                if let PropertyAccessField::Expr(field) = simple.field() {
+                    self.expr(plan_id, scope, field);
+                }
+            }
+            Expression::FunctionExpression(_) | Expression::ArrowFunction(_) => {}
+            _ => {}
+        }
+    }
+}
+
+/// Greatest fixed point of bindings that always hold numbers. Only lexical
+/// bindings are considered: `var` can be read as `undefined` before its
+/// initializer, and parameters may be missing.
+fn analyze_numeric_bindings(program: &Program, builtins: &Builtins) -> HashSet<(ScopeId, usize)> {
+    let mut numeric = HashSet::new();
+    for (index, scope) in program.scopes.iter().enumerate() {
+        for &slot in &scope.tdz {
+            numeric.insert((ScopeId(index), slot));
+        }
+    }
+    for plan in &program.functions {
+        for param in &plan.params {
+            if let Some(key) = resolve_binding(program, plan.root_scope, param.sym) {
+                numeric.remove(&key);
+            }
+        }
+    }
+
+    loop {
+        let mut removed = HashSet::new();
+        for plan in &program.functions {
+            let mut walker = NumericWalker {
+                program,
+                builtins,
+                numeric: &numeric,
+                removed: &mut removed,
+            };
+            for param in &plan.params {
+                if let Some(init) = &param.init {
+                    walker.expr(plan.id, plan.root_scope, init);
+                }
+            }
+            walker.statements(plan.id, plan.root_scope, &plan.body);
+        }
+        if removed.is_empty() {
+            break;
+        }
+        for key in removed {
+            numeric.remove(&key);
+        }
+    }
+    numeric
+}
+
 #[derive(Clone, Copy)]
 struct CodegenCtx<'a> {
     program: &'a Program,
@@ -264,6 +639,8 @@ struct CodegenCtx<'a> {
     child_refs: &'a HashMap<usize, FuncRef>,
     builtins: &'a Builtins,
     builtin_refs: &'a HashMap<&'static str, FuncRef>,
+    vars: &'a HashMap<(ScopeId, usize), Variable>,
+    numeric: &'a HashSet<(ScopeId, usize)>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -281,6 +658,8 @@ impl<'a> CodegenCtx<'a> {
             child_refs: self.child_refs,
             builtins: self.builtins,
             builtin_refs: self.builtin_refs,
+            vars: self.vars,
+            numeric: self.numeric,
         }
     }
 }
@@ -335,6 +714,41 @@ fn init_slots(builder: &mut FunctionBuilder, env: Value, scope: &ScopePlan) {
     }
 }
 
+/// Declares a register-backed local variable for every binding whose scope is
+/// not captured by a closure.
+fn declare_vars(
+    builder: &mut FunctionBuilder,
+    program: &Program,
+    plan_id: usize,
+) -> HashMap<(ScopeId, usize), Variable> {
+    let mut vars = HashMap::new();
+    for (index, scope) in program.scopes.iter().enumerate() {
+        if scope.owner == plan_id && !scope.has_env() {
+            for slot in 0..scope.slot_count() {
+                vars.insert((ScopeId(index), slot), builder.declare_var(types::F64));
+            }
+        }
+    }
+    vars
+}
+
+fn init_local_slots(
+    builder: &mut FunctionBuilder,
+    vars: &HashMap<(ScopeId, usize), Variable>,
+    scope_id: ScopeId,
+    scope: &ScopePlan,
+) {
+    for slot in 0..scope.slot_count() {
+        let initial = if scope.tdz.contains(&slot) {
+            value::uninitialized(builder)
+        } else {
+            value::undefined(builder)
+        };
+        let var = vars[&(scope_id, slot)];
+        builder.def_var(var, initial);
+    }
+}
+
 /// Evaluates a parameter initializer only when the argument is `undefined`.
 fn compile_default(
     builder: &mut FunctionBuilder,
@@ -378,11 +792,12 @@ fn enter_scope<'a>(
     scope: ScopeId,
 ) -> CodegenCtx<'a> {
     let plan = ctx.program.scope(scope);
-    if plan.allocated() {
+    if plan.has_env() {
         let env = alloc_env(builder, ctx.calloc_ref, plan.slot_count(), ctx.env);
         init_slots(builder, env, plan);
         ctx.enter(scope, env)
     } else {
+        init_local_slots(builder, ctx.vars, scope, plan);
         ctx.enter(scope, ctx.env)
     }
 }
@@ -480,19 +895,35 @@ fn call_fmod(builder: &mut FunctionBuilder, fmod_ref: FuncRef, lhs: Value, rhs: 
     call_f64_binary(builder, fmod_ref, lhs, rhs)
 }
 
-/// Resolves an identifier to the environment holding it and the slot offset.
-fn lvalue(
-    builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    sym: Sym,
-) -> Result<(Value, i32), Error> {
-    let (depth, slot) = resolve(ctx.program, ctx.scope, sym)
+#[derive(Clone, Copy)]
+enum Place {
+    Env { ptr: Value, offset: i32 },
+    Local { var: Variable },
+}
+
+/// Resolves an identifier to either a slot in an environment record or a
+/// register-backed local variable.
+fn place(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Place, Error> {
+    let (home, slot) = resolve_binding(ctx.program, ctx.scope, sym)
         .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
-    let mut ptr = ctx.env;
-    for _ in 0..depth {
-        ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+    if ctx.program.scope(home).has_env() {
+        let (depth, _) = resolve(ctx.program, ctx.scope, sym)
+            .ok_or_else(|| Error::Scope(format!("unresolved identifier: {sym:?}")))?;
+        let mut ptr = ctx.env;
+        for _ in 0..depth {
+            ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        }
+        Ok(Place::Env {
+            ptr,
+            offset: (8 + 8 * slot) as i32,
+        })
+    } else {
+        let var = *ctx
+            .vars
+            .get(&(home, slot))
+            .ok_or_else(|| Error::Codegen("missing local variable".to_string()))?;
+        Ok(Place::Local { var })
     }
-    Ok((ptr, (8 + 8 * slot) as i32))
 }
 
 fn load_at(builder: &mut FunctionBuilder, ptr: Value, offset: i32) -> Value {
@@ -503,21 +934,30 @@ fn store_at(builder: &mut FunctionBuilder, ptr: Value, offset: i32, value: Value
     builder.ins().store(MemFlags::new(), value, ptr, offset);
 }
 
+fn load_place(builder: &mut FunctionBuilder, place: Place) -> Value {
+    match place {
+        Place::Env { ptr, offset } => load_at(builder, ptr, offset),
+        Place::Local { var } => builder.use_var(var),
+    }
+}
+
+fn store_place(builder: &mut FunctionBuilder, place: Place, value: Value) {
+    match place {
+        Place::Env { ptr, offset } => store_at(builder, ptr, offset, value),
+        Place::Local { var } => builder.def_var(var, value),
+    }
+}
+
 fn check_tdz(builder: &mut FunctionBuilder, value: Value) {
     let uninitialized = value::is_uninitialized(builder, value);
-    let trap_block = builder.create_block();
-    let continue_block = builder.create_block();
     builder
         .ins()
-        .brif(uninitialized, trap_block, &[], continue_block, &[]);
-    builder.switch_to_block(trap_block);
-    builder.ins().trap(TrapCode::unwrap_user(1));
-    builder.switch_to_block(continue_block);
+        .trapnz(uninitialized, TrapCode::unwrap_user(1));
 }
 
 fn load_var(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, sym: Sym) -> Result<Value, Error> {
-    let (ptr, offset) = lvalue(builder, ctx, sym)?;
-    let value = load_at(builder, ptr, offset);
+    let place = place(builder, ctx, sym)?;
+    let value = load_place(builder, place);
     if needs_tdz_check(ctx.program, ctx.scope, sym) {
         check_tdz(builder, value);
     }
@@ -530,8 +970,8 @@ fn store_var(
     sym: Sym,
     value: Value,
 ) -> Result<(), Error> {
-    let (ptr, offset) = lvalue(builder, ctx, sym)?;
-    store_at(builder, ptr, offset, value);
+    let place = place(builder, ctx, sym)?;
+    store_place(builder, place, value);
     Ok(())
 }
 
@@ -666,14 +1106,58 @@ fn compile_statement(
     }
 }
 
+fn compile_condition(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    expr: &Expression,
+) -> Result<Value, Error> {
+    match expr {
+        Expression::Parenthesized(paren) => compile_condition(builder, ctx, paren.expression()),
+        Expression::Unary(unary) if unary.op() == UnaryOp::Not => {
+            let cond = compile_condition(builder, ctx, unary.target())?;
+            Ok(builder.ins().icmp_imm(IntCC::Equal, cond, 0))
+        }
+        Expression::Binary(binary)
+            if matches!(
+                binary.op(),
+                BinaryOp::Relational(
+                    RelationalOp::GreaterThan
+                        | RelationalOp::GreaterThanOrEqual
+                        | RelationalOp::LessThan
+                        | RelationalOp::LessThanOrEqual
+                )
+            ) =>
+        {
+            let BinaryOp::Relational(op) = binary.op() else {
+                unreachable!()
+            };
+            let lhs = compile_expr(builder, ctx, binary.lhs())?;
+            let rhs = compile_expr(builder, ctx, binary.rhs())?;
+            let lhs = number_value(builder, lhs, expr_is_number(ctx, binary.lhs()));
+            let rhs = number_value(builder, rhs, expr_is_number(ctx, binary.rhs()));
+            let cc = match op {
+                RelationalOp::GreaterThan => FloatCC::GreaterThan,
+                RelationalOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
+                RelationalOp::LessThan => FloatCC::LessThan,
+                RelationalOp::LessThanOrEqual => FloatCC::LessThanOrEqual,
+                _ => unreachable!(),
+            };
+            Ok(builder.ins().fcmp(cc, lhs, rhs))
+        }
+        _ => {
+            let value = compile_expr(builder, ctx, expr)?;
+            Ok(value::truthy(builder, value))
+        }
+    }
+}
+
 fn compile_if(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     if_stmt: &boa_ast::statement::If,
     loops: &mut Vec<LoopTarget>,
 ) -> Result<StmtOutcome, Error> {
-    let cond_value = compile_expr(builder, ctx, if_stmt.cond())?;
-    let cond = value::truthy(builder, cond_value);
+    let cond = compile_condition(builder, ctx, if_stmt.cond())?;
 
     let then_block = builder.create_block();
     let else_block = builder.create_block();
@@ -721,8 +1205,7 @@ fn compile_while(
     builder.ins().jump(header, &[]);
     builder.switch_to_block(header);
 
-    let cond_value = compile_expr(builder, ctx, while_stmt.condition())?;
-    let cond = value::truthy(builder, cond_value);
+    let cond = compile_condition(builder, ctx, while_stmt.condition())?;
     builder.ins().brif(cond, body, &[], exit, &[]);
 
     builder.switch_to_block(body);
@@ -768,8 +1251,7 @@ fn compile_do_while(
     }
 
     builder.switch_to_block(condition_block);
-    let cond_value = compile_expr(builder, ctx, do_while.cond())?;
-    let cond = value::truthy(builder, cond_value);
+    let cond = compile_condition(builder, ctx, do_while.cond())?;
     builder.ins().brif(cond, body_block, &[], exit, &[]);
 
     builder.switch_to_block(exit);
@@ -842,9 +1324,9 @@ fn compile_for(
         let scope = node_scope(&ctx, node_key(for_stmt))?;
         let plan = ctx.program.scope(scope);
         let slots = plan.slot_count();
-        let allocated = plan.allocated();
+        let has_env = plan.has_env();
         ctx = enter_scope(builder, &ctx, scope);
-        if allocated {
+        if has_env {
             fresh = Some((slots, ctx.env));
         }
     }
@@ -880,8 +1362,7 @@ fn compile_for(
     };
     match for_stmt.condition() {
         Some(condition) => {
-            let value = compile_expr(builder, &header_ctx, condition)?;
-            let cond = value::truthy(builder, value);
+            let cond = compile_condition(builder, &header_ctx, condition)?;
             builder.ins().brif(cond, body_block, &[], exit, &[]);
         }
         None => {
@@ -1057,9 +1538,24 @@ fn compile_binary(
     let lhs = compile_expr(builder, ctx, binary.lhs())?;
     let rhs = compile_expr(builder, ctx, binary.rhs())?;
     match binary.op() {
-        BinaryOp::Arithmetic(arith) => compile_arithmetic(builder, ctx, arith, lhs, rhs),
+        BinaryOp::Arithmetic(arith) => compile_arithmetic(
+            builder,
+            ctx,
+            arith,
+            lhs,
+            rhs,
+            expr_is_number(ctx, binary.lhs()),
+            expr_is_number(ctx, binary.rhs()),
+        ),
         BinaryOp::Bitwise(bitwise) => Ok(compile_bitwise(builder, ctx, bitwise, lhs, rhs)),
-        BinaryOp::Relational(rel) => compile_relational(builder, rel, lhs, rhs),
+        BinaryOp::Relational(rel) => compile_relational(
+            builder,
+            rel,
+            lhs,
+            rhs,
+            expr_is_number(ctx, binary.lhs()),
+            expr_is_number(ctx, binary.rhs()),
+        ),
         BinaryOp::Comma => Ok(rhs),
         other => Err(Error::Unsupported(format!(
             "binary operator not supported: {other:?}"
@@ -1073,8 +1569,7 @@ fn compile_conditional(
     ctx: &CodegenCtx<'_>,
     conditional: &boa_ast::expression::operator::Conditional,
 ) -> Result<Value, Error> {
-    let cond_value = compile_expr(builder, ctx, conditional.condition())?;
-    let cond = value::truthy(builder, cond_value);
+    let cond = compile_condition(builder, ctx, conditional.condition())?;
 
     let result_var = builder.declare_var(types::F64);
     let true_block = builder.create_block();
@@ -1136,9 +1631,11 @@ fn compile_arithmetic(
     op: ArithmeticOp,
     lhs: Value,
     rhs: Value,
+    lhs_numeric: bool,
+    rhs_numeric: bool,
 ) -> Result<Value, Error> {
-    let lhs = value::to_number(builder, lhs);
-    let rhs = value::to_number(builder, rhs);
+    let lhs = number_value(builder, lhs, lhs_numeric);
+    let rhs = number_value(builder, rhs, rhs_numeric);
     let value = match op {
         ArithmeticOp::Add => builder.ins().fadd(lhs, rhs),
         ArithmeticOp::Sub => builder.ins().fsub(lhs, rhs),
@@ -1187,6 +1684,8 @@ fn compile_relational(
     op: RelationalOp,
     lhs: Value,
     rhs: Value,
+    lhs_numeric: bool,
+    rhs_numeric: bool,
 ) -> Result<Value, Error> {
     match op {
         RelationalOp::Equal => Ok(value::loose_equal(builder, lhs, rhs)),
@@ -1205,8 +1704,8 @@ fn compile_relational(
         | RelationalOp::GreaterThanOrEqual
         | RelationalOp::LessThan
         | RelationalOp::LessThanOrEqual => {
-            let lhs = value::to_number(builder, lhs);
-            let rhs = value::to_number(builder, rhs);
+            let lhs = number_value(builder, lhs, lhs_numeric);
+            let rhs = number_value(builder, rhs, rhs_numeric);
             let cc = match op {
                 RelationalOp::GreaterThan => FloatCC::GreaterThan,
                 RelationalOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
@@ -1231,10 +1730,14 @@ fn compile_unary(
     let target = compile_expr(builder, ctx, unary.target())?;
     match unary.op() {
         UnaryOp::Minus => {
-            let target = value::to_number(builder, target);
+            let target = number_value(builder, target, expr_is_number(ctx, unary.target()));
             Ok(builder.ins().fneg(target))
         }
-        UnaryOp::Plus => Ok(value::to_number(builder, target)),
+        UnaryOp::Plus => Ok(number_value(
+            builder,
+            target,
+            expr_is_number(ctx, unary.target()),
+        )),
         UnaryOp::Not => {
             let cond = value::truthy(builder, target);
             let not = builder.ins().icmp_imm(IntCC::Equal, cond, 0);
@@ -1270,7 +1773,7 @@ fn compile_assign(
             "assignment to a constant variable".to_string(),
         ));
     }
-    let (ptr, offset) = lvalue(builder, ctx, sym)?;
+    let place = place(builder, ctx, sym)?;
     let tdz = needs_tdz_check(ctx.program, ctx.scope, sym);
     let op = assign.op();
 
@@ -1283,7 +1786,7 @@ fn compile_assign(
         _ => None,
     };
     if let Some((rhs_when_truthy, use_truthy)) = short_circuit {
-        let old = load_at(builder, ptr, offset);
+        let old = load_place(builder, place);
         if tdz {
             check_tdz(builder, old);
         }
@@ -1305,7 +1808,7 @@ fn compile_assign(
 
         builder.switch_to_block(rhs_block);
         let rhs = compile_expr(builder, ctx, assign.rhs())?;
-        store_at(builder, ptr, offset, rhs);
+        store_place(builder, place, rhs);
         builder.def_var(result_var, rhs);
         builder.ins().jump(join_block, &[]);
 
@@ -1316,27 +1819,75 @@ fn compile_assign(
     if op == AssignOp::Assign {
         let rhs = compile_expr(builder, ctx, assign.rhs())?;
         if tdz {
-            let current = load_at(builder, ptr, offset);
+            let current = load_place(builder, place);
             check_tdz(builder, current);
         }
-        store_at(builder, ptr, offset, rhs);
+        store_place(builder, place, rhs);
         return Ok(rhs);
     }
 
     // Compound assignment reads the old value before evaluating the right-hand
     // side, matching the evaluation order of the specification.
-    let old = load_at(builder, ptr, offset);
+    let old = load_place(builder, place);
     if tdz {
         check_tdz(builder, old);
     }
     let rhs = compile_expr(builder, ctx, assign.rhs())?;
     let value = match op {
-        AssignOp::Add => compile_arithmetic(builder, ctx, ArithmeticOp::Add, old, rhs)?,
-        AssignOp::Sub => compile_arithmetic(builder, ctx, ArithmeticOp::Sub, old, rhs)?,
-        AssignOp::Mul => compile_arithmetic(builder, ctx, ArithmeticOp::Mul, old, rhs)?,
-        AssignOp::Div => compile_arithmetic(builder, ctx, ArithmeticOp::Div, old, rhs)?,
-        AssignOp::Mod => compile_arithmetic(builder, ctx, ArithmeticOp::Mod, old, rhs)?,
-        AssignOp::Exp => compile_arithmetic(builder, ctx, ArithmeticOp::Exp, old, rhs)?,
+        AssignOp::Add => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Add,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
+        AssignOp::Sub => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Sub,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
+        AssignOp::Mul => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Mul,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
+        AssignOp::Div => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Div,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
+        AssignOp::Mod => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Mod,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
+        AssignOp::Exp => compile_arithmetic(
+            builder,
+            ctx,
+            ArithmeticOp::Exp,
+            old,
+            rhs,
+            binding_is_number(ctx, sym),
+            expr_is_number(ctx, assign.rhs()),
+        )?,
         AssignOp::And => compile_bitwise(builder, ctx, BitwiseOp::And, old, rhs),
         AssignOp::Or => compile_bitwise(builder, ctx, BitwiseOp::Or, old, rhs),
         AssignOp::Xor => compile_bitwise(builder, ctx, BitwiseOp::Xor, old, rhs),
@@ -1349,7 +1900,7 @@ fn compile_assign(
             )));
         }
     };
-    store_at(builder, ptr, offset, value);
+    store_place(builder, place, value);
     Ok(value)
 }
 
@@ -1372,7 +1923,7 @@ fn compile_update(
         ));
     }
     let old = load_var(builder, ctx, sym)?;
-    let old = value::to_number(builder, old);
+    let old = number_value(builder, old, binding_is_number(ctx, sym));
     let one = builder.ins().f64const(1.0);
     let (new_value, result) = match update.op() {
         UpdateOp::IncrementPre => (builder.ins().fadd(old, one), None),
@@ -1434,8 +1985,10 @@ fn compile_builtin_call(
     };
 
     let mut values = Vec::with_capacity(args.len());
+    let mut known_numbers = Vec::with_capacity(args.len());
     for arg in args {
         values.push(compile_expr(builder, ctx, arg)?);
+        known_numbers.push(expr_is_number(ctx, arg));
     }
     builtins::call(
         builder,
@@ -1444,6 +1997,7 @@ fn compile_builtin_call(
         namespace,
         name,
         &values,
+        &known_numbers,
     )
 }
 

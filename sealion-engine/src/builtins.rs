@@ -227,9 +227,18 @@ fn argument(builder: &mut FunctionBuilder, args: &[Value], index: usize) -> Valu
     }
 }
 
-fn number_argument(builder: &mut FunctionBuilder, args: &[Value], index: usize) -> Value {
+fn number_argument(
+    builder: &mut FunctionBuilder,
+    args: &[Value],
+    index: usize,
+    known: &[bool],
+) -> Value {
     let value = argument(builder, args, index);
-    value::to_number(builder, value)
+    if known.get(index).copied().unwrap_or(false) {
+        value
+    } else {
+        value::to_number(builder, value)
+    }
 }
 
 fn call_libm(builder: &mut FunctionBuilder, func_ref: FuncRef, args: &[Value]) -> Value {
@@ -328,15 +337,24 @@ fn extremum(builder: &mut FunctionBuilder, lhs: Value, rhs: Value, maximum: bool
     builder.ins().select(lhs_nan, lhs, with_zero)
 }
 
-fn min_or_max(builder: &mut FunctionBuilder, args: &[Value], maximum: bool) -> Value {
+fn min_or_max(
+    builder: &mut FunctionBuilder,
+    args: &[Value],
+    maximum: bool,
+    known: &[bool],
+) -> Value {
     let identity = if maximum {
         f64::NEG_INFINITY
     } else {
         f64::INFINITY
     };
     let mut acc = builder.ins().f64const(identity);
-    for &arg in args {
-        let arg = value::to_number(builder, arg);
+    for (index, &arg) in args.iter().enumerate() {
+        let arg = if known.get(index).copied().unwrap_or(false) {
+            arg
+        } else {
+            value::to_number(builder, arg)
+        };
         acc = extremum(builder, acc, arg, maximum);
     }
     acc
@@ -351,40 +369,41 @@ pub fn call(
     namespace: Option<Namespace>,
     name: &str,
     args: &[Value],
+    known: &[bool],
 ) -> Result<Value, Error> {
     let value = match name {
         "abs" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             builder.ins().fabs(x)
         }
         "ceil" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             builder.ins().ceil(x)
         }
         "floor" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             builder.ins().floor(x)
         }
         "round" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             js_round(builder, x)
         }
         "trunc" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             builder.ins().trunc(x)
         }
         "sqrt" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             builder.ins().sqrt(x)
         }
         "fround" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             fround(builder, x)
         }
-        "min" => min_or_max(builder, args, false),
-        "max" => min_or_max(builder, args, true),
+        "min" => min_or_max(builder, args, false, known),
+        "max" => min_or_max(builder, args, true, known),
         "sign" => {
-            let x = number_argument(builder, args, 0);
+            let x = number_argument(builder, args, 0, known);
             sign(builder, x)
         }
         "clz32" => {
@@ -403,21 +422,19 @@ pub fn call(
             value::from_int32(builder, product)
         }
         "isNaN" => {
-            let x = argument(builder, args, 0);
             let x = if namespace == Some(Namespace::Number) {
-                x
+                argument(builder, args, 0)
             } else {
-                value::to_number(builder, x)
+                number_argument(builder, args, 0, known)
             };
             let nan = value::is_nan(builder, x);
             value::from_bool(builder, nan)
         }
         "isFinite" => {
-            let x = argument(builder, args, 0);
             let x = if namespace == Some(Namespace::Number) {
-                x
+                argument(builder, args, 0)
             } else {
-                value::to_number(builder, x)
+                number_argument(builder, args, 0, known)
             };
             let finite = value::is_finite(builder, x);
             value::from_bool(builder, finite)
@@ -446,17 +463,17 @@ pub fn call(
             let truthy = value::truthy(builder, x);
             value::from_bool(builder, truthy)
         }
-        "Number" => number_argument(builder, args, 0),
+        "Number" => number_argument(builder, args, 0, known),
         other => {
             let func_ref = *funcs
                 .get(other)
                 .ok_or_else(|| Error::Unsupported(format!("unknown builtin function: {other}")))?;
             if BINARY_LIBM.contains(&other) {
-                let lhs = number_argument(builder, args, 0);
-                let rhs = number_argument(builder, args, 1);
+                let lhs = number_argument(builder, args, 0, known);
+                let rhs = number_argument(builder, args, 1, known);
                 call_libm(builder, func_ref, &[lhs, rhs])
             } else {
-                let x = number_argument(builder, args, 0);
+                let x = number_argument(builder, args, 0, known);
                 call_libm(builder, func_ref, &[x])
             }
         }
