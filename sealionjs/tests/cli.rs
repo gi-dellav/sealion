@@ -119,10 +119,31 @@ fn runs_0_3_0_operators() {
 
 #[test]
 fn runs_0_4_0_blocks_and_arrows() {
-    let input = write_source(
-        "let x = 1; { let x = 2; } var inc = (n) => n + x; inc(3);",
-    );
+    let input = write_source("let x = 1; { let x = 2; } var inc = (n) => n + x; inc(3);");
     let status = Command::new(bin()).arg(&input).status().unwrap();
     let _ = fs::remove_file(&input);
     assert_eq!(status.code(), Some(4));
+}
+
+#[test]
+fn runs_0_6_0_for_and_switch() {
+    let input = write_source(
+        "const limit = 4;
+         var s = 0;
+         for (let i = 0; i < limit; i++) { if (i === 2) { continue; } s = s + i; }
+         switch (s) { case 4: s = s + 1; break; default: s = 0; }
+         s;",
+    );
+    let status = Command::new(bin()).arg(&input).status().unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(5));
+}
+
+#[test]
+fn rejects_const_reassignment() {
+    let input = write_source("const c = 1; c = 2;");
+    let output = Command::new(bin()).arg(&input).output().unwrap();
+    let _ = fs::remove_file(&input);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("constant"));
 }

@@ -1,18 +1,20 @@
-//! The `Math` and `Number` namespaces.
+//! The `Math`, `Number` and `Object` namespaces.
 //!
-//! `Math` and `Number` are not objects: they are compile-time namespaces whose
-//! members are either constants (folded to an `f64` literal) or builtin
-//! functions (compiled to a libm call or a short instruction sequence). The
-//! global `isNaN` and `isFinite` functions are aliases for their `Number`
-//! counterparts, as the roadmap asks.
+//! They are not objects: they are compile-time namespaces whose members are
+//! either constants (folded to an `f64` literal) or builtin functions (compiled
+//! to a libm call or a short instruction sequence). The global `isNaN`,
+//! `isFinite`, `Boolean` and `Number` functions are compiled the same way, as
+//! are the global `NaN` and `Infinity` constants.
 //!
-//! Because there are no objects yet, `Math` and `Number` cannot be used as
-//! values: only `Math.member` and `Number.member` are accepted.
+//! Because there are no objects yet, the namespaces cannot be used as values:
+//! only `Math.member`, `Number.member` and `Object.member` are accepted.
 
 use std::collections::HashMap;
 
 use boa_interner::{Interner, Sym};
-use cranelift_codegen::ir::{FuncRef, Function, InstBuilder, Value, condcodes::FloatCC, types};
+use cranelift_codegen::ir::{
+    FuncRef, Function, InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
+};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::ObjectModule;
@@ -27,6 +29,7 @@ use crate::{
 pub enum Namespace {
     Math,
     Number,
+    Object,
 }
 
 /// libm entry points taking one `f64`.
@@ -38,25 +41,17 @@ const UNARY_LIBM: &[&str] = &[
 /// libm entry points taking two `f64`s.
 const BINARY_LIBM: &[&str] = &["pow", "atan2"];
 
-/// Builtin functions implemented inline rather than by a libm call.
-const INLINE_FUNCTIONS: &[&str] = &[
-    "abs",
-    "ceil",
-    "floor",
-    "round",
-    "trunc",
-    "sqrt",
-    "fround",
-    "min",
-    "max",
-    "clz32",
-    "imul",
+/// `Math` functions implemented inline rather than by a libm call.
+const MATH_INLINE: &[&str] = &[
+    "abs", "ceil", "floor", "round", "trunc", "sqrt", "fround", "min", "max", "clz32", "imul",
     "sign",
-    "isNaN",
-    "isFinite",
-    "isInteger",
-    "isSafeInteger",
 ];
+
+/// `Number` functions implemented inline.
+const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeInteger"];
+
+/// `Object` functions implemented inline.
+const OBJECT_INLINE: &[&str] = &["is"];
 
 const MATH_CONSTANTS: &[(&str, f64)] = &[
     ("PI", std::f64::consts::PI),
@@ -86,10 +81,14 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 pub struct Builtins {
     math: Sym,
     number: Sym,
-    is_nan: Sym,
-    is_finite: Sym,
+    object: Sym,
+    undefined: Sym,
+    nan: Sym,
+    infinity: Sym,
     /// Property names, so that a member expression can be recognised.
     names: HashMap<Sym, &'static str>,
+    /// Free global function names.
+    globals: HashMap<Sym, &'static str>,
     funcs: HashMap<&'static str, FuncId>,
 }
 
@@ -114,45 +113,87 @@ impl Builtins {
             .chain(NUMBER_CONSTANTS.iter().map(|(name, _)| *name))
             .chain(UNARY_LIBM.iter().copied())
             .chain(BINARY_LIBM.iter().copied())
-            .chain(INLINE_FUNCTIONS.iter().copied());
+            .chain(MATH_INLINE.iter().copied())
+            .chain(NUMBER_INLINE.iter().copied())
+            .chain(OBJECT_INLINE.iter().copied());
         for name in all {
             names.insert(interner.get_or_intern(name), name);
         }
 
+        let is_nan = interner.get_or_intern("isNaN");
+        let is_finite = interner.get_or_intern("isFinite");
+        let boolean = interner.get_or_intern("Boolean");
+        let number = interner.get_or_intern("Number");
+        let mut globals = HashMap::new();
+        globals.insert(is_nan, "isNaN");
+        globals.insert(is_finite, "isFinite");
+        globals.insert(boolean, "Boolean");
+        globals.insert(number, "Number");
+
         Ok(Self {
             math: interner.get_or_intern("Math"),
-            number: interner.get_or_intern("Number"),
-            is_nan: interner.get_or_intern("isNaN"),
-            is_finite: interner.get_or_intern("isFinite"),
+            number,
+            object: interner.get_or_intern("Object"),
+            undefined: interner.get_or_intern("undefined"),
+            nan: interner.get_or_intern("NaN"),
+            infinity: interner.get_or_intern("Infinity"),
             names,
+            globals,
             funcs,
         })
     }
 
-    /// The namespace a bare identifier names, `Math` or `Number`.
+    /// The namespace a bare identifier names.
     pub fn namespace(&self, sym: Sym) -> Option<Namespace> {
         if sym == self.math {
             Some(Namespace::Math)
         } else if sym == self.number {
             Some(Namespace::Number)
+        } else if sym == self.object {
+            Some(Namespace::Object)
         } else {
             None
         }
     }
 
-    /// `isNaN` and `isFinite` are also plain global functions.
-    pub fn alias(&self, sym: Sym) -> Option<&'static str> {
-        if sym == self.is_nan {
-            Some("isNaN")
-        } else if sym == self.is_finite {
-            Some("isFinite")
+    /// A free global function such as `isNaN` or `Boolean`.
+    pub fn global_function(&self, sym: Sym) -> Option<&'static str> {
+        self.globals.get(&sym).copied()
+    }
+
+    /// A free global constant such as `NaN` or `Infinity`.
+    pub fn global_constant(&self, sym: Sym) -> Option<f64> {
+        if sym == self.nan {
+            Some(f64::NAN)
+        } else if sym == self.infinity {
+            Some(f64::INFINITY)
         } else {
             None
         }
+    }
+
+    pub fn is_undefined(&self, sym: Sym) -> bool {
+        sym == self.undefined
     }
 
     pub fn property(&self, sym: Sym) -> Option<&'static str> {
         self.names.get(&sym).copied()
+    }
+
+    /// True when `name` is a constant or function member of `namespace`.
+    pub fn has(&self, namespace: Namespace, name: &str) -> bool {
+        if self.constant(namespace, name).is_some() {
+            return true;
+        }
+        match namespace {
+            Namespace::Math => {
+                UNARY_LIBM.contains(&name)
+                    || BINARY_LIBM.contains(&name)
+                    || MATH_INLINE.contains(&name)
+            }
+            Namespace::Number => NUMBER_INLINE.contains(&name),
+            Namespace::Object => OBJECT_INLINE.contains(&name),
+        }
     }
 
     /// The constant folded into the program for `namespace.member`, if any.
@@ -160,6 +201,7 @@ impl Builtins {
         let table = match namespace {
             Namespace::Math => MATH_CONSTANTS,
             Namespace::Number => NUMBER_CONSTANTS,
+            Namespace::Object => return None,
         };
         table
             .iter()
@@ -185,12 +227,18 @@ fn argument(builder: &mut FunctionBuilder, args: &[Value], index: usize) -> Valu
     }
 }
 
+fn number_argument(builder: &mut FunctionBuilder, args: &[Value], index: usize) -> Value {
+    let value = argument(builder, args, index);
+    value::to_number(builder, value)
+}
+
 fn call_libm(builder: &mut FunctionBuilder, func_ref: FuncRef, args: &[Value]) -> Value {
     let call = builder.ins().call(func_ref, args);
     builder.inst_results(call)[0]
 }
 
-/// `Math.round`: halves round towards `+Infinity`, unlike C's `round`.
+/// `Math.round`: halves round towards `+Infinity`, unlike C's `round`. Negative
+/// values that round to zero produce `-0`.
 fn js_round(builder: &mut FunctionBuilder, x: Value) -> Value {
     let floor = builder.ins().floor(x);
     let diff = builder.ins().fsub(x, floor);
@@ -198,7 +246,16 @@ fn js_round(builder: &mut FunctionBuilder, x: Value) -> Value {
     let below_half = builder.ins().fcmp(FloatCC::LessThan, diff, half);
     let one = builder.ins().f64const(1.0);
     let upper = builder.ins().fadd(floor, one);
-    builder.ins().select(below_half, floor, upper)
+    let rounded = builder.ins().select(below_half, floor, upper);
+
+    let zero = builder.ins().f64const(0.0);
+    let negative = builder.ins().fcmp(FloatCC::LessThan, x, zero);
+    let is_zero = builder.ins().fcmp(FloatCC::Equal, rounded, zero);
+    let fix_negative_zero = builder.ins().band(negative, is_zero);
+    let negative_zero = builder.ins().f64const(-0.0);
+    builder
+        .ins()
+        .select(fix_negative_zero, negative_zero, rounded)
 }
 
 /// `Math.fround`: rounds the value to the nearest `f32` and back.
@@ -214,6 +271,11 @@ fn is_integer(builder: &mut FunctionBuilder, x: Value) -> Value {
     builder.ins().band(finite, integral)
 }
 
+fn has_negative_sign(builder: &mut FunctionBuilder, x: Value) -> Value {
+    let bits = builder.ins().bitcast(types::I64, MemFlags::new(), x);
+    builder.ins().icmp_imm(IntCC::SignedLessThan, bits, 0)
+}
+
 fn sign(builder: &mut FunctionBuilder, x: Value) -> Value {
     let zero = builder.ins().f64const(0.0);
     let one = builder.ins().f64const(1.0);
@@ -222,6 +284,15 @@ fn sign(builder: &mut FunctionBuilder, x: Value) -> Value {
     let negative = builder.ins().fcmp(FloatCC::LessThan, x, zero);
     let unsigned = builder.ins().select(positive, one, zero);
     let signed = builder.ins().select(negative, minus_one, unsigned);
+
+    let is_zero = builder.ins().fcmp(FloatCC::Equal, x, zero);
+    let negative_sign = has_negative_sign(builder, x);
+    let is_negative_zero = builder.ins().band(is_zero, negative_sign);
+    let negative_zero = builder.ins().f64const(-0.0);
+    let signed = builder
+        .ins()
+        .select(is_negative_zero, negative_zero, signed);
+
     let nan = builder.ins().fcmp(FloatCC::Unordered, x, x);
     builder.ins().select(nan, x, signed)
 }
@@ -234,8 +305,27 @@ fn extremum(builder: &mut FunctionBuilder, lhs: Value, rhs: Value, maximum: bool
     };
     let comparison = builder.ins().fcmp(cc, lhs, rhs);
     let picked = builder.ins().select(comparison, lhs, rhs);
+
+    let zero = builder.ins().f64const(0.0);
+    let lhs_zero = builder.ins().fcmp(FloatCC::Equal, lhs, zero);
+    let rhs_zero = builder.ins().fcmp(FloatCC::Equal, rhs, zero);
+    let both_zero = builder.ins().band(lhs_zero, rhs_zero);
+    let lhs_negative = has_negative_sign(builder, lhs);
+    let rhs_negative = has_negative_sign(builder, rhs);
+    let negative_zero = builder.ins().f64const(-0.0);
+    let zero_result = if maximum {
+        let lhs_positive = builder.ins().icmp_imm(IntCC::Equal, lhs_negative, 0);
+        let rhs_positive = builder.ins().icmp_imm(IntCC::Equal, rhs_negative, 0);
+        let either_positive = builder.ins().bor(lhs_positive, rhs_positive);
+        builder.ins().select(either_positive, zero, negative_zero)
+    } else {
+        let either_negative = builder.ins().bor(lhs_negative, rhs_negative);
+        builder.ins().select(either_negative, negative_zero, zero)
+    };
+    let with_zero = builder.ins().select(both_zero, zero_result, picked);
+
     let lhs_nan = builder.ins().fcmp(FloatCC::Unordered, lhs, lhs);
-    builder.ins().select(lhs_nan, lhs, picked)
+    builder.ins().select(lhs_nan, lhs, with_zero)
 }
 
 fn min_or_max(builder: &mut FunctionBuilder, args: &[Value], maximum: bool) -> Value {
@@ -246,57 +336,59 @@ fn min_or_max(builder: &mut FunctionBuilder, args: &[Value], maximum: bool) -> V
     };
     let mut acc = builder.ins().f64const(identity);
     for &arg in args {
+        let arg = value::to_number(builder, arg);
         acc = extremum(builder, acc, arg, maximum);
     }
     acc
 }
 
-/// Compiles `Math.foo(...)` / `Number.foo(...)`, with `args` already evaluated.
+/// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)` and the free
+/// global builtins, with `args` already evaluated.
 pub fn call(
     builder: &mut FunctionBuilder,
     funcs: &HashMap<&'static str, FuncRef>,
     fmod_ref: FuncRef,
+    namespace: Option<Namespace>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Error> {
-    let unary = |builder: &mut FunctionBuilder| argument(builder, args, 0);
     let value = match name {
         "abs" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             builder.ins().fabs(x)
         }
         "ceil" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             builder.ins().ceil(x)
         }
         "floor" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             builder.ins().floor(x)
         }
         "round" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             js_round(builder, x)
         }
         "trunc" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             builder.ins().trunc(x)
         }
         "sqrt" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             builder.ins().sqrt(x)
         }
         "fround" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             fround(builder, x)
         }
         "min" => min_or_max(builder, args, false),
         "max" => min_or_max(builder, args, true),
         "sign" => {
-            let x = unary(builder);
+            let x = number_argument(builder, args, 0);
             sign(builder, x)
         }
         "clz32" => {
-            let x = unary(builder);
+            let x = argument(builder, args, 0);
             let int = value::to_int32(builder, fmod_ref, x);
             let leading = builder.ins().clz(int);
             let wide = builder.ins().uextend(types::I64, leading);
@@ -311,22 +403,32 @@ pub fn call(
             value::from_int32(builder, product)
         }
         "isNaN" => {
-            let x = unary(builder);
+            let x = argument(builder, args, 0);
+            let x = if namespace == Some(Namespace::Number) {
+                x
+            } else {
+                value::to_number(builder, x)
+            };
             let nan = value::is_nan(builder, x);
             value::from_bool(builder, nan)
         }
         "isFinite" => {
-            let x = unary(builder);
+            let x = argument(builder, args, 0);
+            let x = if namespace == Some(Namespace::Number) {
+                x
+            } else {
+                value::to_number(builder, x)
+            };
             let finite = value::is_finite(builder, x);
             value::from_bool(builder, finite)
         }
         "isInteger" => {
-            let x = unary(builder);
+            let x = argument(builder, args, 0);
             let integral = is_integer(builder, x);
             value::from_bool(builder, integral)
         }
         "isSafeInteger" => {
-            let x = unary(builder);
+            let x = argument(builder, args, 0);
             let integral = is_integer(builder, x);
             let abs = builder.ins().fabs(x);
             let limit = builder.ins().f64const(MAX_SAFE_INTEGER);
@@ -334,16 +436,27 @@ pub fn call(
             let safe = builder.ins().band(integral, small);
             value::from_bool(builder, safe)
         }
+        "is" => {
+            let lhs = argument(builder, args, 0);
+            let rhs = argument(builder, args, 1);
+            value::same_value(builder, lhs, rhs)
+        }
+        "Boolean" => {
+            let x = argument(builder, args, 0);
+            let truthy = value::truthy(builder, x);
+            value::from_bool(builder, truthy)
+        }
+        "Number" => number_argument(builder, args, 0),
         other => {
             let func_ref = *funcs
                 .get(other)
                 .ok_or_else(|| Error::Unsupported(format!("unknown builtin function: {other}")))?;
             if BINARY_LIBM.contains(&other) {
-                let lhs = argument(builder, args, 0);
-                let rhs = argument(builder, args, 1);
+                let lhs = number_argument(builder, args, 0);
+                let rhs = number_argument(builder, args, 1);
                 call_libm(builder, func_ref, &[lhs, rhs])
             } else {
-                let x = unary(builder);
+                let x = number_argument(builder, args, 0);
                 call_libm(builder, func_ref, &[x])
             }
         }

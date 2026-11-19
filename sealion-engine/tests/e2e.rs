@@ -8,7 +8,7 @@ use sealion_engine::Engine;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-fn run(js: &str) -> i32 {
+fn run_status(js: &str) -> std::process::ExitStatus {
     let engine = Engine::new();
     let mut ir = engine
         .compile(js)
@@ -22,8 +22,17 @@ fn run(js: &str) -> i32 {
         .unwrap_or_else(|e| panic!("run failed: {e}"));
     let _ = std::fs::remove_file(PathBuf::from(&path));
     status
+}
+
+fn run(js: &str) -> i32 {
+    run_status(js)
         .code()
         .unwrap_or_else(|| panic!("process terminated by signal"))
+}
+
+fn run_traps(js: &str) {
+    let status = run_status(js);
+    assert!(!status.success(), "expected runtime failure for {js}");
 }
 
 #[test]
@@ -577,4 +586,499 @@ fn builtins_shadowing_and_errors() {
     assert!(Engine::new().compile("Number.PI;").is_err());
     assert!(Engine::new().compile("var m = Math;").is_err());
     assert!(Engine::new().compile("Math['abs'](1);").is_err());
+}
+
+#[test]
+fn for_loop_basics() {
+    assert_eq!(
+        run("var s = 0; for (var i = 0; i < 5; i++) { s = s + i; } s;"),
+        10
+    );
+    assert_eq!(
+        run("var s = 0; for (let i = 0; i < 5; i++) { s = s + i; } s;"),
+        10
+    );
+    assert_eq!(
+        run("var s = 0; for (let i = 0; i < 4; i++) s = s + i; s;"),
+        6
+    );
+    assert_eq!(run("let i = 9; for (let i = 0; i < 2; i++) {} i;"), 9);
+    assert_eq!(
+        run(
+            "function fact(n) { let p = 1; for (let i = 2; i <= n; i++) { p = p * i; } return p; } fact(5);"
+        ),
+        120
+    );
+}
+
+#[test]
+fn for_loop_optional_clauses() {
+    assert_eq!(
+        run("var i = 0; for (;;) { i = i + 1; if (i > 3) { break; } } i;"),
+        4
+    );
+    assert_eq!(run("var i = 0; for (; i < 3; i++) {} i;"), 3);
+    assert_eq!(run("var i = 0; for (; i < 3;) { i = i + 1; } i;"), 3);
+    assert_eq!(
+        run("var s = 0; for (var i = 0, j = 3; i < j; i++) { s = s + 1; } s;"),
+        3
+    );
+}
+
+#[test]
+fn for_loop_control_flow() {
+    assert_eq!(
+        run("var s = 0; for (let i = 0; i < 5; i++) { if (i === 2) { continue; } s = s + i; } s;"),
+        8
+    );
+    assert_eq!(
+        run("var s = 0; for (let i = 0; i < 10; i++) { if (i === 3) { break; } s = s + i; } s;"),
+        3
+    );
+    assert_eq!(
+        run(
+            "function f() { for (let i = 0; i < 10; i++) { if (i > 2) { return i; } } return 0; } f();"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var s = 0; for (let i = 0; i < 3; i++) { for (let j = 0; j < 2; j++) { s = s + 1; } } s;"
+        ),
+        6
+    );
+    assert_eq!(
+        run(
+            "var s = 0; for (let i = 0; i < 3; i++) { let j = 0; while (1) { j = j + 1; if (j > 1) { break; } s = s + 10; } s = s + i; } s;"
+        ),
+        33
+    );
+}
+
+#[test]
+fn for_loop_per_iteration_bindings() {
+    assert_eq!(
+        run(
+            "var f = undefined; var g = undefined; for (let i = 0; i < 2; i++) { if (i === 0) { f = function () { return i; }; } else { g = function () { return i; }; } } f() + g();"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var s = 0; for (let i = 0; i < 3; i++) { let n = i * 2; s = s + n; } s;"),
+        6
+    );
+}
+
+#[test]
+fn for_loop_scope_does_not_leak() {
+    assert!(
+        Engine::new()
+            .compile("for (let i = 0; i < 1; i++) {} i;")
+            .is_err()
+    );
+    assert!(
+        Engine::new()
+            .compile("for (const i = 0; i < 1;) {} i;")
+            .is_err()
+    );
+    assert_eq!(run("for (var i = 0; i < 1; i++) {} i;"), 1);
+}
+
+#[test]
+fn switch_matches_and_falls_through() {
+    assert_eq!(
+        run("var x = 0; switch (2) { case 1: x = 1; break; case 2: x = 2; break; } x;"),
+        2
+    );
+    assert_eq!(run("var x = 0; switch (9) { case 1: x = 1; break; } x;"), 0);
+    assert_eq!(
+        run(
+            "var x = 0; switch (2) { case 1: x = 1; case 2: x = x + 2; case 3: x = x + 3; break; case 4: x = x + 4; } x;"
+        ),
+        5
+    );
+    assert_eq!(run("var x = 0; switch (1) { } x;"), 0);
+}
+
+#[test]
+fn switch_default() {
+    assert_eq!(
+        run("var x = 0; switch (9) { case 1: x = 1; break; default: x = 7; } x;"),
+        7
+    );
+    assert_eq!(
+        run("var x = 0; switch (1) { case 1: x = 1; break; default: x = 7; } x;"),
+        1
+    );
+    assert_eq!(
+        run("var x = 0; switch (9) { case 1: x = 1; default: x = x + 7; case 2: x = x + 1; } x;"),
+        8
+    );
+}
+
+#[test]
+fn switch_evaluation_order_and_strict_equality() {
+    assert_eq!(
+        run(
+            "var n = 0; function next() { n = n + 1; return n; } switch (next()) { case 1: break; } n;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "var n = 0; function t(v) { n = n + 1; return v; } switch (2) { case t(1): break; case t(2): break; case t(3): break; } n;"
+        ),
+        2
+    );
+    assert_eq!(
+        run("var x = 0; switch (0) { case null: x = 1; break; default: x = 2; } x;"),
+        2
+    );
+    assert_eq!(
+        run("var x = 0; switch (undefined) { case undefined: x = 1; break; default: x = 2; } x;"),
+        1
+    );
+}
+
+#[test]
+fn switch_control_flow() {
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; while (i < 3) { i = i + 1; switch (i) { case 2: continue; default: s = s + i; } } s;"
+        ),
+        4
+    );
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; while (i < 3) { i = i + 1; switch (i) { case 2: break; default: s = s + i; } } s;"
+        ),
+        4
+    );
+    assert_eq!(
+        run("function f(x) { switch (x) { case 1: return 10; default: return 20; } } f(1) + f(2);"),
+        30
+    );
+}
+
+#[test]
+fn switch_shares_its_block_scope() {
+    assert_eq!(
+        run("switch (1) { case 1: let y = 5; var z = y + 1; break; } z;"),
+        6
+    );
+    assert!(
+        Engine::new()
+            .compile("switch (1) { case 1: let y = 5; } y;")
+            .is_err()
+    );
+    assert_eq!(
+        run("let y = 1; switch (1) { case 1: let y = 2; var z = y; } z + y;"),
+        3
+    );
+}
+
+#[test]
+fn const_cannot_be_reassigned() {
+    assert_eq!(run("const x = 2; const y = 3; x * y;"), 6);
+    assert!(Engine::new().compile("const x = 1; x = 2;").is_err());
+    assert!(Engine::new().compile("const x = 1; x += 2;").is_err());
+    assert!(Engine::new().compile("const x = 1; x++;").is_err());
+    assert!(Engine::new().compile("const x = 1; --x;").is_err());
+    assert!(Engine::new().compile("const x = 1; x ||= 2;").is_err());
+    assert!(
+        Engine::new()
+            .compile("const c = 1; function f() { c = 2; }")
+            .is_err()
+    );
+    assert!(
+        Engine::new()
+            .compile("function f() { const c = 1; c = 2; }")
+            .is_err()
+    );
+}
+
+#[test]
+fn const_shadowing() {
+    assert_eq!(run("const x = 1; { let x = 2; x = 3; } x;"), 1);
+    assert_eq!(run("let x = 1; { const x = 2; } x = 5; x;"), 5);
+    assert_eq!(
+        run("const x = 1; function f(x) { x = x + 1; return x; } f(5) + x;"),
+        7
+    );
+    assert_eq!(
+        run("var s = 0; for (const i = 9; s < 1; s++) { s = s + i; } s;"),
+        10
+    );
+}
+
+#[test]
+fn do_while_loops() {
+    assert_eq!(run("var i = 0; do { i = i + 1; } while (i < 3); i;"), 3);
+    assert_eq!(run("var i = 0; do { i = 1; } while (0); i;"), 1);
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; do { i = i + 1; if (i === 2) { continue; } s = s + i; } while (i < 3); s;"
+        ),
+        4
+    );
+    assert_eq!(
+        run("var i = 0; do { i = i + 1; if (i === 2) { break; } } while (1); i;"),
+        2
+    );
+}
+
+#[test]
+fn labelled_break_and_continue() {
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; outer: while (i < 5) { i = i + 1; var j = 0; inner: while (j < 5) { j = j + 1; if (j === 2) { continue outer; } s = s + 1; } } s;"
+        ),
+        5
+    );
+    assert_eq!(
+        run(
+            "var i = 0; outer: for (; i < 5; i = i + 1) { for (var j = 0; j < 5; j = j + 1) { if (j === 1) { break outer; } } } i;"
+        ),
+        0
+    );
+    assert_eq!(
+        run(
+            "var i = 0; var s = 0; outer: do { i = i + 1; if (i === 2) { continue outer; } s = s + i; } while (i < 3); s;"
+        ),
+        4
+    );
+    assert_eq!(
+        run(
+            "var s = 0; outer: for (var i = 0; i < 3; i = i + 1) { for (var j = 0; j < 3; j = j + 1) { if (j === 1) { continue outer; } s = s + 1; } } s;"
+        ),
+        3
+    );
+}
+
+#[test]
+fn labelled_blocks() {
+    assert_eq!(
+        run("var x = 0; block: { x = 1; break block; x = 2; } x;"),
+        1
+    );
+    assert_eq!(run("var x = 0; a: b: { x = 1; break a; x = 2; } x;"), 1);
+    assert_eq!(
+        run("var x = 0; lab: switch (1) { case 1: x = 1; break lab; default: x = 2; } x;"),
+        1
+    );
+    assert_eq!(
+        run("var i = 0; while (i < 3) { i = i + 1; lab: { if (i === 2) { break; } } } i;"),
+        2
+    );
+    assert!(Engine::new().compile("a: { continue a; }").is_err());
+    assert!(Engine::new().compile("break nope;").is_err());
+}
+
+#[test]
+fn debugger_is_a_noop() {
+    assert_eq!(run("var x = 1; debugger; x;"), 1);
+    assert_eq!(run("debugger; 2;"), 2);
+}
+
+#[test]
+fn default_parameters() {
+    assert_eq!(run("function f(a = 5) { return a; } f() + f(2);"), 7);
+    assert_eq!(run("function f(a, b = a + 1) { return b; } f(2);"), 3);
+    assert_eq!(run("function f(a = 5) { return a; } f(undefined);"), 5);
+    assert_eq!(
+        run("var n = 0; function f(a = (n = n + 1)) { return a; } f(1); f(); n;"),
+        1
+    );
+    assert_eq!(
+        run("var f = function (g = function () { return 7; }) { return g(); }; f();"),
+        7
+    );
+    assert_eq!(run("function f(g = () => 8) { return g(); } f();"), 8);
+    assert_eq!(run("function f(a, g = () => a) { return g(); } f(9);"), 9);
+    assert_eq!(
+        run("function f(a = 1, b = a + 1) { return a + b; } f();"),
+        3
+    );
+    assert_eq!(run("function f(a = 5) { return a === null; } f(null);"), 1);
+    assert_eq!(run("function f(a = 5) { return a === 0; } f(0);"), 1);
+    assert_eq!(
+        run("function f(a = 5) { return a === false; } f(false);"),
+        1
+    );
+}
+
+#[test]
+fn default_parameters_have_a_tdz() {
+    run_traps("function f(a = b, b = 1) { return a; } f();");
+    run_traps("function f(a = a) { return a; } f();");
+}
+
+#[test]
+fn let_and_const_have_a_tdz() {
+    run_traps("x; let x = 1;");
+    run_traps("let x = x;");
+    run_traps("const x = x;");
+    run_traps("x = 1; let x;");
+    run_traps("let x = 1; { x; let x = 2; }");
+    assert_eq!(run("let x; x === undefined;"), 1);
+    assert_eq!(run("let x; x = 5; x;"), 5);
+    assert_eq!(run("let x = 1; x;"), 1);
+    assert_eq!(
+        run("let x = 1; switch (x) { case 1: let x = 2; break; } x;"),
+        1
+    );
+    assert_eq!(
+        run("var r = 0; switch (1) { case 1: let x = 2; r = x; } r;"),
+        2
+    );
+    run_traps("switch (1) { case 1: x; let x = 2; }");
+}
+
+#[test]
+fn math_signed_zero() {
+    assert_eq!(run("1 / Math.min(0, -0) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.min(-0, 0) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.max(0, -0) === Number.POSITIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.max(-0, 0) === Number.POSITIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.round(-0.4) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.round(-0.5) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.sign(-0) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.min(-0, -0) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Math.max(-0, -0) === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("Number.isNaN(Math.min(NaN, -0));"), 1);
+    assert_eq!(run("Number.isNaN(Math.max(-0, NaN));"), 1);
+}
+
+#[test]
+fn math_arguments_are_coerced() {
+    assert_eq!(run("Math.abs(null);"), 0);
+    assert_eq!(run("Number.isNaN(Math.abs(undefined));"), 1);
+    assert_eq!(run("Number.isNaN(Math.abs(function () {}));"), 1);
+    assert_eq!(run("Math.min(null, 1);"), 0);
+    assert_eq!(run("Number.isNaN(Math.min(undefined, 1));"), 1);
+    assert_eq!(run("Math.max(null, -1);"), 0);
+    assert_eq!(run("Math.round(null);"), 0);
+    assert_eq!(run("Math.sign(null);"), 0);
+    assert_eq!(run("Math.pow(null, 2);"), 0);
+    assert_eq!(run("Math.atan2(null, 1);"), 0);
+    assert_eq!(run("Math.floor(true);"), 1);
+    assert_eq!(run("Math.abs(false);"), 0);
+    assert_eq!(run("Math.sqrt(null);"), 0);
+}
+
+#[test]
+fn arithmetic_and_relational_coercion() {
+    assert_eq!(run("null + 1;"), 1);
+    assert_eq!(run("null - 1 === -1;"), 1);
+    assert_eq!(run("null * 3;"), 0);
+    assert_eq!(run("null / 2;"), 0);
+    assert_eq!(run("null % 2;"), 0);
+    assert_eq!(run("null ** 2;"), 0);
+    assert_eq!(run("null < 1;"), 1);
+    assert_eq!(run("null >= 0;"), 1);
+    assert_eq!(run("null <= 0;"), 1);
+    assert_eq!(run("undefined < 1;"), 0);
+    assert_eq!(run("Number.isNaN(undefined + 1);"), 1);
+    assert_eq!(run("+null;"), 0);
+    assert_eq!(run("1 / -null === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("+true;"), 1);
+    assert_eq!(run("+false;"), 0);
+    assert_eq!(run("var x = null; x++; x;"), 1);
+    assert_eq!(run("var x = null; var y = x++; y + x;"), 1);
+    assert_eq!(run("var x = null; x += 2; x;"), 2);
+    assert_eq!(run("var x = true; x++; x;"), 2);
+    assert_eq!(run("true + 1;"), 2);
+}
+
+#[test]
+fn global_nan_and_infinity() {
+    assert_eq!(run("Number.isNaN(NaN);"), 1);
+    assert_eq!(run("Infinity === Number.POSITIVE_INFINITY;"), 1);
+    assert_eq!(run("-Infinity === Number.NEGATIVE_INFINITY;"), 1);
+    assert_eq!(run("1 / Infinity;"), 0);
+    assert_eq!(run("Number.isNaN(NaN + 1);"), 1);
+    assert!(Engine::new().compile("undefined = 1;").is_err());
+    assert!(Engine::new().compile("NaN = 1;").is_err());
+    assert_eq!(run("{ let undefined = 5; undefined; }"), 5);
+    assert_eq!(run("function f(undefined) { return undefined; } f(5);"), 5);
+}
+
+#[test]
+fn booleans_are_distinct_and_coerce() {
+    assert_eq!(run("true === 1;"), 0);
+    assert_eq!(run("false === 0;"), 0);
+    assert_eq!(run("true === true;"), 1);
+    assert_eq!(run("false === false;"), 1);
+    assert_eq!(run("true == 1;"), 1);
+    assert_eq!(run("false == 0;"), 1);
+    assert_eq!(run("true == 2;"), 0);
+    assert_eq!(run("false == null;"), 0);
+    assert_eq!(run("true + 1;"), 2);
+}
+
+#[test]
+fn global_boolean_and_number_functions() {
+    assert_eq!(run("Number(true);"), 1);
+    assert_eq!(run("Number(false);"), 0);
+    assert_eq!(run("Number(null);"), 0);
+    assert_eq!(run("Number.isNaN(Number(undefined));"), 1);
+    assert_eq!(run("Number(3);"), 3);
+    assert_eq!(run("Boolean(1);"), 1);
+    assert_eq!(run("Boolean(0);"), 0);
+    assert_eq!(run("Boolean(null);"), 0);
+    assert_eq!(run("Boolean(undefined);"), 0);
+    assert_eq!(run("Boolean(function () {});"), 1);
+    assert_eq!(run("Boolean();"), 0);
+    assert_eq!(run("Number.isNaN(Number());"), 1);
+}
+
+#[test]
+fn global_is_nan_and_is_finite_coerce() {
+    assert_eq!(run("isNaN(undefined);"), 1);
+    assert_eq!(run("isNaN(null);"), 0);
+    assert_eq!(run("isNaN(true);"), 0);
+    assert_eq!(run("isFinite(null);"), 1);
+    assert_eq!(run("isFinite(undefined);"), 0);
+    assert_eq!(run("isFinite(true);"), 1);
+    assert_eq!(run("Number.isNaN(undefined);"), 0);
+    assert_eq!(run("Number.isFinite(null);"), 0);
+}
+
+#[test]
+fn named_function_expressions() {
+    assert_eq!(
+        run(
+            "var f = function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); }; f(5);"
+        ),
+        120
+    );
+    assert_eq!(run("var f = function g() { return g === f; }; f();"), 1);
+    assert_eq!(run("var f = function g() { return g; }; f === f();"), 1);
+    assert_eq!(
+        run(
+            "function make() { return function inner(n) { if (n === 0) { return 1; } return inner(n - 1); }; } make()(3);"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var f = function g(a = g) { return a === g; }; f();"),
+        1
+    );
+}
+
+#[test]
+fn object_is() {
+    assert_eq!(run("Object.is(NaN, NaN);"), 1);
+    assert_eq!(run("Object.is(0, -0);"), 0);
+    assert_eq!(run("Object.is(-0, -0);"), 1);
+    assert_eq!(run("Object.is(0, 0);"), 1);
+    assert_eq!(run("Object.is(1, 2);"), 0);
+    assert_eq!(run("Object.is(null, null);"), 1);
+    assert_eq!(run("Object.is(null, undefined);"), 0);
+    assert_eq!(run("Object.is(true, true);"), 1);
+    assert_eq!(run("Object.is(true, 1);"), 0);
+    assert_eq!(run("var f = function () {}; Object.is(f, f);"), 1);
+    assert_eq!(run("Object.is(function () {}, function () {});"), 0);
+    assert_eq!(run("Object.is();"), 1);
+    assert!(Engine::new().compile("Math.is(1, 1);").is_err());
 }

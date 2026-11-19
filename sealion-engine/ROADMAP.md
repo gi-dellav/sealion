@@ -49,9 +49,9 @@
 
 ## 0.6.0
 
-- [ ] `switch, case, default`
-- [ ] `for` loops
-- [ ] `const` keyword
+- [x] `switch, case, default`
+- [x] `for` loops
+- [x] `const` keyword
 
 ## 0.7.0
 

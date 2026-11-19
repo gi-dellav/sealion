@@ -1,4 +1,4 @@
-//! A small JavaScript-to-native compiler for the 0.5.0 roadmap subset.
+//! A small JavaScript-to-native compiler for the 0.6.0 roadmap subset.
 //!
 //! The engine parses JavaScript with `boa-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
@@ -11,10 +11,13 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! The 0.5.0 subset supports functions (declarations, expressions and arrow
-//! functions), closures, variables with block scoping, `if`/`else`, `while`,
-//! `break`/`continue`, `return`, the `undefined`/`null` literals, the `Math`
-//! and `Number` namespaces, and the following operators:
+//! The 0.6.0 subset supports functions (declarations, expressions, named
+//! expressions and arrow functions), closures, variables (`var`, `let` and
+//! `const`) with block scoping and a temporal dead zone, default parameters,
+//! `if`/`else`, `while`, `do...while`, `for`, `switch`, labelled statements,
+//! labelled `break`/`continue`, `debugger`, `return`, the `undefined`/`null`
+//! literals, the `Math`, `Number` and `Object.is` builtins, the global
+//! `NaN`/`Infinity` values, and the following operators:
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
@@ -23,16 +26,15 @@
 //! - assignment `=` plus every compound form, including `&&=`, `||=` and `??=`.
 //!
 //! Values are NaN-boxed `f64`s: numbers are plain IEEE-754, while `undefined`,
-//! `null` and closures live in reserved quiet-NaN tag ranges.
-//! Consequences of the current encoding:
+//! `null`, booleans, uninitialized bindings and closures live in reserved
+//! quiet-NaN tag ranges. Consequences of the current encoding:
 //!
-//! - `===`/`!==` distinguish the tagged values, but booleans are still plain
-//!   `0`/`1` numbers, so `true === 1` holds.
-//! - `==`/`!=` implement strict equality plus `null == undefined`; the coercions
-//!   that need strings or objects arrive with those types.
-//! - Arithmetic on tagged values yields a NaN rather than coercing, so
-//!   `undefined + 1` is not `NaN` by spec rules yet, while the bitwise operators
-//!   do convert through `ToInt32` (`undefined | 0` is `0`).
+//! - `===`/`!==` distinguish the tagged values, so `true === 1` is false.
+//! - `==`/`!=` implement strict equality, `null == undefined`, and boolean to
+//!   number coercion; string/object coercions arrive with those types.
+//! - Arithmetic, relational operators, `++`/`--` and Math calls apply
+//!   `ToNumber` to their operands (`null + 1` is `1`, `undefined + 1` is NaN).
+//! - Bitwise operators convert through `ToInt32` (`undefined | 0` is `0`).
 //! - Bitwise results are signed 32-bit values except for `>>>`, as per the spec.
 //! - String literals are rejected outright; strings arrive with the object work.
 //!
@@ -47,29 +49,44 @@
 //!
 //! - Environments are never freed; a block that runs in a loop allocates once
 //!   per iteration.
-//! - There is no temporal dead zone: a block-scoped binding reads as
-//!   `undefined` before its declaration executes.
-//! - Named function expressions ignore their inner name, so recursion has to go
-//!   through the assigned outer variable.
+//! - `let`/`const` bindings and parameters start in the temporal dead zone;
+//!   reading one before its declaration runs traps instead of yielding
+//!   `undefined`.
+//! - Named function expressions can refer to themselves by name.
 //! - `function` declarations hoist to the enclosing function even when written
 //!   in a block, so they cannot see that block's `let`/`const` bindings.
 //!
-//! `Math` and `Number` are namespaces, not objects: every member is either a
-//! compile-time constant or a builtin function, so `Math.PI` folds to a
-//! literal, `Math.sqrt` becomes a libm call and `Math.clz32` a few
+//! `Math`, `Number` and `Object` are namespaces, not objects: every member is
+//! either a compile-time constant or a builtin function, so `Math.PI` folds to
+//! a literal, `Math.sqrt` becomes a libm call and `Math.clz32` a few
 //! instructions. Consequences:
 //!
-//! - `Math` and `Number` cannot be used as values (`var m = Math` is
-//!   rejected), and only the dot notation reaches them.
-//! - A local binding named `Math`, `Number`, `isNaN` or `isFinite` shadows the
-//!   builtin for reads, but `Math.abs(x)` still resolves to the builtin.
-//! - `isNaN`/`isFinite` are aliases of `Number.isNaN`/`Number.isFinite` rather
-//!   than coercing their argument, because there are no strings to coerce yet.
-//! - `Math.round` rounds halves towards `+Infinity` and `Math.fround` rounds
-//!   through an `f32`; the rest call libm directly.
+//! - The namespaces cannot be used as values (`var m = Math` is rejected), and
+//!   only the dot notation reaches them.
+//! - A local binding named after a namespace or builtin shadows it for reads,
+//!   but `Math.abs(x)` still resolves to the builtin.
+//! - `isNaN`/`isFinite` coerce their argument; `Number.isNaN`/`Number.isFinite`
+//!   do not. `Boolean(value)` and `Number(value)` are also available.
+//! - `Math.round` rounds halves towards `+Infinity`; `Math.min`/`Math.max` keep
+//!   `-0`/`NaN` semantics, and `Math.fround` rounds through an `f32`.
 //!
-//! `switch`, objects, arrays, and strings are intentionally deferred to later
-//! roadmap versions.
+//! `const` bindings are immutable: assigning to one (or updating it with
+//! `++`/`--`) is rejected at compile time. `switch` compares with `===`,
+//! evaluates the discriminant once, evaluates case expressions in source order
+//! until one matches, and falls through from the matched clause on. A `let` or
+//! `const` declared inside a `switch` belongs to the scope of the whole
+//! `switch` body.
+//!
+//! A `for (init; condition; update)` loop opens a scope for its lexical
+//! initializer and, like the specification, copies that scope's bindings once
+//! per iteration, so a closure created in the body sees the iteration's own
+//! value. `continue` still runs the update expression. `do...while` evaluates
+//! its condition after the body, and labelled `break`/`continue` can target
+//! outer loops or labelled blocks.
+//!
+//! `undefined` is a non-writable global and `debugger` is accepted as a no-op.
+//! Objects, arrays, strings and `for..in`/`for..of` loops are intentionally
+//! deferred to later roadmap versions.
 
 mod builtins;
 mod compiler;
@@ -118,8 +135,7 @@ impl Engine {
         let mut parser = Parser::new(Source::from_bytes(source));
         let script = parser.parse_script(&scope, &mut interner)?;
 
-        let undefined_sym = interner.get_or_intern("undefined");
-        let program = build_program_plan(&script, undefined_sym)?;
+        let program = build_program_plan(&script)?;
 
         let triple = Triple::host();
         let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
