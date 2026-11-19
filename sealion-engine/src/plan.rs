@@ -13,8 +13,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    BindingPattern, Expression, ForStatement, ForStatementInit, FormalParameters, Function,
-    FunctionBody, Statement, VariableDeclaration, VariableDeclarationKind,
+    BindingPattern, CatchClause, ChainElement, Expression, ForStatement, ForStatementInit,
+    FormalParameters, Function, FunctionBody, Statement, VariableDeclaration,
+    VariableDeclarationKind,
 };
 
 use crate::Error;
@@ -278,11 +279,7 @@ impl<'a> Planner<'a> {
     ) -> Result<(), Error> {
         match stmt {
             Statement::BlockStatement(block) => {
-                let block_scope = self.new_scope(plan_id, Some(scope));
-                self.functions[plan_id]
-                    .blocks
-                    .insert(node_key(&**block), block_scope);
-                self.scan_statements(plan_id, block_scope, block.body.as_slice())?;
+                self.scan_block(plan_id, scope, block)?;
             }
             Statement::VariableDeclaration(decl) => {
                 if decl.kind == VariableDeclarationKind::Var {
@@ -341,6 +338,18 @@ impl<'a> Planner<'a> {
                 }
                 self.scan_statement(plan_id, scope, &labelled.body)?;
             }
+            Statement::ThrowStatement(throw) => {
+                self.scan_expression(plan_id, scope, &throw.argument)?;
+            }
+            Statement::TryStatement(try_stmt) => {
+                self.scan_block(plan_id, scope, &try_stmt.block)?;
+                if let Some(handler) = &try_stmt.handler {
+                    self.scan_catch(plan_id, scope, handler)?;
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    self.scan_block(plan_id, scope, finalizer)?;
+                }
+            }
             Statement::EmptyStatement(_)
             | Statement::DebuggerStatement(_)
             | Statement::BreakStatement(_)
@@ -394,6 +403,71 @@ impl<'a> Planner<'a> {
             self.scan_expression(plan_id, loop_scope, update)?;
         }
         self.scan_statement(plan_id, loop_scope, &for_stmt.body)?;
+        Ok(())
+    }
+
+    fn scan_block(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        block: &'a oxc_ast::ast::BlockStatement<'a>,
+    ) -> Result<ScopeId, Error> {
+        let block_scope = self.new_scope(plan_id, Some(scope));
+        self.functions[plan_id]
+            .blocks
+            .insert(node_key(block), block_scope);
+        self.scan_statements(plan_id, block_scope, block.body.as_slice())?;
+        Ok(block_scope)
+    }
+
+    fn scan_catch(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        handler: &'a CatchClause<'a>,
+    ) -> Result<(), Error> {
+        let catch_scope = self.new_scope(plan_id, Some(scope));
+        self.functions[plan_id]
+            .blocks
+            .insert(node_key(handler), catch_scope);
+        if let Some(param) = &handler.param {
+            let BindingPattern::BindingIdentifier(id) = &param.pattern else {
+                return Err(Error::Unsupported(
+                    "destructuring catch parameters are not supported".to_string(),
+                ));
+            };
+            self.add_binding(catch_scope, id.name.as_str());
+        }
+        self.scan_statements(plan_id, catch_scope, handler.body.body.as_slice())
+    }
+
+    fn scan_chain_element(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        element: &'a ChainElement<'a>,
+    ) -> Result<(), Error> {
+        match element {
+            ChainElement::CallExpression(call) => {
+                self.scan_expression(plan_id, scope, &call.callee)?;
+                for arg in &call.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.scan_expression(plan_id, scope, expr)?;
+                    }
+                }
+            }
+            ChainElement::ComputedMemberExpression(member) => {
+                self.scan_expression(plan_id, scope, &member.object)?;
+                self.scan_expression(plan_id, scope, &member.expression)?;
+            }
+            ChainElement::StaticMemberExpression(member) => {
+                self.scan_expression(plan_id, scope, &member.object)?;
+            }
+            ChainElement::PrivateFieldExpression(member) => {
+                self.scan_expression(plan_id, scope, &member.object)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -513,6 +587,9 @@ impl<'a> Planner<'a> {
                         self.scan_expression(plan_id, scope, expr)?;
                     }
                 }
+            }
+            Expression::ChainExpression(chain) => {
+                self.scan_chain_element(plan_id, scope, &chain.expression)?;
             }
             Expression::StaticMemberExpression(simple) => {
                 self.scan_expression(plan_id, scope, &simple.object)?;

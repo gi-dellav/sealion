@@ -1,4 +1,4 @@
-//! The `Math`, `Number` and `Object` namespaces.
+//! The `Math`, `Number`, `Object` and `Date` namespaces.
 //!
 //! They are not objects: they are compile-time namespaces whose members are
 //! either constants (folded to an `f64` literal) or builtin functions (compiled
@@ -7,7 +7,8 @@
 //! are the global `NaN` and `Infinity` constants.
 //!
 //! Because there are no objects yet, the namespaces cannot be used as values:
-//! only `Math.member`, `Number.member` and `Object.member` are accepted.
+//! only `Math.member`, `Number.member`, `Object.member` and `Date.member` are
+//! accepted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,7 +21,10 @@ use cranelift_object::ObjectModule;
 
 use crate::{
     Error,
-    compiler::{make_f64_binary_signature, make_f64_unary_signature},
+    compiler::{
+        make_f64_binary_signature, make_f64_unary_signature, make_i64_unary_signature,
+        make_nullary_f64_signature,
+    },
     value,
 };
 
@@ -29,6 +33,7 @@ pub enum Namespace {
     Math,
     Number,
     Object,
+    Date,
 }
 
 /// libm entry points taking one `f64`.
@@ -43,7 +48,7 @@ const BINARY_LIBM: &[&str] = &["pow", "atan2"];
 /// `Math` functions implemented inline rather than by a libm call.
 const MATH_INLINE: &[&str] = &[
     "abs", "ceil", "floor", "round", "trunc", "sqrt", "fround", "min", "max", "clz32", "imul",
-    "sign",
+    "sign", "hypot", "random", "f16round",
 ];
 
 /// `Number` functions implemented inline.
@@ -51,6 +56,9 @@ const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeIntege
 
 /// `Object` functions implemented inline.
 const OBJECT_INLINE: &[&str] = &["is"];
+
+/// `Date` functions implemented inline.
+const DATE_INLINE: &[&str] = &["now"];
 
 const MATH_CONSTANTS: &[(&str, f64)] = &[
     ("PI", std::f64::consts::PI),
@@ -96,6 +104,12 @@ impl Builtins {
             let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
             funcs.insert(name, id);
         }
+        let nullary_sig = make_nullary_f64_signature(module);
+        let random_id = module.declare_function("drand48", Linkage::Import, &nullary_sig)?;
+        funcs.insert("random", random_id);
+        let time_sig = make_i64_unary_signature(module);
+        let time_id = module.declare_function("time", Linkage::Import, &time_sig)?;
+        funcs.insert("now", time_id);
 
         let names = MATH_CONSTANTS
             .iter()
@@ -106,6 +120,7 @@ impl Builtins {
             .chain(MATH_INLINE.iter().copied())
             .chain(NUMBER_INLINE.iter().copied())
             .chain(OBJECT_INLINE.iter().copied())
+            .chain(DATE_INLINE.iter().copied())
             .collect();
 
         Ok(Self { names, funcs })
@@ -117,6 +132,7 @@ impl Builtins {
             "Math" => Some(Namespace::Math),
             "Number" => Some(Namespace::Number),
             "Object" => Some(Namespace::Object),
+            "Date" => Some(Namespace::Date),
             _ => None,
         }
     }
@@ -145,6 +161,14 @@ impl Builtins {
         name == "undefined"
     }
 
+    /// True when `name` is one of the engine's builtin globals.
+    pub fn is_global(&self, name: &str) -> bool {
+        self.namespace(name).is_some()
+            || self.global_function(name).is_some()
+            || self.global_constant(name).is_some()
+            || self.is_undefined(name)
+    }
+
     pub fn property(&self, name: &str) -> Option<&'static str> {
         self.names.get(name).copied()
     }
@@ -162,6 +186,7 @@ impl Builtins {
             }
             Namespace::Number => NUMBER_INLINE.contains(&name),
             Namespace::Object => OBJECT_INLINE.contains(&name),
+            Namespace::Date => DATE_INLINE.contains(&name),
         }
     }
 
@@ -170,7 +195,7 @@ impl Builtins {
         let table = match namespace {
             Namespace::Math => MATH_CONSTANTS,
             Namespace::Number => NUMBER_CONSTANTS,
-            Namespace::Object => return None,
+            Namespace::Object | Namespace::Date => return None,
         };
         table
             .iter()
@@ -329,6 +354,79 @@ fn min_or_max(
     acc
 }
 
+fn hypot(builder: &mut FunctionBuilder, args: &[Value], known: &[bool]) -> Value {
+    let mut scale = builder.ins().f64const(0.0);
+    let mut sum = builder.ins().f64const(0.0);
+    let mut has_nan = builder.ins().iconst(types::I8, 0);
+    let mut has_inf = builder.ins().iconst(types::I8, 0);
+    let zero = builder.ins().f64const(0.0);
+    let one = builder.ins().f64const(1.0);
+    let infinity = builder.ins().f64const(f64::INFINITY);
+    let nan = builder.ins().f64const(f64::NAN);
+
+    for (index, &arg) in args.iter().enumerate() {
+        let x = if known.get(index).copied().unwrap_or(false) {
+            arg
+        } else {
+            value::to_number(builder, arg)
+        };
+        let abs = builder.ins().fabs(x);
+        let x_nan = builder.ins().fcmp(FloatCC::Unordered, x, x);
+        let x_inf = builder.ins().fcmp(FloatCC::Equal, abs, infinity);
+        has_nan = builder.ins().bor(has_nan, x_nan);
+        has_inf = builder.ins().bor(has_inf, x_inf);
+
+        let bigger = builder.ins().fcmp(FloatCC::GreaterThan, abs, scale);
+        let new_scale = builder.ins().select(bigger, abs, scale);
+        let scale_over_abs = builder.ins().fdiv(scale, abs);
+        let abs_over_scale = builder.ins().fdiv(abs, scale);
+        let ratio = builder.ins().select(bigger, scale_over_abs, abs_over_scale);
+        let square = builder.ins().fmul(ratio, ratio);
+        let scaled = builder.ins().fmul(sum, square);
+        let increased = builder.ins().fadd(scaled, one);
+        let accumulated = builder.ins().fadd(sum, square);
+        let candidate = builder.ins().select(bigger, increased, accumulated);
+        let scale_is_zero = builder.ins().fcmp(FloatCC::Equal, new_scale, zero);
+        sum = builder.ins().select(scale_is_zero, zero, candidate);
+        scale = new_scale;
+    }
+
+    let root = builder.ins().sqrt(sum);
+    let magnitude = builder.ins().fmul(scale, root);
+    let with_nan = builder.ins().select(has_nan, nan, magnitude);
+    builder.ins().select(has_inf, infinity, with_nan)
+}
+
+fn f16round(builder: &mut FunctionBuilder, x: Value) -> Value {
+    let abs = builder.ins().fabs(x);
+    let bits = builder.ins().bitcast(types::I64, MemFlags::new(), abs);
+    let exponent = builder.ins().ushr_imm(bits, 52);
+    let exponent = builder.ins().band_imm(exponent, 0x7ff);
+    let min_normal = builder.ins().f64const(2f64.powi(-14));
+    let subnormal = builder.ins().fcmp(FloatCC::LessThan, abs, min_normal);
+    let normal_exponent = builder.ins().iadd_imm(exponent, -10);
+    let subnormal_exponent = builder.ins().iconst(types::I64, 999);
+    let chosen = builder
+        .ins()
+        .select(subnormal, subnormal_exponent, normal_exponent);
+    let quantum_bits = builder.ins().ishl_imm(chosen, 52);
+    let quantum = builder
+        .ins()
+        .bitcast(types::F64, MemFlags::new(), quantum_bits);
+    let quotient = builder.ins().fdiv(abs, quantum);
+    let rounded = builder.ins().nearest(quotient);
+    let magnitude = builder.ins().fmul(rounded, quantum);
+    let signed = builder.ins().fcopysign(magnitude, x);
+
+    let overflow = builder.ins().f64const(65520.0);
+    let too_big = builder
+        .ins()
+        .fcmp(FloatCC::GreaterThanOrEqual, abs, overflow);
+    let infinity = builder.ins().f64const(f64::INFINITY);
+    let infinity = builder.ins().fcopysign(infinity, x);
+    builder.ins().select(too_big, infinity, signed)
+}
+
 /// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)` and the free
 /// global builtins, with `args` already evaluated.
 pub fn call(
@@ -371,6 +469,27 @@ pub fn call(
         }
         "min" => min_or_max(builder, args, false, known),
         "max" => min_or_max(builder, args, true, known),
+        "hypot" => hypot(builder, args, known),
+        "f16round" => {
+            let x = number_argument(builder, args, 0, known);
+            f16round(builder, x)
+        }
+        "random" => {
+            let func_ref = *funcs
+                .get("random")
+                .ok_or_else(|| Error::Unsupported("Math.random is not available".to_string()))?;
+            call_libm(builder, func_ref, &[])
+        }
+        "now" => {
+            let func_ref = *funcs
+                .get("now")
+                .ok_or_else(|| Error::Unsupported("Date.now is not available".to_string()))?;
+            let null = builder.ins().iconst(types::I64, 0);
+            let call = builder.ins().call(func_ref, &[null]);
+            let seconds = builder.inst_results(call)[0];
+            let millis = builder.ins().imul_imm(seconds, 1000);
+            builder.ins().fcvt_from_sint(types::F64, millis)
+        }
         "sign" => {
             let x = number_argument(builder, args, 0, known);
             sign(builder, x)

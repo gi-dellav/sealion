@@ -1082,3 +1082,455 @@ fn object_is() {
     assert_eq!(run("Object.is();"), 1);
     assert!(Engine::new().compile("Math.is(1, 1);").is_err());
 }
+
+#[test]
+fn math_hypot() {
+    assert_eq!(run("Math.hypot(3, 4);"), 5);
+    assert_eq!(run("Math.hypot();"), 0);
+    assert_eq!(run("Math.hypot(5);"), 5);
+    assert_eq!(run("Math.hypot(-3, -4);"), 5);
+    assert_eq!(run("Math.hypot(3, 4, 12);"), 13);
+    assert_eq!(run("Math.hypot(null, 3, 4);"), 5);
+    assert_eq!(run("Math.hypot(true, 0);"), 1);
+    assert_eq!(run("Math.hypot(3, 4) === Math.hypot(4, 3);"), 1);
+    assert_eq!(run("Number.isNaN(Math.hypot(NaN, 1));"), 1);
+    assert_eq!(run("Math.hypot(Infinity, NaN) === Infinity;"), 1);
+    assert_eq!(run("1 / Math.hypot(-0) === Infinity;"), 1);
+    assert_eq!(run("Math.hypot(1e308, 1e308) < Infinity;"), 1);
+}
+
+#[test]
+fn math_random_and_date_now() {
+    assert_eq!(run("var r = Math.random(); r >= 0 && r < 1;"), 1);
+    assert_eq!(run("var r = Math.random(); r !== 1;"), 1);
+    assert_eq!(run("Date.now() > 1000000000000;"), 1);
+    assert_eq!(run("Date.now() % 1 === 0;"), 1);
+}
+
+#[test]
+fn math_f16round() {
+    assert_eq!(run("Math.f16round(1.5) === 1.5;"), 1);
+    assert_eq!(run("Math.f16round(1.1) === 1.099609375;"), 1);
+    assert_eq!(run("Math.f16round(2 ** -14) === 2 ** -14;"), 1);
+    assert_eq!(run("Math.f16round(2 ** -25) === 0;"), 1);
+    assert_eq!(run("Math.f16round(3 * 2 ** -25) === 2 ** -23;"), 1);
+    assert_eq!(run("Math.f16round(1 + 2 ** -11) === 1;"), 1);
+    assert_eq!(run("Math.f16round(1 + 3 * 2 ** -11) === 1 + 2 ** -9;"), 1);
+    assert_eq!(run("Math.f16round(2049) === 2048;"), 1);
+    assert_eq!(run("Math.f16round(65504) === 65504;"), 1);
+    assert_eq!(run("Math.f16round(65519) === 65504;"), 1);
+    assert_eq!(run("Math.f16round(65520) === Infinity;"), 1);
+    assert_eq!(run("Math.f16round(-65520) === -Infinity;"), 1);
+    assert_eq!(run("Math.f16round(2 ** 20) === Infinity;"), 1);
+    assert_eq!(run("Math.f16round(-Infinity) === -Infinity;"), 1);
+    assert_eq!(run("Number.isNaN(Math.f16round(NaN));"), 1);
+    assert_eq!(run("Math.f16round(null) === 0;"), 1);
+    assert_eq!(run("Math.f16round(1e-8) === 0;"), 1);
+    assert_eq!(run("1 / Math.f16round(-0) === -Infinity;"), 1);
+}
+
+#[test]
+fn delete_expressions() {
+    assert_eq!(run("var x = 1; delete x;"), 0);
+    assert_eq!(run("var x = 1; delete (x);"), 0);
+    assert_eq!(run("var x = 1; delete x; x;"), 1);
+    assert_eq!(run("delete 1;"), 1);
+    assert_eq!(run("delete (1 + 2);"), 1);
+    assert_eq!(run("delete missing;"), 1);
+    assert_eq!(run("delete Math;"), 0);
+    assert_eq!(run("delete undefined;"), 0);
+    assert_eq!(run("delete null?.x;"), 1);
+    assert_eq!(
+        run("var x = 0; function f() { x = 5; return 1; } delete f(); x;"),
+        5
+    );
+    assert_eq!(run("var x = 0; delete (x = 3); x;"), 3);
+    assert!(Engine::new().compile("var o; delete o.x;").is_err());
+}
+
+#[test]
+fn optional_chaining() {
+    assert_eq!(run("var f; f?.();"), 0);
+    assert_eq!(run("var f; f?.(1);"), 0);
+    assert_eq!(run("var f; f?.() === undefined;"), 1);
+    assert_eq!(run("var f = function (x) { return x + 1; }; f?.(1);"), 2);
+    assert_eq!(
+        run("var f = function (a, b) { return a + b; }; f?.(2, 3);"),
+        5
+    );
+    assert_eq!(run("var f; var n = 0; f?.(n = 1); n;"), 0);
+    assert_eq!(run("var n = null; n?.x;"), 0);
+    assert_eq!(run("var n = null; n?.x === undefined;"), 1);
+    assert_eq!(run("var n = null; n?.x.y === undefined;"), 1);
+    assert_eq!(run("var n = null; n?.x();"), 0);
+    assert_eq!(run("var n = null; n?.x?.();"), 0);
+    assert_eq!(run("undefined?.[0] === undefined;"), 1);
+    assert_eq!(run("var a = null; a?.[0] === undefined;"), 1);
+    assert_eq!(run("var n = 0; var a = null; a?.[n = 1]; n;"), 0);
+    assert_eq!(run("var a = 0; a?.[0] === undefined;"), 1);
+    assert_eq!(run("Math?.PI === Math.PI;"), 1);
+    assert_eq!(run("Date?.now() > 1000000000000;"), 1);
+    assert_eq!(run("var f = null; f?.() ?? 7;"), 7);
+    assert_eq!(run("var f = function () { return 1; }; f?.() + 1;"), 2);
+    assert_eq!(run("(null)?.x === undefined;"), 1);
+}
+
+#[test]
+fn throw_catch_basics() {
+    assert_eq!(run("try { throw 42; } catch (e) { e; }"), 42);
+    assert_eq!(run("var x = 0; try { x = 1; } catch (e) { x = 2; } x;"), 1);
+    assert_eq!(run("try { throw 1; } catch (e) { e + 1; }"), 2);
+    assert_eq!(
+        run("try { throw true; } catch (e) { e === true ? 1 : 0; }"),
+        1
+    );
+    assert_eq!(
+        run("try { throw null; } catch (e) { e === null ? 1 : 0; }"),
+        1
+    );
+    assert_eq!(
+        run("try { throw undefined; } catch (e) { e === undefined ? 1 : 0; }"),
+        1
+    );
+    assert_eq!(
+        run("var f = function () {}; try { throw f; } catch (e) { e === f ? 1 : 0; }"),
+        1
+    );
+    assert_eq!(run("var x = 0; try { throw 1; } catch { x = 2; } x;"), 2);
+    assert_eq!(run("var e = 1; try { throw 2; } catch (e) { } e;"), 1);
+    assert_eq!(
+        run("var f; try { throw 7; } catch (e) { f = function () { return e; }; } f();"),
+        7
+    );
+    assert_eq!(
+        run("function f() { throw 7; } try { f(); } catch (e) { e; }"),
+        7
+    );
+    assert_eq!(
+        run("function f() { throw 7; } function g() { f(); } try { g(); } catch (e) { e; }"),
+        7
+    );
+    assert_eq!(run("try { } catch (e) { 5; } 3;"), 3);
+    assert_eq!(run("try { throw 1; } catch (e) { } 3;"), 3);
+    assert_eq!(
+        run("function f() { try { throw 1; } catch (e) { return e + 1; } } f();"),
+        2
+    );
+}
+
+#[test]
+fn uncaught_throw() {
+    assert_eq!(run("throw 1;"), 1);
+    assert_eq!(run("function f() { throw 1; } f();"), 1);
+    assert_eq!(run("var x = 0; try { throw 1; } finally { x = 2; }"), 1);
+}
+
+#[test]
+fn finally_semantics() {
+    assert_eq!(run("var x = 0; try { x = 1; } finally { x = 2; } x;"), 2);
+    assert_eq!(
+        run("var x = 0; try { throw 1; } catch (e) { x = 3; } finally { x = 4; } x;"),
+        4
+    );
+    assert_eq!(
+        run("var x = 0; try { try { throw 1; } finally { x = 1; } } catch (e) { x = x + e; } x;"),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; try { try { throw 1; } finally { x = 1; throw 5; } } catch (e) { x = x + e; } x;"
+        ),
+        6
+    );
+    assert_eq!(
+        run("var x = 0; function f() { try { return 1; } finally { x = 2; } } f(); x;"),
+        2
+    );
+    assert_eq!(
+        run("function f() { try { return 1; } finally { return 2; } } f();"),
+        2
+    );
+    assert_eq!(
+        run("var x = 0; function f() { try { return 1; } finally { return 2; } } x = f(); x;"),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { try { return 1; } finally { x = 2; } } finally { x = x + 3; } } f(); x;"
+        ),
+        5
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { throw 1; } finally { x = 2; } } try { f(); } catch (e) { x = x + e; } x;"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { throw 1; } function g() { try { f(); } finally { x = 2; } } try { g(); } catch (e) { x = x + e; } x;"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function a() { try { throw 1; } finally { x = x + 1; } } function b() { try { a(); } finally { x = x + 10; } } try { b(); } catch (e) { x = x + e; } x;"
+        ),
+        12
+    );
+    assert_eq!(
+        run("var x = 0; while (1) { try { break; } finally { x = 5; } } x;"),
+        5
+    );
+    assert_eq!(
+        run(
+            "var x = 0; for (var i = 0; i < 3; i++) { try { if (i === 1) continue; x = x + 1; } finally { x = x + 10; } } x;"
+        ),
+        32
+    );
+    assert_eq!(
+        run(
+            "var x = 0; outer: for (var i = 0; i < 3; i++) { try { if (i === 1) break outer; x = x + 1; } finally { x = x + 10; } } x;"
+        ),
+        21
+    );
+    assert_eq!(
+        run(
+            "var x = 0; for (var i = 0; i < 2; i++) { try { continue; } finally { x = x + 1; } } x;"
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; switch (1) { case 1: try { break; } finally { x = 3; } default: x = 9; } x;"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { return 1; } finally { x = 2; } } try { f(); } finally { x = x + 10; } x;"
+        ),
+        12
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { throw 1; } finally { x = 2; } } try { try { f(); } catch (e) { x = x + e; } } finally { x = x + 10; } x;"
+        ),
+        13
+    );
+    assert_eq!(
+        run("var f; try { } finally { let y = 3; f = function () { return y; }; } f();"),
+        3
+    );
+    assert_eq!(
+        run("function f() { try { throw 1; } finally { return 7; } } f();"),
+        7
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { return 1; } finally { throw 2; } } try { f(); } catch (e) { x = e; } x;"
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { throw 1; } catch (e) { return e + 1; } finally { x = 9; } } var y = f(); x;"
+        ),
+        9
+    );
+}
+
+#[test]
+fn math_hypot_edge_cases() {
+    assert_eq!(run("Math.hypot(0) === 0;"), 1);
+    assert_eq!(run("1 / Math.hypot(0) === Infinity;"), 1);
+    assert_eq!(run("Math.hypot(-Infinity) === Infinity;"), 1);
+    assert_eq!(run("Math.hypot(Infinity, 1) === Infinity;"), 1);
+    assert_eq!(run("Number.isNaN(Math.hypot(NaN, NaN));"), 1);
+    assert_eq!(run("Number.isNaN(Math.hypot(undefined));"), 1);
+    assert_eq!(run("Math.hypot(null, null) === 0;"), 1);
+    assert_eq!(run("Math.hypot(true, false) === 1;"), 1);
+    assert_eq!(run("Math.hypot(1e-320, 1e-320) > 0;"), 1);
+    assert_eq!(run("Math.hypot(-3, 4) === 5;"), 1);
+}
+
+#[test]
+fn math_random_and_date_now_more() {
+    assert_eq!(
+        run(
+            "var i = 0; var ok = 1; while (i < 8) { var r = Math.random(); if (!(r >= 0 && r < 1)) { ok = 0; } i = i + 1; } ok;"
+        ),
+        1
+    );
+    assert_eq!(run("Date.now() > 0;"), 1);
+    assert_eq!(run("Date.now() < 4102444800000;"), 1);
+}
+
+#[test]
+fn math_f16round_edge_cases() {
+    assert_eq!(run("Math.f16round(65519.999) === 65504;"), 1);
+    assert_eq!(run("Math.f16round(-65519) === -65504;"), 1);
+    assert_eq!(run("Math.f16round(65536) === Infinity;"), 1);
+    assert_eq!(run("Math.f16round(2 ** -24) === 2 ** -24;"), 1);
+    assert_eq!(run("Math.f16round(2 ** -25 + 2 ** -50) === 2 ** -24;"), 1);
+    assert_eq!(run("1 / Math.f16round(-(2 ** -25)) === -Infinity;"), 1);
+    assert_eq!(run("Math.f16round(1.0001) === 1;"), 1);
+    assert_eq!(run("Math.f16round(1.0006) === 1.0009765625;"), 1);
+    assert_eq!(run("Math.f16round(-1.1) === -1.099609375;"), 1);
+    assert_eq!(run("Math.f16round(true) === 1;"), 1);
+    assert_eq!(run("Math.f16round(null) === 0;"), 1);
+    assert_eq!(run("Number.isNaN(Math.f16round(undefined));"), 1);
+    assert_eq!(run("1 / Math.f16round(0) === Infinity;"), 1);
+}
+
+#[test]
+fn delete_more() {
+    assert_eq!(run("function f(x) { return delete x; } f(1);"), 0);
+    assert_eq!(run("function f() { } delete f;"), 0);
+    assert_eq!(run("delete Number;"), 0);
+    assert_eq!(run("delete NaN;"), 0);
+    assert_eq!(run("delete Infinity;"), 0);
+    assert_eq!(run("delete isNaN;"), 0);
+    assert_eq!(run("delete Boolean;"), 0);
+    assert_eq!(run("delete (void 0);"), 1);
+    assert_eq!(run("delete (function () { });"), 1);
+    assert_eq!(run("delete (((missing)));"), 1);
+    assert_eq!(run("let x; delete x;"), 0);
+    assert_eq!(run("var x = 0; var y = (x = 4); delete y; x;"), 4);
+}
+
+#[test]
+fn optional_chaining_more() {
+    assert_eq!(run("var f = function (x = 5) { return x; }; f?.();"), 5);
+    assert_eq!(
+        run("var f = function () { return function () { return 3; }; }; f?.()?.();"),
+        3
+    );
+    assert_eq!(run("var n = null; n?.a.b.c === undefined;"), 1);
+    assert_eq!(run("var a = null; a?.[0][1] === undefined;"), 1);
+    assert_eq!(
+        run("var x = 0; var f; function g() { x = 1; } f?.(g()); x;"),
+        0
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function g() { x = 1; return 1; } var f = function (a) { return a; }; f?.(g()); x;"
+        ),
+        1
+    );
+    assert_eq!(run("var f = null; f?.() || 5;"), 5);
+    assert_eq!(run("Number?.MAX_VALUE === Number.MAX_VALUE;"), 1);
+    assert_eq!(run("Object?.is(1, 1);"), 1);
+    assert_eq!(run("Math?.sqrt(9);"), 3);
+    assert_eq!(run("Math?.sqrt?.(9);"), 3);
+    assert_eq!(run("(5)?.foo === undefined;"), 1);
+    assert_eq!(run("delete null?.[0];"), 1);
+    assert_eq!(
+        run("var x = 0; var f; try { f?.((function () { throw 1; })()); } catch (e) { x = 1; } x;"),
+        0
+    );
+    assert_eq!(
+        run(
+            "var x = 0; var f = function () { }; try { f?.((function () { throw 1; })()); } catch (e) { x = 1; } x;"
+        ),
+        1
+    );
+    assert_eq!(run("var f = function (a) { return a; }; f?.(1) ?? 9;"), 1);
+}
+
+#[test]
+fn try_catch_finally_more() {
+    assert_eq!(
+        run(
+            "var x = 0; for (var i = 0; i < 2; i++) { try { throw 1; } catch (e) { continue; } finally { x = x + 1; } } x;"
+        ),
+        2
+    );
+    assert_eq!(
+        run("var x = 0; while (1) { try { throw 1; } catch (e) { break; } finally { x = 5; } } x;"),
+        5
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { throw 1; } function g() { throw 2; } try { try { f(); } finally { g(); } } catch (e) { x = e; } x;"
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function h() { throw 9; } try { throw 1; } catch (e) { try { h(); } catch (inner) { x = inner; } } x;"
+        ),
+        9
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function h() { throw 9; } try { try { throw 1; } finally { try { h(); } catch (e) { x = e; } } } catch (e) { x = x + e; } x;"
+        ),
+        10
+    );
+    assert_eq!(
+        run(
+            "function boom() { throw 4; } function f(a = boom()) { return a; } try { f(); } catch (e) { e; }"
+        ),
+        4
+    );
+    assert_eq!(
+        run("var f = () => { throw 3; }; try { f(); } catch (e) { e; }"),
+        3
+    );
+    assert_eq!(
+        run(
+            "function make() { return function () { throw 5; }; } try { make()(); } catch (e) { e; }"
+        ),
+        5
+    );
+    assert_eq!(
+        run("function f() { let x = 1; try { return x; } finally { x = 2; } } f();"),
+        1
+    );
+    assert_eq!(
+        run("var x = 0; try { var y = 3; } catch (e) { } x = y; x;"),
+        3
+    );
+    assert_eq!(run("try { throw 1; } catch (e) { e = 2; }"), 2);
+    assert_eq!(
+        run("var x = 0; try { } finally { x = 1; } try { throw 1; } catch (e) { x = x + e; } x;"),
+        2
+    );
+    assert_eq!(
+        run("try { throw 1; } catch (e) { try { throw e + 1; } catch (inner) { inner; } }"),
+        2
+    );
+    assert_eq!(
+        run(
+            "var x = 0; label: for (var i = 0; i < 2; i++) { try { try { continue label; } finally { x = x + 1; } } finally { x = x + 10; } } x;"
+        ),
+        22
+    );
+    assert_eq!(
+        run(
+            "var x = 0; function f() { try { return 1; } finally { try { throw 2; } catch (e) { x = e; } } } var y = f(); x;"
+        ),
+        2
+    );
+    assert_eq!(
+        run("var x = 0; try { throw 1; } catch (e) { x = e; throw e + 1; }"),
+        1
+    );
+}
+
+#[test]
+fn numeric_analysis_with_new_constructs() {
+    assert_eq!(
+        run("let x = 1; try { throw 1; } catch (e) { x = null; } x + 1;"),
+        1
+    );
+    assert_eq!(run("let x = 1; try { } finally { x = null; } x + 1;"), 1);
+    assert_eq!(
+        run("let x = 1; var f = function (a) { }; f?.(x = null); x + 1;"),
+        1
+    );
+    assert_eq!(run("let x = 1; var f; f?.(x = null); x + 1;"), 2);
+    assert_eq!(run("let x = 1; try { } finally { x = true; } x + 1;"), 2);
+    assert_eq!(run("let x = 1; try { } finally { x = false; } x + 1;"), 1);
+}

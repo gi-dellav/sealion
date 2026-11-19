@@ -5,15 +5,15 @@ use cranelift_codegen::ir::{
     UserFuncName, Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{FuncId, Module};
+use cranelift_module::{DataId, FuncId, Module};
 use cranelift_object::ObjectModule;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression,
-    BinaryOperator, BindingPattern, BlockStatement, CallExpression, ConditionalExpression,
-    DoWhileStatement, Expression, ForStatement, ForStatementInit, IfStatement, LabeledStatement,
-    LogicalOperator, SimpleAssignmentTarget, Statement, StaticMemberExpression, SwitchStatement,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarationKind, WhileStatement,
+    BinaryOperator, BindingPattern, BlockStatement, CallExpression, ChainElement, ChainExpression,
+    ConditionalExpression, DoWhileStatement, Expression, ForStatement, ForStatementInit,
+    IfStatement, LabeledStatement, LogicalOperator, SimpleAssignmentTarget, Statement,
+    StaticMemberExpression, SwitchStatement, TryStatement, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind, WhileStatement,
 };
 
 use crate::{
@@ -51,6 +51,19 @@ pub fn make_f64_unary_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
+pub fn make_nullary_f64_signature<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
+pub fn make_i64_unary_signature<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
 pub fn make_f64_binary_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::F64));
@@ -72,6 +85,7 @@ pub struct Imports {
     pub calloc: FuncId,
     pub pow: FuncId,
     pub fmod: FuncId,
+    pub exception: DataId,
 }
 
 pub fn compile_functions<'a>(
@@ -92,6 +106,7 @@ pub fn compile_functions<'a>(
         let calloc_ref = module.declare_func_in_func(imports.calloc, &mut func);
         let pow_ref = module.declare_func_in_func(imports.pow, &mut func);
         let fmod_ref = module.declare_func_in_func(imports.fmod, &mut func);
+        let exception_global = module.declare_data_in_func(imports.exception, &mut func);
         let builtin_refs = builtins.declare_in(module, &mut func);
         let mut child_refs = HashMap::new();
         for &child in plan.children.iter().chain(plan.nested.values()) {
@@ -110,6 +125,7 @@ pub fn compile_functions<'a>(
         let env_param = builder.block_params(entry)[0];
         let args_param = builder.block_params(entry)[1];
         let self_param = builder.block_params(entry)[2];
+        let exception = builder.ins().global_value(types::I64, exception_global);
         let root_scope = program.scope(plan.root_scope);
         let vars = declare_vars(&mut builder, program, plan.id);
         let env = if root_scope.has_env() {
@@ -135,8 +151,10 @@ pub fn compile_functions<'a>(
             builtin_refs: &builtin_refs,
             vars: &vars,
             numeric: &numeric,
+            exception,
         };
 
+        let mut flow = Flow::new();
         if let Some(self_name) = plan.self_binding {
             store_var(&mut builder, &ctx, self_name, self_param)?;
         }
@@ -155,7 +173,7 @@ pub fn compile_functions<'a>(
                         .load(types::F64, MemFlags::new(), args_param, (8 + 8 * i) as i32);
                 let arg = builder.ins().select(present, loaded, undef);
                 let value = match &param.init {
-                    Some(init) => compile_default(&mut builder, &ctx, arg, init)?,
+                    Some(init) => compile_default(&mut builder, &ctx, &mut flow, arg, init)?,
                     None => arg,
                 };
                 store_var(&mut builder, &ctx, param.name, value)?;
@@ -172,8 +190,7 @@ pub fn compile_functions<'a>(
             store_var(&mut builder, &ctx, name, closure)?;
         }
 
-        let mut loops = Vec::new();
-        let out = compile_statements(&mut builder, &ctx, plan.body, &mut loops)?;
+        let out = compile_statements(&mut builder, &ctx, plan.body, &mut flow)?;
         if !out.terminated {
             let ret = match out.last {
                 Some(value) => value,
@@ -203,9 +220,11 @@ pub fn compile_main(
     script_id: FuncId,
     main_id: FuncId,
     main_sig: &Signature,
+    exception_id: DataId,
 ) -> Result<IrFunction, Error> {
     let mut func = Function::with_name_signature(UserFuncName::testcase("main"), main_sig.clone());
     let script_ref = module.declare_func_in_func(script_id, &mut func);
+    let exception_global = module.declare_data_in_func(exception_id, &mut func);
 
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
@@ -214,10 +233,26 @@ pub fn compile_main(
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
 
+    let exception = builder.ins().global_value(types::I64, exception_global);
     let zero = builder.ins().iconst(types::I64, 0);
     let self_value = value::undefined(&mut builder);
     let call = builder.ins().call(script_ref, &[zero, zero, self_value]);
     let result = builder.inst_results(call)[0];
+
+    let pending = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), exception, 0i32);
+    let pending = builder.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+    let failed = builder.create_block();
+    let ok = builder.create_block();
+    builder.ins().brif(pending, failed, &[], ok, &[]);
+
+    builder.switch_to_block(failed);
+    builder.ins().store(MemFlags::new(), zero, exception, 0i32);
+    let failure = builder.ins().iconst(types::I32, 1);
+    builder.ins().return_(&[failure]);
+
+    builder.switch_to_block(ok);
     let result = value::to_number(&mut builder, result);
     let code = builder.ins().fcvt_to_sint_sat(types::I32, result);
     builder.ins().return_(&[code]);
@@ -492,6 +527,45 @@ impl<'a> NumericWalker<'a> {
             Statement::LabeledStatement(labelled) => {
                 self.statement(plan_id, scope, &labelled.body);
             }
+            Statement::ThrowStatement(throw) => {
+                self.expr(scope, &throw.argument);
+            }
+            Statement::TryStatement(try_stmt) => {
+                let inner = self.node_scope(plan_id, scope, node_key(&*try_stmt.block));
+                self.statements(plan_id, inner, try_stmt.block.body.as_slice());
+                if let Some(handler) = &try_stmt.handler {
+                    let catch_scope = self.node_scope(plan_id, scope, node_key(&**handler));
+                    self.statements(plan_id, catch_scope, handler.body.body.as_slice());
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    let finalizer_scope = self.node_scope(plan_id, scope, node_key(&**finalizer));
+                    self.statements(plan_id, finalizer_scope, finalizer.body.as_slice());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn chain_element(&mut self, scope: ScopeId, element: &ChainElement<'a>) {
+        match element {
+            ChainElement::CallExpression(call) => {
+                self.expr(scope, &call.callee);
+                for arg in &call.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.expr(scope, expr);
+                    }
+                }
+            }
+            ChainElement::ComputedMemberExpression(member) => {
+                self.expr(scope, &member.object);
+                self.expr(scope, &member.expression);
+            }
+            ChainElement::StaticMemberExpression(member) => {
+                self.expr(scope, &member.object);
+            }
+            ChainElement::PrivateFieldExpression(member) => {
+                self.expr(scope, &member.object);
+            }
             _ => {}
         }
     }
@@ -544,6 +618,9 @@ impl<'a> NumericWalker<'a> {
                         self.expr(scope, expr);
                     }
                 }
+            }
+            Expression::ChainExpression(chain) => {
+                self.chain_element(scope, &chain.expression);
             }
             Expression::StaticMemberExpression(simple) => {
                 self.expr(scope, &simple.object);
@@ -620,6 +697,7 @@ struct CodegenCtx<'a> {
     builtin_refs: &'a HashMap<&'static str, FuncRef>,
     vars: &'a HashMap<(ScopeId, usize), Variable>,
     numeric: &'a HashSet<(ScopeId, usize)>,
+    exception: Value,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -639,6 +717,7 @@ impl<'a> CodegenCtx<'a> {
             builtin_refs: self.builtin_refs,
             vars: self.vars,
             numeric: self.numeric,
+            exception: self.exception,
         }
     }
 }
@@ -732,6 +811,7 @@ fn init_local_slots(
 fn compile_default<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     arg: Value,
     init: &'a Expression<'a>,
 ) -> Result<Value, Error> {
@@ -746,7 +826,7 @@ fn compile_default<'a>(
         .brif(missing, init_block, &[], join_block, &[]);
 
     builder.switch_to_block(init_block);
-    let default = compile_expr(builder, ctx, init)?;
+    let default = compile_expr(builder, ctx, flow, init)?;
     builder.def_var(result_var, default);
     builder.ins().jump(join_block, &[]);
 
@@ -804,40 +884,73 @@ fn compile_block<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     block: &'a BlockStatement<'a>,
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let scope = node_scope(ctx, node_key(block))?;
     let inner = enter_scope(builder, ctx, scope);
-    compile_statements(builder, &inner, block.body.as_slice(), loops)
+    compile_statements(builder, &inner, block.body.as_slice(), flow)
 }
 
+#[derive(Clone)]
 struct LoopTarget<'a> {
     labels: Vec<&'a str>,
     break_block: Block,
     continue_block: Option<Block>,
     /// `break;` without a label may target this entry (loops and `switch`).
     breakable: bool,
+    cleanup_depth: usize,
 }
 
-fn break_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<Block, Error> {
+#[derive(Clone, Copy)]
+struct ExceptionTarget {
+    block: Block,
+    cleanup_depth: usize,
+}
+
+#[derive(Clone)]
+struct Cleanup<'a> {
+    finalizer: &'a BlockStatement<'a>,
+    loop_depth: usize,
+    scope: ScopeId,
+    env: Value,
+    exception: Option<ExceptionTarget>,
+}
+
+struct Flow<'a> {
+    loops: Vec<LoopTarget<'a>>,
+    cleanups: Vec<Cleanup<'a>>,
+    exception: Option<ExceptionTarget>,
+}
+
+impl<'a> Flow<'a> {
+    fn new() -> Self {
+        Self {
+            loops: Vec::new(),
+            cleanups: Vec::new(),
+            exception: None,
+        }
+    }
+}
+
+fn break_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<(Block, usize), Error> {
     if let Some(label) = label {
         loops
             .iter()
             .rev()
             .find(|target| target.labels.contains(&label))
-            .map(|target| target.break_block)
+            .map(|target| (target.break_block, target.cleanup_depth))
             .ok_or_else(|| Error::Scope(format!("unknown break label: {label}")))
     } else {
         loops
             .iter()
             .rev()
             .find(|target| target.breakable)
-            .map(|target| target.break_block)
+            .map(|target| (target.break_block, target.cleanup_depth))
             .ok_or_else(|| Error::Scope("break statement outside of a loop".to_string()))
     }
 }
 
-fn continue_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<Block, Error> {
+fn continue_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<(Block, usize), Error> {
     if let Some(label) = label {
         let target = loops
             .iter()
@@ -846,12 +959,17 @@ fn continue_target(loops: &[LoopTarget<'_>], label: Option<&str>) -> Result<Bloc
             .ok_or_else(|| Error::Scope(format!("unknown continue label: {label}")))?;
         target
             .continue_block
+            .map(|block| (block, target.cleanup_depth))
             .ok_or_else(|| Error::Scope("continue label does not target a loop".to_string()))
     } else {
         loops
             .iter()
             .rev()
-            .find_map(|target| target.continue_block)
+            .find_map(|target| {
+                target
+                    .continue_block
+                    .map(|block| (block, target.cleanup_depth))
+            })
             .ok_or_else(|| Error::Scope("continue statement outside of a loop".to_string()))
     }
 }
@@ -958,15 +1076,140 @@ fn store_var(
     Ok(())
 }
 
+fn has_exception(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>) -> Value {
+    let pending = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), ctx.exception, 0i32);
+    builder.ins().icmp_imm(IntCC::NotEqual, pending, 0)
+}
+
+fn take_exception(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>) -> Value {
+    let value = builder
+        .ins()
+        .load(types::F64, MemFlags::new(), ctx.exception, 8i32);
+    let clear = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .store(MemFlags::new(), clear, ctx.exception, 0i32);
+    value
+}
+
+fn set_exception(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, value: Value) {
+    let set = builder.ins().iconst(types::I64, 1);
+    builder
+        .ins()
+        .store(MemFlags::new(), set, ctx.exception, 0i32);
+    builder
+        .ins()
+        .store(MemFlags::new(), value, ctx.exception, 8i32);
+}
+
+/// Emits every finalizer between `from_depth` and `target_depth`, then jumps to
+/// `continuation`. Returns false when a finalizer completes abruptly and
+/// therefore overrides the original completion.
+fn emit_unwind<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &Flow<'a>,
+    from_depth: usize,
+    target_depth: usize,
+    continuation: Block,
+    pending: bool,
+) -> Result<bool, Error> {
+    if from_depth <= target_depth {
+        builder.ins().jump(continuation, &[]);
+        return Ok(true);
+    }
+
+    let index = from_depth - 1;
+    let cleanup = flow.cleanups[index].clone();
+    let saved = if pending {
+        Some(take_exception(builder, ctx))
+    } else {
+        None
+    };
+    let mut inner = Flow {
+        loops: flow.loops[..cleanup.loop_depth].to_vec(),
+        cleanups: flow.cleanups[..index].to_vec(),
+        exception: cleanup.exception,
+    };
+    let finalizer_ctx = ctx.enter(cleanup.scope, cleanup.env);
+    let after = builder.create_block();
+    let out = compile_block(builder, &finalizer_ctx, cleanup.finalizer, &mut inner)?;
+    if out.terminated {
+        return Ok(false);
+    }
+    builder.ins().jump(after, &[]);
+    builder.switch_to_block(after);
+    if let Some(saved) = saved {
+        set_exception(builder, ctx, saved);
+    }
+    emit_unwind(
+        builder,
+        ctx,
+        flow,
+        index,
+        target_depth,
+        continuation,
+        pending,
+    )
+}
+
+fn emit_pending_exception<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &Flow<'a>,
+) -> Result<(), Error> {
+    let depth = flow.cleanups.len();
+    match flow.exception {
+        Some(target) => {
+            emit_unwind(
+                builder,
+                ctx,
+                flow,
+                depth,
+                target.cleanup_depth,
+                target.block,
+                true,
+            )?;
+        }
+        None => {
+            let exit = builder.create_block();
+            let reached = emit_unwind(builder, ctx, flow, depth, 0, exit, true)?;
+            if reached {
+                builder.switch_to_block(exit);
+                let value = value::undefined(builder);
+                builder.ins().return_(&[value]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_exception_check<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &Flow<'a>,
+) -> Result<(), Error> {
+    let pending = has_exception(builder, ctx);
+    let handler = builder.create_block();
+    let ok = builder.create_block();
+    builder.ins().brif(pending, handler, &[], ok, &[]);
+    builder.switch_to_block(handler);
+    emit_pending_exception(builder, ctx, flow)?;
+    builder.switch_to_block(ok);
+    Ok(())
+}
+
 fn compile_statements<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     list: &'a [Statement<'a>],
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let mut last = None;
     for stmt in list {
-        let out = compile_statement(builder, ctx, stmt, loops)?;
+        let out = compile_statement(builder, ctx, stmt, flow)?;
         if out.last.is_some() {
             last = out.last;
         }
@@ -987,6 +1230,7 @@ fn compile_var_list<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     decl: &'a VariableDeclaration<'a>,
+    flow: &mut Flow<'a>,
 ) -> Result<(), Error> {
     let lexical = decl.kind != VariableDeclarationKind::Var;
     for var in &decl.declarations {
@@ -997,7 +1241,7 @@ fn compile_var_list<'a>(
         };
         let name = id.name.as_str();
         if let Some(init) = &var.init {
-            let value = compile_expr(builder, ctx, init)?;
+            let value = compile_expr(builder, ctx, flow, init)?;
             store_var(builder, ctx, name, value)?;
         } else if lexical {
             let value = value::undefined(builder);
@@ -1011,40 +1255,46 @@ fn compile_statement<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     stmt: &'a Statement<'a>,
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     match stmt {
-        Statement::BlockStatement(block) => compile_block(builder, ctx, block, loops),
+        Statement::BlockStatement(block) => compile_block(builder, ctx, block, flow),
         Statement::VariableDeclaration(decl) => {
-            compile_var_list(builder, ctx, decl)?;
+            compile_var_list(builder, ctx, decl, flow)?;
             Ok(StmtOutcome::default())
         }
         Statement::FunctionDeclaration(_)
         | Statement::EmptyStatement(_)
         | Statement::DebuggerStatement(_) => Ok(StmtOutcome::default()),
         Statement::ExpressionStatement(expr) => {
-            let value = compile_expr(builder, ctx, &expr.expression)?;
+            let value = compile_expr(builder, ctx, flow, &expr.expression)?;
             Ok(StmtOutcome {
                 last: Some(value),
                 terminated: false,
             })
         }
-        Statement::IfStatement(if_stmt) => compile_if(builder, ctx, if_stmt, loops),
-        Statement::WhileStatement(while_stmt) => {
-            compile_while(builder, ctx, while_stmt, &[], loops)
-        }
+        Statement::IfStatement(if_stmt) => compile_if(builder, ctx, if_stmt, flow),
+        Statement::WhileStatement(while_stmt) => compile_while(builder, ctx, while_stmt, &[], flow),
         Statement::DoWhileStatement(do_while) => {
-            compile_do_while(builder, ctx, do_while, &[], loops)
+            compile_do_while(builder, ctx, do_while, &[], flow)
         }
-        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &[], loops),
+        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &[], flow),
         Statement::SwitchStatement(switch_stmt) => {
-            compile_switch(builder, ctx, switch_stmt, &[], loops)
+            compile_switch(builder, ctx, switch_stmt, &[], flow)
         }
-        Statement::LabeledStatement(labelled) => compile_labelled(builder, ctx, labelled, loops),
+        Statement::LabeledStatement(labelled) => compile_labelled(builder, ctx, labelled, flow),
         Statement::BreakStatement(break_stmt) => {
             let label = break_stmt.label.as_ref().map(|label| label.name.as_str());
-            let target = break_target(loops, label)?;
-            builder.ins().jump(target, &[]);
+            let (target, depth) = break_target(&flow.loops, label)?;
+            emit_unwind(
+                builder,
+                ctx,
+                flow,
+                flow.cleanups.len(),
+                depth,
+                target,
+                false,
+            )?;
             Ok(StmtOutcome {
                 last: None,
                 terminated: true,
@@ -1055,8 +1305,16 @@ fn compile_statement<'a>(
                 .label
                 .as_ref()
                 .map(|label| label.name.as_str());
-            let target = continue_target(loops, label)?;
-            builder.ins().jump(target, &[]);
+            let (target, depth) = continue_target(&flow.loops, label)?;
+            emit_unwind(
+                builder,
+                ctx,
+                flow,
+                flow.cleanups.len(),
+                depth,
+                target,
+                false,
+            )?;
             Ok(StmtOutcome {
                 last: None,
                 terminated: true,
@@ -1064,16 +1322,31 @@ fn compile_statement<'a>(
         }
         Statement::ReturnStatement(ret) => {
             let value = if let Some(target) = &ret.argument {
-                compile_expr(builder, ctx, target)?
+                compile_expr(builder, ctx, flow, target)?
             } else {
                 value::undefined(builder)
             };
-            builder.ins().return_(&[value]);
+            let exit = builder.create_block();
+            let reached = emit_unwind(builder, ctx, flow, flow.cleanups.len(), 0, exit, false)?;
+            if reached {
+                builder.switch_to_block(exit);
+                builder.ins().return_(&[value]);
+            }
             Ok(StmtOutcome {
                 last: None,
                 terminated: true,
             })
         }
+        Statement::ThrowStatement(throw) => {
+            let value = compile_expr(builder, ctx, flow, &throw.argument)?;
+            set_exception(builder, ctx, value);
+            emit_pending_exception(builder, ctx, flow)?;
+            Ok(StmtOutcome {
+                last: None,
+                terminated: true,
+            })
+        }
+        Statement::TryStatement(try_stmt) => compile_try(builder, ctx, try_stmt, flow),
         other => Err(Error::Unsupported(format!(
             "statement not supported: {other:?}"
         ))),
@@ -1083,20 +1356,21 @@ fn compile_statement<'a>(
 fn compile_condition<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     expr: &'a Expression<'a>,
 ) -> Result<Value, Error> {
     match expr {
         Expression::ParenthesizedExpression(paren) => {
-            compile_condition(builder, ctx, &paren.expression)
+            compile_condition(builder, ctx, flow, &paren.expression)
         }
         Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
-            let cond = compile_condition(builder, ctx, &unary.argument)?;
+            let cond = compile_condition(builder, ctx, flow, &unary.argument)?;
             Ok(builder.ins().icmp_imm(IntCC::Equal, cond, 0))
         }
         Expression::BinaryExpression(binary) if binary.operator.is_compare() => {
             let op = binary.operator;
-            let lhs = compile_expr(builder, ctx, &binary.left)?;
-            let rhs = compile_expr(builder, ctx, &binary.right)?;
+            let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
+            let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
             let lhs = number_value(builder, lhs, expr_is_number(ctx, &binary.left));
             let rhs = number_value(builder, rhs, expr_is_number(ctx, &binary.right));
             let cc = match op {
@@ -1109,7 +1383,7 @@ fn compile_condition<'a>(
             Ok(builder.ins().fcmp(cc, lhs, rhs))
         }
         _ => {
-            let value = compile_expr(builder, ctx, expr)?;
+            let value = compile_expr(builder, ctx, flow, expr)?;
             Ok(value::truthy(builder, value))
         }
     }
@@ -1119,9 +1393,9 @@ fn compile_if<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     if_stmt: &'a IfStatement<'a>,
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
-    let cond = compile_condition(builder, ctx, &if_stmt.test)?;
+    let cond = compile_condition(builder, ctx, flow, &if_stmt.test)?;
 
     let then_block = builder.create_block();
     let else_block = builder.create_block();
@@ -1129,14 +1403,14 @@ fn compile_if<'a>(
     builder.ins().brif(cond, then_block, &[], else_block, &[]);
 
     builder.switch_to_block(then_block);
-    let then_out = compile_statement(builder, ctx, &if_stmt.consequent, loops)?;
+    let then_out = compile_statement(builder, ctx, &if_stmt.consequent, flow)?;
     if !then_out.terminated {
         builder.ins().jump(join_block, &[]);
     }
 
     builder.switch_to_block(else_block);
     let else_out = if let Some(else_node) = &if_stmt.alternate {
-        compile_statement(builder, ctx, else_node, loops)?
+        compile_statement(builder, ctx, else_node, flow)?
     } else {
         StmtOutcome::default()
     };
@@ -1160,7 +1434,7 @@ fn compile_while<'a>(
     ctx: &CodegenCtx<'a>,
     while_stmt: &'a WhileStatement<'a>,
     labels: &[&'a str],
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let header = builder.create_block();
     let body = builder.create_block();
@@ -1169,18 +1443,19 @@ fn compile_while<'a>(
     builder.ins().jump(header, &[]);
     builder.switch_to_block(header);
 
-    let cond = compile_condition(builder, ctx, &while_stmt.test)?;
+    let cond = compile_condition(builder, ctx, flow, &while_stmt.test)?;
     builder.ins().brif(cond, body, &[], exit, &[]);
 
     builder.switch_to_block(body);
-    loops.push(LoopTarget {
+    flow.loops.push(LoopTarget {
         labels: labels.to_vec(),
         break_block: exit,
         continue_block: Some(header),
         breakable: true,
+        cleanup_depth: flow.cleanups.len(),
     });
-    let body_out = compile_statement(builder, ctx, &while_stmt.body, loops)?;
-    loops.pop();
+    let body_out = compile_statement(builder, ctx, &while_stmt.body, flow)?;
+    flow.loops.pop();
     if !body_out.terminated {
         builder.ins().jump(header, &[]);
     }
@@ -1194,7 +1469,7 @@ fn compile_do_while<'a>(
     ctx: &CodegenCtx<'a>,
     do_while: &'a DoWhileStatement<'a>,
     labels: &[&'a str],
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let body_block = builder.create_block();
     let condition_block = builder.create_block();
@@ -1202,20 +1477,21 @@ fn compile_do_while<'a>(
 
     builder.ins().jump(body_block, &[]);
     builder.switch_to_block(body_block);
-    loops.push(LoopTarget {
+    flow.loops.push(LoopTarget {
         labels: labels.to_vec(),
         break_block: exit,
         continue_block: Some(condition_block),
         breakable: true,
+        cleanup_depth: flow.cleanups.len(),
     });
-    let body_out = compile_statement(builder, ctx, &do_while.body, loops)?;
-    loops.pop();
+    let body_out = compile_statement(builder, ctx, &do_while.body, flow)?;
+    flow.loops.pop();
     if !body_out.terminated {
         builder.ins().jump(condition_block, &[]);
     }
 
     builder.switch_to_block(condition_block);
-    let cond = compile_condition(builder, ctx, &do_while.test)?;
+    let cond = compile_condition(builder, ctx, flow, &do_while.test)?;
     builder.ins().brif(cond, body_block, &[], exit, &[]);
 
     builder.switch_to_block(exit);
@@ -1228,7 +1504,7 @@ fn compile_labelled<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     labelled: &'a LabeledStatement<'a>,
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let mut labels = vec![labelled.label.name.as_str()];
     let mut stmt = &labelled.body;
@@ -1245,25 +1521,26 @@ fn compile_labelled<'a>(
 
     match stmt {
         Statement::WhileStatement(while_stmt) => {
-            compile_while(builder, ctx, while_stmt, &labels, loops)
+            compile_while(builder, ctx, while_stmt, &labels, flow)
         }
         Statement::DoWhileStatement(do_while) => {
-            compile_do_while(builder, ctx, do_while, &labels, loops)
+            compile_do_while(builder, ctx, do_while, &labels, flow)
         }
-        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &labels, loops),
+        Statement::ForStatement(for_stmt) => compile_for(builder, ctx, for_stmt, &labels, flow),
         Statement::SwitchStatement(switch_stmt) => {
-            compile_switch(builder, ctx, switch_stmt, &labels, loops)
+            compile_switch(builder, ctx, switch_stmt, &labels, flow)
         }
         stmt => {
             let join = builder.create_block();
-            loops.push(LoopTarget {
+            flow.loops.push(LoopTarget {
                 labels,
                 break_block: join,
                 continue_block: None,
                 breakable: false,
+                cleanup_depth: flow.cleanups.len(),
             });
-            let out = compile_statement(builder, ctx, stmt, loops)?;
-            loops.pop();
+            let out = compile_statement(builder, ctx, stmt, flow)?;
+            flow.loops.pop();
             if !out.terminated {
                 builder.ins().jump(join, &[]);
             }
@@ -1280,7 +1557,7 @@ fn compile_for<'a>(
     ctx: &CodegenCtx<'a>,
     for_stmt: &'a ForStatement<'a>,
     labels: &[&'a str],
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let parent_env = ctx.env;
     let mut ctx = *ctx;
@@ -1303,13 +1580,13 @@ fn compile_for<'a>(
 
     match &for_stmt.init {
         Some(ForStatementInit::VariableDeclaration(decl)) => {
-            compile_var_list(builder, &ctx, decl)?;
+            compile_var_list(builder, &ctx, decl, flow)?;
         }
         Some(init) => {
             let expr = init.as_expression().ok_or_else(|| {
                 Error::Unsupported("for-loop initializer is not supported".to_string())
             })?;
-            compile_expr(builder, &ctx, expr)?;
+            compile_expr(builder, &ctx, flow, expr)?;
         }
         None => {}
     }
@@ -1334,7 +1611,7 @@ fn compile_for<'a>(
     };
     match &for_stmt.test {
         Some(condition) => {
-            let cond = compile_condition(builder, &header_ctx, condition)?;
+            let cond = compile_condition(builder, &header_ctx, flow, condition)?;
             builder.ins().brif(cond, body_block, &[], exit, &[]);
         }
         None => {
@@ -1348,14 +1625,15 @@ fn compile_for<'a>(
     } else {
         ctx
     };
-    loops.push(LoopTarget {
+    flow.loops.push(LoopTarget {
         labels: labels.to_vec(),
         break_block: exit,
         continue_block: Some(step),
         breakable: true,
+        cleanup_depth: flow.cleanups.len(),
     });
-    let body_out = compile_statement(builder, &body_ctx, &for_stmt.body, loops)?;
-    loops.pop();
+    let body_out = compile_statement(builder, &body_ctx, &for_stmt.body, flow)?;
+    flow.loops.pop();
     if !body_out.terminated {
         builder.ins().jump(step, &[]);
     }
@@ -1370,7 +1648,7 @@ fn compile_for<'a>(
         ctx
     };
     if let Some(update) = &for_stmt.update {
-        compile_expr(builder, &step_ctx, update)?;
+        compile_expr(builder, &step_ctx, flow, update)?;
     }
     builder.ins().jump(header, &[]);
 
@@ -1384,9 +1662,9 @@ fn compile_switch<'a>(
     ctx: &CodegenCtx<'a>,
     switch_stmt: &'a SwitchStatement<'a>,
     labels: &[&'a str],
-    loops: &mut Vec<LoopTarget<'a>>,
+    flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
-    let value = compile_expr(builder, ctx, &switch_stmt.discriminant)?;
+    let value = compile_expr(builder, ctx, flow, &switch_stmt.discriminant)?;
     let scope = node_scope(ctx, node_key(switch_stmt))?;
     let inner = enter_scope(builder, ctx, scope);
 
@@ -1412,7 +1690,7 @@ fn compile_switch<'a>(
     }
     for (n, (i, condition)) in tests.iter().enumerate() {
         let is_last = n + 1 == tests.len();
-        let matched_value = compile_expr(builder, &inner, condition)?;
+        let matched_value = compile_expr(builder, &inner, flow, condition)?;
         let target = builder.use_var(value_var);
         let equal = value::strict_equal(builder, target, matched_value);
         let cond = value::truthy(builder, equal);
@@ -1427,29 +1705,137 @@ fn compile_switch<'a>(
         }
     }
 
-    loops.push(LoopTarget {
+    flow.loops.push(LoopTarget {
         labels: labels.to_vec(),
         break_block: exit,
         continue_block: None,
         breakable: true,
+        cleanup_depth: flow.cleanups.len(),
     });
     for (i, case) in cases.iter().enumerate() {
         builder.switch_to_block(case_blocks[i]);
-        let out = compile_statements(builder, &inner, case.consequent.as_slice(), loops)?;
+        let out = compile_statements(builder, &inner, case.consequent.as_slice(), flow)?;
         if !out.terminated {
             let next = case_blocks.get(i + 1).copied().unwrap_or(exit);
             builder.ins().jump(next, &[]);
         }
     }
-    loops.pop();
+    flow.loops.pop();
 
     builder.switch_to_block(exit);
     Ok(StmtOutcome::default())
 }
 
+fn compile_try<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    try_stmt: &'a TryStatement<'a>,
+    flow: &mut Flow<'a>,
+) -> Result<StmtOutcome, Error> {
+    let outer_exception = flow.exception;
+    let base_cleanup = flow.cleanups.len();
+    let base_loop = flow.loops.len();
+    let has_finalizer = try_stmt.finalizer.is_some();
+    if let Some(finalizer) = &try_stmt.finalizer {
+        flow.cleanups.push(Cleanup {
+            finalizer,
+            loop_depth: base_loop,
+            scope: ctx.scope,
+            env: ctx.env,
+            exception: outer_exception,
+        });
+    }
+
+    let catch_entry = try_stmt.handler.as_ref().map(|_| builder.create_block());
+    flow.exception = match catch_entry {
+        Some(block) => Some(ExceptionTarget {
+            block,
+            cleanup_depth: base_cleanup + usize::from(has_finalizer),
+        }),
+        None => outer_exception,
+    };
+
+    let after = builder.create_block();
+    let try_value = builder.declare_var(types::F64);
+    let mut reaches_after = false;
+
+    let try_out = compile_block(builder, ctx, &try_stmt.block, flow)?;
+    if !try_out.terminated {
+        let value = match try_out.last {
+            Some(value) => value,
+            None => value::undefined(builder),
+        };
+        builder.def_var(try_value, value);
+        reaches_after |= emit_unwind(
+            builder,
+            ctx,
+            flow,
+            flow.cleanups.len(),
+            base_cleanup,
+            after,
+            false,
+        )?;
+    }
+
+    if let Some(handler) = &try_stmt.handler {
+        let entry = catch_entry.ok_or_else(|| Error::Codegen("missing catch block".to_string()))?;
+        builder.switch_to_block(entry);
+        let catch_scope = node_scope(ctx, node_key(&**handler))?;
+        let catch_ctx = enter_scope(builder, ctx, catch_scope);
+        let exception = take_exception(builder, ctx);
+        if let Some(param) = &handler.param {
+            let BindingPattern::BindingIdentifier(id) = &param.pattern else {
+                return Err(Error::Unsupported(
+                    "destructuring catch parameters are not supported".to_string(),
+                ));
+            };
+            store_var(builder, &catch_ctx, id.name.as_str(), exception)?;
+        }
+
+        flow.exception = outer_exception;
+        let catch_out =
+            compile_statements(builder, &catch_ctx, handler.body.body.as_slice(), flow)?;
+        if !catch_out.terminated {
+            let value = match catch_out.last {
+                Some(value) => value,
+                None => value::undefined(builder),
+            };
+            builder.def_var(try_value, value);
+            reaches_after |= emit_unwind(
+                builder,
+                ctx,
+                flow,
+                flow.cleanups.len(),
+                base_cleanup,
+                after,
+                false,
+            )?;
+        }
+    }
+
+    if has_finalizer {
+        flow.cleanups.pop();
+    }
+    flow.exception = outer_exception;
+
+    if reaches_after {
+        builder.switch_to_block(after);
+        Ok(StmtOutcome {
+            last: Some(builder.use_var(try_value)),
+            terminated: false,
+        })
+    } else {
+        Ok(StmtOutcome {
+            last: None,
+            terminated: true,
+        })
+    }
+}
+
 fn compile_expr<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     expr: &'a Expression<'a>,
 ) -> Result<Value, Error> {
     match expr {
@@ -1474,30 +1860,33 @@ fn compile_expr<'a>(
             }
             load_var(builder, ctx, name)
         }
-        Expression::ParenthesizedExpression(paren) => compile_expr(builder, ctx, &paren.expression),
-        Expression::BinaryExpression(binary) => compile_binary(builder, ctx, binary),
+        Expression::ParenthesizedExpression(paren) => {
+            compile_expr(builder, ctx, flow, &paren.expression)
+        }
+        Expression::BinaryExpression(binary) => compile_binary(builder, ctx, flow, binary),
         Expression::LogicalExpression(logical) => {
-            let lhs = compile_expr(builder, ctx, &logical.left)?;
-            compile_logical(builder, ctx, lhs, &logical.right, logical.operator)
+            let lhs = compile_expr(builder, ctx, flow, &logical.left)?;
+            compile_logical(builder, ctx, flow, lhs, &logical.right, logical.operator)
         }
         Expression::ConditionalExpression(conditional) => {
-            compile_conditional(builder, ctx, conditional)
+            compile_conditional(builder, ctx, flow, conditional)
         }
-        Expression::UnaryExpression(unary) => compile_unary(builder, ctx, unary),
-        Expression::AssignmentExpression(assign) => compile_assign(builder, ctx, assign),
+        Expression::UnaryExpression(unary) => compile_unary(builder, ctx, flow, unary),
+        Expression::AssignmentExpression(assign) => compile_assign(builder, ctx, flow, assign),
         Expression::UpdateExpression(update) => compile_update(builder, ctx, update),
         Expression::SequenceExpression(sequence) => {
             let mut result = value::undefined(builder);
             for expr in &sequence.expressions {
-                result = compile_expr(builder, ctx, expr)?;
+                result = compile_expr(builder, ctx, flow, expr)?;
             }
             Ok(result)
         }
-        Expression::CallExpression(call) => compile_call(builder, ctx, call),
+        Expression::CallExpression(call) => compile_call(builder, ctx, flow, call),
         Expression::FunctionExpression(func) => compile_closure(builder, ctx, node_key(&**func)),
         Expression::ArrowFunctionExpression(arrow) => {
             compile_closure(builder, ctx, node_key(&**arrow))
         }
+        Expression::ChainExpression(chain) => compile_chain(builder, ctx, flow, chain),
         Expression::StaticMemberExpression(access) => compile_property_access(builder, ctx, access),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
@@ -1508,10 +1897,11 @@ fn compile_expr<'a>(
 fn compile_binary<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     binary: &'a BinaryExpression<'a>,
 ) -> Result<Value, Error> {
-    let lhs = compile_expr(builder, ctx, &binary.left)?;
-    let rhs = compile_expr(builder, ctx, &binary.right)?;
+    let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
+    let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
     let op = binary.operator;
     if op.is_arithmetic() {
         compile_arithmetic(
@@ -1545,9 +1935,10 @@ fn compile_binary<'a>(
 fn compile_conditional<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     conditional: &'a ConditionalExpression<'a>,
 ) -> Result<Value, Error> {
-    let cond = compile_condition(builder, ctx, &conditional.test)?;
+    let cond = compile_condition(builder, ctx, flow, &conditional.test)?;
 
     let result_var = builder.declare_var(types::F64);
     let true_block = builder.create_block();
@@ -1556,12 +1947,12 @@ fn compile_conditional<'a>(
     builder.ins().brif(cond, true_block, &[], false_block, &[]);
 
     builder.switch_to_block(true_block);
-    let if_true = compile_expr(builder, ctx, &conditional.consequent)?;
+    let if_true = compile_expr(builder, ctx, flow, &conditional.consequent)?;
     builder.def_var(result_var, if_true);
     builder.ins().jump(join_block, &[]);
 
     builder.switch_to_block(false_block);
-    let if_false = compile_expr(builder, ctx, &conditional.alternate)?;
+    let if_false = compile_expr(builder, ctx, flow, &conditional.alternate)?;
     builder.def_var(result_var, if_false);
     builder.ins().jump(join_block, &[]);
 
@@ -1573,6 +1964,7 @@ fn compile_conditional<'a>(
 fn compile_logical<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     lhs: Value,
     rhs_expr: &'a Expression<'a>,
     op: LogicalOperator,
@@ -1595,7 +1987,7 @@ fn compile_logical<'a>(
     }
 
     builder.switch_to_block(rhs_block);
-    let rhs = compile_expr(builder, ctx, rhs_expr)?;
+    let rhs = compile_expr(builder, ctx, flow, rhs_expr)?;
     builder.def_var(result_var, rhs);
     builder.ins().jump(join_block, &[]);
 
@@ -1709,9 +2101,13 @@ fn compile_relational(
 fn compile_unary<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     unary: &'a UnaryExpression<'a>,
 ) -> Result<Value, Error> {
-    let target = compile_expr(builder, ctx, &unary.argument)?;
+    if unary.operator == UnaryOperator::Delete {
+        return compile_delete(builder, ctx, flow, &unary.argument);
+    }
+    let target = compile_expr(builder, ctx, flow, &unary.argument)?;
     match unary.operator {
         UnaryOperator::UnaryNegation => {
             let target = number_value(builder, target, expr_is_number(ctx, &unary.argument));
@@ -1739,9 +2135,38 @@ fn compile_unary<'a>(
     }
 }
 
+fn compile_delete<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    expr: &'a Expression<'a>,
+) -> Result<Value, Error> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => {
+            compile_delete(builder, ctx, flow, &paren.expression)
+        }
+        Expression::Identifier(id) => {
+            let name = id.name.as_str();
+            let deletable = resolve_binding(ctx.program, ctx.scope, name).is_none()
+                && !ctx.builtins.is_global(name);
+            Ok(value::boolean(builder, deletable))
+        }
+        Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_)
+        | Expression::PrivateFieldExpression(_) => Err(Error::Unsupported(
+            "delete of a property requires objects".to_string(),
+        )),
+        other => {
+            compile_expr(builder, ctx, flow, other)?;
+            Ok(value::boolean(builder, true))
+        }
+    }
+}
+
 fn compile_assign<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     assign: &'a AssignmentExpression<'a>,
 ) -> Result<Value, Error> {
     let name = match &assign.left {
@@ -1791,7 +2216,7 @@ fn compile_assign<'a>(
         }
 
         builder.switch_to_block(rhs_block);
-        let rhs = compile_expr(builder, ctx, &assign.right)?;
+        let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
         store_place(builder, place, rhs);
         builder.def_var(result_var, rhs);
         builder.ins().jump(join_block, &[]);
@@ -1801,7 +2226,7 @@ fn compile_assign<'a>(
     }
 
     if op == AssignmentOperator::Assign {
-        let rhs = compile_expr(builder, ctx, &assign.right)?;
+        let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
         if tdz {
             let current = load_place(builder, place);
             check_tdz(builder, current);
@@ -1816,7 +2241,7 @@ fn compile_assign<'a>(
     if tdz {
         check_tdz(builder, old);
     }
-    let rhs = compile_expr(builder, ctx, &assign.right)?;
+    let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
     let binary = op
         .to_binary_operator()
         .ok_or_else(|| Error::Unsupported(format!("assignment operator not supported: {op:?}")))?;
@@ -1896,11 +2321,12 @@ enum BuiltinCallee {
     Member(builtins::Namespace, &'static str),
 }
 
-/// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)` and the
-/// global conversion/predicate functions.
+/// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)`, `Date.now()`
+/// and the global conversion/predicate functions.
 fn compile_builtin_call<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     callee: BuiltinCallee,
     args: &'a [Argument<'a>],
 ) -> Result<Value, Error> {
@@ -1922,7 +2348,7 @@ fn compile_builtin_call<'a>(
                 "spread arguments are not supported".to_string(),
             ));
         };
-        values.push(compile_expr(builder, ctx, expr)?);
+        values.push(compile_expr(builder, ctx, flow, expr)?);
         known_numbers.push(expr_is_number(ctx, expr));
     }
     builtins::call(
@@ -1959,7 +2385,7 @@ fn compile_property_access(
     match constant {
         Some(value) => Ok(builder.ins().f64const(value)),
         None => Err(Error::Unsupported(
-            "only Math and Number constants can be read as properties".to_string(),
+            "only builtin constants can be read as properties".to_string(),
         )),
     }
 }
@@ -1967,19 +2393,30 @@ fn compile_property_access(
 fn compile_call<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
     call: &'a CallExpression<'a>,
 ) -> Result<Value, Error> {
     if let Some(builtin) = builtin_callee(ctx, &call.callee) {
-        return compile_builtin_call(builder, ctx, builtin, call.arguments.as_slice());
+        return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
     }
 
-    if call.arguments.len() > MAX_ARGS {
+    let callee = compile_expr(builder, ctx, flow, &call.callee)?;
+    compile_call_value(builder, ctx, flow, callee, &call.arguments)
+}
+
+fn compile_call_value<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    callee: Value,
+    args: &'a [Argument<'a>],
+) -> Result<Value, Error> {
+    if args.len() > MAX_ARGS {
         return Err(Error::Unsupported(format!(
             "calls with more than {MAX_ARGS} arguments are not supported"
         )));
     }
 
-    let callee = compile_expr(builder, ctx, &call.callee)?;
     let callee_ptr = value::payload(builder, callee);
     let code = builder
         .ins()
@@ -1989,18 +2426,16 @@ fn compile_call<'a>(
         .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
 
     let args_ptr = call_calloc(builder, ctx.calloc_ref, 8 + 8 * MAX_ARGS as i64);
-    let len = builder
-        .ins()
-        .iconst(types::I64, call.arguments.len() as i64);
+    let len = builder.ins().iconst(types::I64, args.len() as i64);
     builder.ins().store(MemFlags::new(), len, args_ptr, 0i32);
 
-    for (i, arg) in call.arguments.iter().enumerate() {
+    for (i, arg) in args.iter().enumerate() {
         let Some(expr) = arg.as_expression() else {
             return Err(Error::Unsupported(
                 "spread arguments are not supported".to_string(),
             ));
         };
-        let value = compile_expr(builder, ctx, expr)?;
+        let value = compile_expr(builder, ctx, flow, expr)?;
         builder
             .ins()
             .store(MemFlags::new(), value, args_ptr, (8 + 8 * i) as i32);
@@ -2009,7 +2444,146 @@ fn compile_call<'a>(
     let call = builder
         .ins()
         .call_indirect(ctx.js_sig_ref, code, &[captured_env, args_ptr, callee]);
-    Ok(builder.inst_results(call)[0])
+    let result = builder.inst_results(call)[0];
+    emit_exception_check(builder, ctx, flow)?;
+    Ok(result)
+}
+
+fn compile_chain<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    chain: &'a ChainExpression<'a>,
+) -> Result<Value, Error> {
+    let short = builder.create_block();
+    let join = builder.create_block();
+    let result = builder.declare_var(types::F64);
+    let value = compile_chain_element(builder, ctx, flow, &chain.expression, short, result)?;
+    builder.def_var(result, value);
+    builder.ins().jump(join, &[]);
+
+    builder.switch_to_block(short);
+    let undefined = value::undefined(builder);
+    builder.def_var(result, undefined);
+    builder.ins().jump(join, &[]);
+
+    builder.switch_to_block(join);
+    Ok(builder.use_var(result))
+}
+
+fn compile_chain_element<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    element: &'a ChainElement<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<Value, Error> {
+    match element {
+        ChainElement::CallExpression(call) => {
+            compile_chain_call(builder, ctx, flow, call, short, result)
+        }
+        ChainElement::StaticMemberExpression(access) => {
+            compile_chain_static_member(builder, ctx, flow, access, short, result)
+        }
+        ChainElement::ComputedMemberExpression(member) => {
+            compile_chain_computed_member(builder, ctx, flow, member, short, result)
+        }
+        other => Err(Error::Unsupported(format!(
+            "optional chain element not supported: {other:?}"
+        ))),
+    }
+}
+
+fn compile_chain_expr<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    expr: &'a Expression<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<Value, Error> {
+    match expr {
+        Expression::CallExpression(call) => {
+            compile_chain_call(builder, ctx, flow, call, short, result)
+        }
+        Expression::StaticMemberExpression(access) => {
+            compile_chain_static_member(builder, ctx, flow, access, short, result)
+        }
+        Expression::ChainExpression(chain) => compile_chain(builder, ctx, flow, chain),
+        Expression::ComputedMemberExpression(member) => {
+            compile_chain_computed_member(builder, ctx, flow, member, short, result)
+        }
+        Expression::PrivateFieldExpression(_) => Err(Error::Unsupported(
+            "private member access requires objects".to_string(),
+        )),
+        other => compile_expr(builder, ctx, flow, other),
+    }
+}
+
+fn compile_chain_static_member<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    access: &'a StaticMemberExpression<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<Value, Error> {
+    if builtin_member(ctx, access).is_some() {
+        return compile_property_access(builder, ctx, access);
+    }
+
+    let object = compile_chain_expr(builder, ctx, flow, &access.object, short, result)?;
+    if !access.optional {
+        return Ok(value::undefined(builder));
+    }
+
+    let ok = builder.create_block();
+    let nullish = value::is_nullish(builder, object);
+    builder.ins().brif(nullish, short, &[], ok, &[]);
+    builder.switch_to_block(ok);
+    Ok(value::undefined(builder))
+}
+
+fn compile_chain_computed_member<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    member: &'a oxc_ast::ast::ComputedMemberExpression<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<Value, Error> {
+    let object = compile_chain_expr(builder, ctx, flow, &member.object, short, result)?;
+    if member.optional {
+        let ok = builder.create_block();
+        let nullish = value::is_nullish(builder, object);
+        builder.ins().brif(nullish, short, &[], ok, &[]);
+        builder.switch_to_block(ok);
+    }
+    let _ = compile_expr(builder, ctx, flow, &member.expression)?;
+    Ok(value::undefined(builder))
+}
+
+fn compile_chain_call<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    call: &'a CallExpression<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<Value, Error> {
+    if let Some(builtin) = builtin_callee(ctx, &call.callee) {
+        return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
+    }
+
+    let callee = compile_chain_expr(builder, ctx, flow, &call.callee, short, result)?;
+    if call.optional {
+        let ok = builder.create_block();
+        let nullish = value::is_nullish(builder, callee);
+        builder.ins().brif(nullish, short, &[], ok, &[]);
+        builder.switch_to_block(ok);
+    }
+    compile_call_value(builder, ctx, flow, callee, &call.arguments)
 }
 
 /// Materialises a function or arrow expression as a closure over the current

@@ -15,9 +15,11 @@
 //! expressions and arrow functions), closures, variables (`var`, `let` and
 //! `const`) with block scoping and a temporal dead zone, default parameters,
 //! `if`/`else`, `while`, `do...while`, `for`, `switch`, labelled statements,
-//! labelled `break`/`continue`, `debugger`, `return`, the `undefined`/`null`
-//! literals, the `Math`, `Number` and `Object.is` builtins, the global
-//! `NaN`/`Infinity` values, and the following operators:
+//! labelled `break`/`continue`, `debugger`, `return`, `try`/`catch`/`finally`
+//! with primitive exceptions, `throw`, the `undefined`/`null` literals, the
+//! `Math`, `Number`, `Object.is` and `Date.now` builtins, the global
+//! `NaN`/`Infinity` values, optional chaining (`?.` and `?.()`), `delete` on
+//! identifiers and non-references, and the following operators:
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
@@ -56,10 +58,10 @@
 //! - `function` declarations hoist to the enclosing function even when written
 //!   in a block, so they cannot see that block's `let`/`const` bindings.
 //!
-//! `Math`, `Number` and `Object` are namespaces, not objects: every member is
-//! either a compile-time constant or a builtin function, so `Math.PI` folds to
-//! a literal, `Math.sqrt` becomes a libm call and `Math.clz32` a few
-//! instructions. Consequences:
+//! `Math`, `Number`, `Object` and `Date` are namespaces, not objects: every
+//! member is either a compile-time constant or a builtin function, so
+//! `Math.PI` folds to a literal, `Math.sqrt` becomes a libm call and
+//! `Math.clz32` a few instructions. Consequences:
 //!
 //! - The namespaces cannot be used as values (`var m = Math` is rejected), and
 //!   only the dot notation reaches them.
@@ -68,7 +70,17 @@
 //! - `isNaN`/`isFinite` coerce their argument; `Number.isNaN`/`Number.isFinite`
 //!   do not. `Boolean(value)` and `Number(value)` are also available.
 //! - `Math.round` rounds halves towards `+Infinity`; `Math.min`/`Math.max` keep
-//!   `-0`/`NaN` semantics, and `Math.fround` rounds through an `f32`.
+//!   `-0`/`NaN` semantics, `Math.fround` rounds through an `f32`, and
+//!   `Math.f16round` rounds to half precision. `Math.hypot` scales its
+//!   operands, and `Math.random` uses `drand48`.
+//! - `Date.now()` returns the current epoch time in milliseconds.
+//!
+//! Optional chains short-circuit to `undefined` for nullish values. Without
+//! objects, non-builtin property reads inside a chain evaluate to `undefined`;
+//! `delete property` is still rejected.
+//!
+//! `throw` accepts any current value. An uncaught exception unwinds every
+//! `finally` block and makes the process exit with status `1`.
 //!
 //! `const` bindings are immutable: assigning to one (or updating it with
 //! `++`/`--`) is rejected at compile time. `switch` compares with `===`,
@@ -107,7 +119,7 @@ use cranelift_codegen::{
     isa,
     settings::{self, Configurable},
 };
-use cranelift_module::{Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
@@ -167,6 +179,11 @@ impl Engine {
         let calloc_id = module.declare_function("calloc", Linkage::Import, &calloc_sig)?;
         let pow_id = module.declare_function("pow", Linkage::Import, &f64_binary_sig)?;
         let fmod_id = module.declare_function("fmod", Linkage::Import, &f64_binary_sig)?;
+        let exception_id = module.declare_data("sealion_exception", Linkage::Local, true, false)?;
+        let mut exception_data = DataDescription::new();
+        exception_data.define_zeroinit(16);
+        exception_data.set_align(8);
+        module.define_data(exception_id, &exception_data)?;
 
         let mut func_ids = Vec::with_capacity(program.functions.len());
         for plan in &program.functions {
@@ -180,6 +197,7 @@ impl Engine {
             calloc: calloc_id,
             pow: pow_id,
             fmod: fmod_id,
+            exception: exception_id,
         };
         let mut functions = compiler::compile_functions(
             &mut module,
@@ -194,6 +212,7 @@ impl Engine {
             func_ids[0],
             main_id,
             &main_sig,
+            exception_id,
         )?);
 
         Ok(IrModule {
