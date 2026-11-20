@@ -1,0 +1,5 @@
+import { head, list, tail } from './sicp.js';
+const x = list(1, 2, 3);
+
+const y = list(4, 5, 6);
+head(tail(list(x, y)));

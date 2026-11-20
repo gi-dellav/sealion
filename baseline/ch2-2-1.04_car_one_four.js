@@ -1,0 +1,5 @@
+import { head, list } from './sicp.js';
+const one_through_four = list(1, 2, 3, 4);
+head(one_through_four);
+
+// expected: 1

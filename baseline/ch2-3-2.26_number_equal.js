@@ -1,0 +1,8 @@
+import { equal, is_number } from './sicp.js';
+function number_equal(exp, num) {
+    return is_number(exp) && exp === num;
+}
+
+number_equal(3, 3);
+
+// expected: true

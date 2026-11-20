@@ -47,7 +47,7 @@ passed=0
 run_failed=0
 compile_failed=0
 
-for src in "$ROOT"/testerjs/*.js; do
+for src in "$ROOT"/baseline/*.js; do
     name=$(basename "$src")
     out="$TMP/$name.bin"
 

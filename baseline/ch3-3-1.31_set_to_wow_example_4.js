@@ -1,0 +1,9 @@
+import { head, list, pair, set_head } from './sicp.js';
+function set_to_wow(x) {
+    set_head(head(x), "wow");
+    return x;
+}
+const z2 = pair(list("a", "b"), list("a", "b"));
+set_to_wow(z2);
+
+// expected: [ [ 'wow', [ 'b', null ] ], [ 'a', [ 'b', null ] ] ]

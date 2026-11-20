@@ -1,1 +1,0 @@
-length(primitive_constants);
