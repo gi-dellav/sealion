@@ -758,28 +758,3 @@ plumbing:
   executable artifacts behind.
 - **Debug:** breakpoint patching on a per-store copy does not affect other
   stores.
-
----
-
-## 12. Reference source map
-
-Paths beginning with `src/` are relative to the reference runtime crate;
-`crates/cranelift` and `crates/environ` are the compiler and environment crates.
-
-| Topic | Location |
-|---|---|
-| JIT entry point and in-process module creation | `src/runtime/module.rs`, `src/compile/runtime.rs` |
-| Cached compile, hit/miss behavior, publish helper | `src/compile/runtime.rs` |
-| Object writer and metadata assembly | `src/compile.rs`, `crates/environ/src/compile/module_artifacts.rs` |
-| Executable-capable object sink | `src/compile/runtime.rs` |
-| Mmap allocation, alignment, file mapping | `src/runtime/vm/mmap_vec.rs` |
-| Section parsing, publication, W^X, unwind/debug registration | `src/runtime/code_memory.rs` |
-| Custom executable-memory hook | `src/runtime/code_memory.rs`, `src/config.rs` |
-| Engine-code creation, global code registration, drop | `src/runtime/code.rs` |
-| Module construction and metadata reuse | `src/runtime/module.rs` |
-| Store-local code handle and private debug copies | `src/runtime/code.rs` |
-| Parallel compilation helper | `src/engine.rs` |
-| Compilation cache key | `src/compile/code_builder.rs` |
-| Profiling registration | `src/runtime/instantiate.rs`, `src/profiling_agent.rs` |
-| Runtime host-call ABI and trampolines | `src/runtime/func.rs`, `crates/cranelift/src/compiler.rs` |
-| Trap/backtrace code registry | `src/runtime/module/registry.rs` |

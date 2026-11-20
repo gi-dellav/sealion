@@ -1266,27 +1266,3 @@ properties. For a new runtime, make these explicit:
 - `feature_bits` with a documented compatibility rule
 
 This costs a few bytes and removes a class of subtle cross-target failures.
-
----
-
-## 12. Reference source map
-
-Paths beginning with `src/` are relative to the reference runtime crate;
-`crates/cranelift` and `crates/environ` are the compiler and environment crates.
-
-| Topic | Location |
-|---|---|
-| Engine compiler handle and AOT entry point | `src/engine.rs` |
-| Module artifact build pipeline | `src/compile.rs` |
-| Serialized-compile and cached-compile paths | `src/compile/code_builder.rs`, `src/compile/runtime.rs` |
-| Object file construction and section/relocation layout | `crates/environ/src/compile/mod.rs`, `crates/cranelift/src/obj.rs` |
-| Function and module metadata structures | `crates/environ/src/module_artifacts.rs` |
-| Module structural metadata | `crates/environ/src/module.rs` |
-| Compiled function representation and relocations | `crates/cranelift/src/compiled_function.rs` |
-| Per-function compile and append-code driver | `crates/cranelift/src/compiler.rs` |
-| Engine compatibility metadata and checks | `src/engine/serialization.rs` |
-| Module deserialization and construction | `src/runtime/module.rs` |
-| ELF section parsing, publication, unwind registration | `src/runtime/code_memory.rs` |
-| Mmap/copy/external-memory strategies | `src/runtime/vm/mmap_vec.rs` |
-| Store-level module/code registration | `src/runtime/module/registry.rs`, `src/runtime/code.rs` |
-| Runtime module object and function ranges | `src/runtime/instantiate.rs` |

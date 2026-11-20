@@ -1004,28 +1004,3 @@ this: the host boundary is a root-set boundary.
   store-local function references and contexts distinct.
 - **Using native-endian slots.** Define one endianness for the ABI and stick to
   it; otherwise cross-compilation and serialization become fragile.
-
----
-
-## 12. Reference source map
-
-Paths beginning with `src/` are relative to the reference runtime crate;
-`crates/cranelift` and `crates/environ` are the compiler and environment crates.
-
-| Topic | Location |
-|---|---|
-| Public `Func`/`Caller` surface, `IntoFunc`, host trampoline | `src/runtime/func.rs` |
-| Typed value traits and typed calls | `src/runtime/func/typed.rs` |
-| Array ABI type, `VMFuncRef`, `ValRaw` | `src/runtime/vm/vmcontext.rs` |
-| Host context layout | `src/runtime/vm/vmcontext/vm_host_func_context.rs` |
-| Function reference/import layouts | `crates/environ/src/vmtypes.rs` |
-| Layout offset calculation | `crates/environ/src/vmoffsets.rs` |
-| Store-local function-reference arena and hole filling | `src/runtime/store/func_refs.rs` |
-| Linker definitions, import lookup, `InstancePre` | `src/runtime/linker.rs`, `src/runtime/instance.rs` |
-| Import-table initialization in the instance context | `src/runtime/vm/instance.rs` |
-| Compiled signatures and array ABI | `crates/cranelift/src/lib.rs` |
-| Compiled-to-array bridge | `crates/cranelift/src/compiler.rs` |
-| Array-to-compiled bridge | `crates/cranelift/src/compiler.rs` |
-| Direct/indirect imported calls and signature checks | `crates/cranelift/src/func_environ.rs` |
-| Trap/error ABI and host-entry wrapper | `src/runtime/vm/traphandlers.rs` |
-| Opaque context pointer types | `src/runtime/vm/vmcontext.rs` |
