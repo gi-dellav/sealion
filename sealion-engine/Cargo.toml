@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [dependencies]
-cranelift-codegen = { version = "0.132.3", features = ["x86"] }
+cranelift-codegen = { version = "0.132.3", features = ["x86", "arm64"] }
 cranelift-frontend = "0.132.3"
 cranelift-module = "0.132.3"
 cranelift-object = "0.132.3"

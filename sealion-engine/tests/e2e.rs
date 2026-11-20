@@ -4,14 +4,14 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use sealion_engine::Engine;
+use sealion_engine::{CompileOptions, Engine, OptLevel};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-fn run_status(js: &str) -> std::process::ExitStatus {
+fn run_status_with_options(js: &str, options: &CompileOptions) -> std::process::ExitStatus {
     let engine = Engine::new();
     let mut ir = engine
-        .compile(js)
+        .compile_with_options(js, options)
         .unwrap_or_else(|e| panic!("compile failed: {e}\n{js}"));
     let n = NEXT.fetch_add(1, Ordering::SeqCst);
     let path = std::env::temp_dir().join(format!("sealion_test_{}_{}.bin", std::process::id(), n));
@@ -22,6 +22,16 @@ fn run_status(js: &str) -> std::process::ExitStatus {
         .unwrap_or_else(|e| panic!("run failed: {e}"));
     let _ = std::fs::remove_file(PathBuf::from(&path));
     status
+}
+
+fn run_status(js: &str) -> std::process::ExitStatus {
+    run_status_with_options(js, &CompileOptions::default())
+}
+
+fn run_with_options(js: &str, options: &CompileOptions) -> i32 {
+    run_status_with_options(js, options)
+        .code()
+        .unwrap_or_else(|| panic!("process terminated by signal"))
 }
 
 fn run(js: &str) -> i32 {
@@ -1533,4 +1543,83 @@ fn numeric_analysis_with_new_constructs() {
     assert_eq!(run("let x = 1; var f; f?.(x = null); x + 1;"), 2);
     assert_eq!(run("let x = 1; try { } finally { x = true; } x + 1;"), 2);
     assert_eq!(run("let x = 1; try { } finally { x = false; } x + 1;"), 1);
+}
+
+#[test]
+fn supports_cranelift_optimization_levels() {
+    let none = CompileOptions {
+        opt_level: OptLevel::None,
+        ..Default::default()
+    };
+    assert_eq!(run_with_options("1 + 2 * 3;", &none), 7);
+
+    let size = CompileOptions {
+        opt_level: OptLevel::SpeedAndSize,
+        ..Default::default()
+    };
+    assert_eq!(run_with_options("1 + 2 * 3;", &size), 7);
+}
+
+#[test]
+fn supports_cranelift_codegen_toggles() {
+    let options = CompileOptions {
+        enable_alias_analysis: false,
+        enable_verifier: false,
+        unwind_info: false,
+        preserve_frame_pointers: true,
+        ..Default::default()
+    };
+    assert_eq!(run_with_options("var x = 1; x + 2;", &options), 3);
+}
+
+#[test]
+fn emits_non_pic_object() {
+    let options = CompileOptions {
+        is_pic: false,
+        ..Default::default()
+    };
+    let mut ir = Engine::new()
+        .compile_with_options("1 + 2;", &options)
+        .unwrap();
+    assert!(!ir.emit_object().unwrap().is_empty());
+}
+
+#[test]
+fn accepts_explicit_host_target() {
+    let options = CompileOptions {
+        target: Some(target_lexicon::Triple::host().to_string()),
+        ..Default::default()
+    };
+    assert_eq!(run_with_options("1 + 2;", &options), 3);
+}
+
+#[test]
+fn cross_compiles_aarch64_object() {
+    let options = CompileOptions {
+        target: Some("aarch64-unknown-linux-gnu".to_string()),
+        ..Default::default()
+    };
+    let mut ir = Engine::new()
+        .compile_with_options("1 + 2;", &options)
+        .unwrap();
+    assert!(!ir.emit_object().unwrap().is_empty());
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn applies_x86_cpu_preset() {
+    let options = CompileOptions {
+        target_cpu: Some("x86-64".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(run_with_options("1 + 2;", &options), 3);
+}
+
+#[test]
+fn rejects_invalid_target() {
+    let options = CompileOptions {
+        target: Some("not-a-target".to_string()),
+        ..Default::default()
+    };
+    assert!(Engine::new().compile_with_options("1;", &options).is_err());
 }

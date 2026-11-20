@@ -11,8 +11,9 @@
 //! assert!(clif.contains("__script"));
 //! ```
 //!
-//! [`CompileOptions`] enables TypeScript parsing and the ECMAScript 2026
-//! transforms before the AST is lowered.
+//! [`CompileOptions`] enables TypeScript parsing, the ECMAScript 2026
+//! transforms, and Cranelift code-generation settings before the AST is
+//! lowered.
 //!
 //! The 0.6.0 subset supports functions (declarations, expressions, named
 //! expressions and arrow functions), closures, variables (`var`, `let` and
@@ -114,6 +115,7 @@ pub use error::Error;
 use std::{
     path::Path,
     process::Command,
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -135,13 +137,82 @@ use target_lexicon::Triple;
 
 use plan::build_program_plan;
 
-/// Language and edition options for [`Engine::compile_with_options`].
-#[derive(Debug, Clone, Copy, Default)]
+/// Cranelift optimization level for [`CompileOptions::opt_level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptLevel {
+    /// Minimize compile time by disabling most optimizations.
+    None,
+    /// Generate the fastest possible code.
+    #[default]
+    Speed,
+    /// Like [`OptLevel::Speed`], but also reduce code size.
+    SpeedAndSize,
+}
+
+impl OptLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Speed => "speed",
+            Self::SpeedAndSize => "speed_and_size",
+        }
+    }
+}
+
+/// Language, edition and code-generation options for
+/// [`Engine::compile_with_options`].
+#[derive(Debug, Clone)]
 pub struct CompileOptions {
     /// Parse the source as TypeScript and remove type syntax before lowering.
     pub typescript: bool,
     /// Apply the ECMAScript 2026 transforms before lowering.
     pub es2026: bool,
+    /// Cranelift optimization level.
+    pub opt_level: OptLevel,
+    /// Enable redundant-load optimizations with alias analysis.
+    pub enable_alias_analysis: bool,
+    /// Run the Cranelift IR verifier during compilation.
+    pub enable_verifier: bool,
+    /// Target triple to compile for; defaults to the host.
+    pub target: Option<String>,
+    /// Target-specific CPU preset, for example `x86-64-v3` or `znver4`.
+    pub target_cpu: Option<String>,
+    /// Emit position-independent code.
+    pub is_pic: bool,
+    /// Generate unwind information.
+    pub unwind_info: bool,
+    /// Preserve frame pointers in generated functions.
+    pub preserve_frame_pointers: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            typescript: false,
+            es2026: false,
+            opt_level: OptLevel::Speed,
+            enable_alias_analysis: true,
+            enable_verifier: true,
+            target: None,
+            target_cpu: None,
+            is_pic: true,
+            unwind_info: true,
+            preserve_frame_pointers: false,
+        }
+    }
+}
+
+fn set_flag(
+    builder: &mut settings::Builder,
+    name: &str,
+    value: impl std::fmt::Display,
+) -> Result<(), Error> {
+    let value = value.to_string();
+    builder.set(name, &value).map_err(|e| {
+        Error::Codegen(format!(
+            "failed to set Cranelift setting '{name}' to '{value}': {e}"
+        ))
+    })
 }
 
 pub struct Engine;
@@ -158,13 +229,13 @@ impl Engine {
     }
 
     pub fn compile(&self, source: &str) -> Result<IrModule, Error> {
-        self.compile_with_options(source, CompileOptions::default())
+        self.compile_with_options(source, &CompileOptions::default())
     }
 
     pub fn compile_with_options(
         &self,
         source: &str,
-        options: CompileOptions,
+        options: &CompileOptions,
     ) -> Result<IrModule, Error> {
         let allocator = Allocator::default();
         let source_type = if options.typescript {
@@ -214,15 +285,36 @@ impl Engine {
 
         let program = build_program_plan(&program)?;
 
-        let triple = Triple::host();
-        let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
+        let triple = match &options.target {
+            Some(target) => Triple::from_str(target)
+                .map_err(|e| Error::Codegen(format!("invalid target triple '{target}': {e}")))?,
+            None => Triple::host(),
+        };
+        let mut isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
         let mut flag_builder = settings::builder();
-        flag_builder
-            .set("is_pic", "true")
-            .map_err(|e| Error::Codegen(e.to_string()))?;
-        flag_builder
-            .set("opt_level", "speed")
-            .map_err(|e| Error::Codegen(e.to_string()))?;
+        set_flag(&mut flag_builder, "is_pic", options.is_pic)?;
+        set_flag(&mut flag_builder, "opt_level", options.opt_level.as_str())?;
+        set_flag(
+            &mut flag_builder,
+            "enable_alias_analysis",
+            options.enable_alias_analysis,
+        )?;
+        set_flag(
+            &mut flag_builder,
+            "enable_verifier",
+            options.enable_verifier,
+        )?;
+        set_flag(&mut flag_builder, "unwind_info", options.unwind_info)?;
+        set_flag(
+            &mut flag_builder,
+            "preserve_frame_pointers",
+            options.preserve_frame_pointers,
+        )?;
+        if let Some(cpu) = &options.target_cpu {
+            isa_builder
+                .enable(cpu)
+                .map_err(|e| Error::Codegen(format!("invalid target CPU '{cpu}': {e}")))?;
+        }
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder
             .finish(flags)
@@ -279,6 +371,7 @@ impl Engine {
         Ok(IrModule {
             functions,
             module: Some(module),
+            is_pic: options.is_pic,
         })
     }
 }
@@ -291,6 +384,7 @@ pub struct IrFunction {
 pub struct IrModule {
     functions: Vec<IrFunction>,
     module: Option<ObjectModule>,
+    is_pic: bool,
 }
 
 impl IrModule {
@@ -330,12 +424,12 @@ impl IrModule {
         std::fs::write(&object_path, object)?;
 
         let mut command = Command::new("cc");
-        let output = command
-            .arg("-o")
-            .arg(path)
-            .arg(&object_path)
-            .arg("-lm")
-            .output()?;
+        command.arg("-o").arg(path).arg(&object_path).arg("-lm");
+        #[cfg(target_os = "linux")]
+        if !self.is_pic {
+            command.arg("-no-pie");
+        }
+        let output = command.output()?;
 
         let _ = std::fs::remove_file(&object_path);
 

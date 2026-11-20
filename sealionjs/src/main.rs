@@ -5,8 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::Parser;
-use sealion_engine::{CompileOptions, Engine};
+use clap::{Parser, ValueEnum};
+use sealion_engine::{CompileOptions, Engine, OptLevel};
 
 /// Run or build the sealion 0.6.0 JavaScript subset.
 #[derive(Debug, Parser)]
@@ -38,6 +38,62 @@ struct Cli {
     /// Apply the ECMAScript 2026 transforms before compiling.
     #[arg(long)]
     es2026: bool,
+
+    /// Set the Cranelift optimization level.
+    #[arg(
+        short = 'O',
+        long,
+        value_enum,
+        value_name = "LEVEL",
+        default_value = "speed"
+    )]
+    opt_level: OptLevelArg,
+
+    /// Disable redundant-load optimizations with alias analysis.
+    #[arg(long)]
+    no_alias_analysis: bool,
+
+    /// Disable the Cranelift IR verifier.
+    #[arg(long)]
+    no_verifier: bool,
+
+    /// Compile for this target triple instead of the host.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
+
+    /// Enable a target-specific CPU preset (for example x86-64-v3 or znver4).
+    #[arg(long, value_name = "PRESET")]
+    target_cpu: Option<String>,
+
+    /// Emit non-position-independent code.
+    #[arg(long)]
+    no_pic: bool,
+
+    /// Do not generate unwind information.
+    #[arg(long)]
+    no_unwind_info: bool,
+
+    /// Preserve frame pointers in generated functions.
+    #[arg(long)]
+    preserve_frame_pointers: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OptLevelArg {
+    None,
+    Speed,
+    #[value(name = "speed_and_size", alias = "speed-and-size")]
+    SpeedAndSize,
+}
+
+impl From<OptLevelArg> for OptLevel {
+    fn from(value: OptLevelArg) -> Self {
+        match value {
+            OptLevelArg::None => Self::None,
+            OptLevelArg::Speed => Self::Speed,
+            OptLevelArg::SpeedAndSize => Self::SpeedAndSize,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -58,18 +114,26 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     let options = CompileOptions {
         typescript: cli.ts,
         es2026: cli.es2026,
+        opt_level: cli.opt_level.into(),
+        enable_alias_analysis: !cli.no_alias_analysis,
+        enable_verifier: !cli.no_verifier,
+        target: cli.target.clone(),
+        target_cpu: cli.target_cpu.clone(),
+        is_pic: !cli.no_pic,
+        unwind_info: !cli.no_unwind_info,
+        preserve_frame_pointers: cli.preserve_frame_pointers,
     };
 
     if cli.emit_ir {
         let ir = engine
-            .compile_with_options(&source, options)
+            .compile_with_options(&source, &options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         print!("{}", ir.clif());
     }
 
     if let Some(object_path) = &cli.object {
         let mut ir = engine
-            .compile_with_options(&source, options)
+            .compile_with_options(&source, &options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         let object = ir
             .emit_object()
@@ -80,7 +144,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 
     if let Some(output_path) = &cli.output {
         let mut ir = engine
-            .compile_with_options(&source, options)
+            .compile_with_options(&source, &options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         ir.emit_binary(output_path)
             .map_err(|e| format!("failed to emit binary: {e}"))?;
@@ -91,7 +155,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
 
     let mut ir = engine
-        .compile_with_options(&source, options)
+        .compile_with_options(&source, &options)
         .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
     let binary_path = temporary_executable_path();
     ir.emit_binary(&binary_path)

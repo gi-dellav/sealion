@@ -172,3 +172,125 @@ fn accepts_es2026_transform() {
     let _ = fs::remove_file(&input);
     assert_eq!(status.code(), Some(6));
 }
+
+#[test]
+fn supports_opt_level_flags() {
+    for level in ["none", "speed", "speed_and_size"] {
+        let input = write_source("1 + 2 * 3;");
+        let status = Command::new(bin())
+            .arg("--opt-level")
+            .arg(level)
+            .arg(&input)
+            .status()
+            .unwrap();
+        let _ = fs::remove_file(&input);
+        assert_eq!(status.code(), Some(7), "opt level {level}");
+    }
+}
+
+#[test]
+fn supports_short_opt_level_flag() {
+    let input = write_source("1 + 2 * 3;");
+    let status = Command::new(bin())
+        .arg("-O")
+        .arg("none")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn supports_cranelift_codegen_toggles() {
+    let input = write_source("var x = 1; x + 2;");
+    let status = Command::new(bin())
+        .arg("--no-alias-analysis")
+        .arg("--no-verifier")
+        .arg("--preserve-frame-pointers")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(3));
+}
+
+#[test]
+fn emits_object_without_unwind_info() {
+    let input = write_source("while (0) {}");
+    let object = temp_path("program.o");
+    let status = Command::new(bin())
+        .arg("--object")
+        .arg(&object)
+        .arg("--no-unwind-info")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let bytes = fs::read(&object).unwrap();
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&object);
+    assert!(status.success());
+    assert!(!bytes.is_empty());
+}
+
+#[test]
+fn emits_non_pic_object() {
+    let input = write_source("while (0) {}");
+    let object = temp_path("program.o");
+    let status = Command::new(bin())
+        .arg("--object")
+        .arg(&object)
+        .arg("--no-pic")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let bytes = fs::read(&object).unwrap();
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&object);
+    assert!(status.success());
+    assert!(!bytes.is_empty());
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn supports_explicit_target_and_cpu() {
+    let input = write_source("1 + 2;");
+    let status = Command::new(bin())
+        .arg("--target")
+        .arg("x86_64-unknown-linux-gnu")
+        .arg("--target-cpu")
+        .arg("x86-64")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(3));
+}
+
+#[test]
+fn rejects_invalid_target() {
+    let input = write_source("1;");
+    let output = Command::new(bin())
+        .arg("--target")
+        .arg("not-a-target")
+        .arg(&input)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("target triple"));
+}
+
+#[test]
+fn rejects_invalid_target_cpu() {
+    let input = write_source("1;");
+    let output = Command::new(bin())
+        .arg("--target-cpu")
+        .arg("not-a-cpu")
+        .arg(&input)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("target CPU"));
+}
