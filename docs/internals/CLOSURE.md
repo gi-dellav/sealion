@@ -1,6 +1,6 @@
 # Closure compilation and runtime model
 
-This document describes how `sealion-engine` 0.6.0 plans, materialises, calls and
+This document describes how `sealion-engine` plans, materialises, calls and
 stores closures. It covers the lexical planning pass that decides which bindings
 must live in heap environments, the runtime layout of closures and environment
 records, the Cranelift lowering, and the lifetime and limitations of the current

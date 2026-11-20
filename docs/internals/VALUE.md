@@ -1,6 +1,6 @@
 # Value representation and management
 
-This document describes how `sealion-engine` 0.6.0 represents and manipulates
+This document describes how `sealion-engine` represents and manipulates
 JavaScript values. Every value is a single IEEE-754 `f64` using NaN boxing:
 ordinary numbers are stored directly, and the reserved quiet-NaN payloads carry
 the non-numeric values.
