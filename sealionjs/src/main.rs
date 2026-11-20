@@ -6,13 +6,13 @@ use std::{
 };
 
 use clap::Parser;
-use sealion_engine::Engine;
+use sealion_engine::{CompileOptions, Engine};
 
 /// Run or build the sealion 0.6.0 JavaScript subset.
 #[derive(Debug, Parser)]
 #[command(name = "sealionjs", version, about)]
 struct Cli {
-    /// JavaScript source file to compile.
+    /// JavaScript or TypeScript source file to compile.
     input: PathBuf,
 
     /// Write a native executable to this path instead of running it.
@@ -30,6 +30,14 @@ struct Cli {
     /// Do not run the compiled program.
     #[arg(long)]
     no_run: bool,
+
+    /// Parse the input as TypeScript and remove type syntax.
+    #[arg(short = 't', long)]
+    ts: bool,
+
+    /// Apply the ECMAScript 2026 transforms before compiling.
+    #[arg(long)]
+    es2026: bool,
 }
 
 fn main() -> ExitCode {
@@ -47,17 +55,21 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         .map_err(|e| format!("failed to read {}: {e}", cli.input.display()))?;
 
     let engine = Engine::new();
+    let options = CompileOptions {
+        typescript: cli.ts,
+        es2026: cli.es2026,
+    };
 
     if cli.emit_ir {
         let ir = engine
-            .compile(&source)
+            .compile_with_options(&source, options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         print!("{}", ir.clif());
     }
 
     if let Some(object_path) = &cli.object {
         let mut ir = engine
-            .compile(&source)
+            .compile_with_options(&source, options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         let object = ir
             .emit_object()
@@ -68,7 +80,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 
     if let Some(output_path) = &cli.output {
         let mut ir = engine
-            .compile(&source)
+            .compile_with_options(&source, options)
             .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
         ir.emit_binary(output_path)
             .map_err(|e| format!("failed to emit binary: {e}"))?;
@@ -79,7 +91,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
 
     let mut ir = engine
-        .compile(&source)
+        .compile_with_options(&source, options)
         .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
     let binary_path = temporary_executable_path();
     ir.emit_binary(&binary_path)

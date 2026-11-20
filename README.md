@@ -5,7 +5,7 @@ Experimental JS engine built on Cranelift
 
 ## Try it out
 
-Requires latest Rust toolchain.
+Requires Rust 1.98 or newer.
 
 1. Clone the repo
 2. Run `cd sealionjs && cargo install --path .`

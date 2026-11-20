@@ -147,3 +147,28 @@ fn rejects_const_reassignment() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("constant"));
 }
+
+#[test]
+fn transpiles_typescript() {
+    let input = temp_path("input.ts");
+    fs::write(
+        &input,
+        "const add = (a: number, b: number): number => a + b;\nadd(2, 3);",
+    )
+    .unwrap();
+    let status = Command::new(bin()).arg("-t").arg(&input).status().unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(5));
+}
+
+#[test]
+fn accepts_es2026_transform() {
+    let input = write_source("let x = 2 * 3; x;");
+    let status = Command::new(bin())
+        .arg("--es2026")
+        .arg(&input)
+        .status()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(status.code(), Some(6));
+}

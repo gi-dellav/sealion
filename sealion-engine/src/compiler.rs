@@ -20,7 +20,8 @@ use crate::{
     Error, IrFunction,
     builtins::{self, Builtins},
     plan::{
-        Program, ScopeId, ScopePlan, is_const, needs_tdz_check, node_key, resolve, resolve_binding,
+        FunctionBodyPlan, Program, ScopeId, ScopePlan, is_const, needs_tdz_check, node_key,
+        resolve, resolve_binding,
     },
     value,
 };
@@ -190,7 +191,15 @@ pub fn compile_functions<'a>(
             store_var(&mut builder, &ctx, name, closure)?;
         }
 
-        let out = compile_statements(&mut builder, &ctx, plan.body, &mut flow)?;
+        let out = match plan.body {
+            FunctionBodyPlan::Statements(statements) => {
+                compile_statements(&mut builder, &ctx, statements, &mut flow)?
+            }
+            FunctionBodyPlan::Expression(expression) => StmtOutcome {
+                last: Some(compile_expr(&mut builder, &ctx, &mut flow, expression)?),
+                terminated: false,
+            },
+        };
         if !out.terminated {
             let ret = match out.last {
                 Some(value) => value,
@@ -670,7 +679,14 @@ fn analyze_numeric_bindings<'a>(
                     walker.expr(plan.root_scope, init);
                 }
             }
-            walker.statements(plan.id, plan.root_scope, plan.body);
+            match plan.body {
+                FunctionBodyPlan::Statements(statements) => {
+                    walker.statements(plan.id, plan.root_scope, statements);
+                }
+                FunctionBodyPlan::Expression(expression) => {
+                    walker.expr(plan.root_scope, expression);
+                }
+            }
         }
         if removed.is_empty() {
             break;

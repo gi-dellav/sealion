@@ -1,6 +1,6 @@
 //! A small JavaScript-to-native compiler for the 0.6.0 roadmap subset.
 //!
-//! The engine parses JavaScript with `oxc-parser`, lowers the AST to Cranelift IR,
+//! The engine parses JavaScript and TypeScript with `oxc-parser`, lowers the AST to Cranelift IR,
 //! and can emit either a native object file or a linked executable.
 //!
 //! ```
@@ -10,6 +10,9 @@
 //! let clif = module.clif();
 //! assert!(clif.contains("__script"));
 //! ```
+//!
+//! [`CompileOptions`] enables TypeScript parsing and the ECMAScript 2026
+//! transforms before the AST is lowered.
 //!
 //! The 0.6.0 subset supports functions (declarations, expressions, named
 //! expressions and arrow functions), closures, variables (`var`, `let` and
@@ -123,10 +126,23 @@ use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
+use oxc_transformer::{
+    ES2026Options, EnvOptions, TransformOptions, Transformer, TypeScriptOptions,
+};
 use target_lexicon::Triple;
 
 use plan::build_program_plan;
+
+/// Language and edition options for [`Engine::compile_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions {
+    /// Parse the source as TypeScript and remove type syntax before lowering.
+    pub typescript: bool,
+    /// Apply the ECMAScript 2026 transforms before lowering.
+    pub es2026: bool,
+}
 
 pub struct Engine;
 
@@ -142,16 +158,61 @@ impl Engine {
     }
 
     pub fn compile(&self, source: &str) -> Result<IrModule, Error> {
+        self.compile_with_options(source, CompileOptions::default())
+    }
+
+    pub fn compile_with_options(
+        &self,
+        source: &str,
+        options: CompileOptions,
+    ) -> Result<IrModule, Error> {
         let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
-        if let Some(error) = parsed.errors.first() {
+        let source_type = if options.typescript {
+            SourceType::ts()
+        } else {
+            SourceType::script()
+        };
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        if let Some(error) = parsed.diagnostics.first() {
             return Err(Error::Parse(error.to_string()));
         }
-        if parsed.panicked {
+        if parsed.fatal_error {
             return Err(Error::Parse("parser aborted".to_string()));
         }
 
-        let program = build_program_plan(&parsed.program)?;
+        let mut program = parsed.program;
+
+        if options.typescript || options.es2026 {
+            let semantic = SemanticBuilder::new()
+                .with_excess_capacity(2.0)
+                .build(&program);
+            if let Some(error) = semantic.diagnostics.first() {
+                return Err(Error::Parse(error.to_string()));
+            }
+
+            let transform_options = TransformOptions {
+                typescript: TypeScriptOptions::default(),
+                env: EnvOptions {
+                    es2026: ES2026Options {
+                        explicit_resource_management: options.es2026,
+                    },
+                    ..EnvOptions::default()
+                },
+                ..TransformOptions::default()
+            };
+            let source_path = Path::new(if options.typescript {
+                "input.ts"
+            } else {
+                "input.js"
+            });
+            let transformed = Transformer::new(&allocator, source_path, &transform_options)
+                .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+            if let Some(error) = transformed.diagnostics.first() {
+                return Err(Error::Parse(error.to_string()));
+            }
+        }
+
+        let program = build_program_plan(&program)?;
 
         let triple = Triple::host();
         let isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;

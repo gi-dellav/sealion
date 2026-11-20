@@ -14,8 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
     BindingPattern, CatchClause, ChainElement, Expression, ForStatement, ForStatementInit,
-    FormalParameters, Function, FunctionBody, Statement, VariableDeclaration,
-    VariableDeclarationKind,
+    FormalParameters, Function, Statement, VariableDeclaration, VariableDeclarationKind,
 };
 
 use crate::Error;
@@ -55,13 +54,19 @@ impl ScopePlan<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionBodyPlan<'a> {
+    Statements(&'a [Statement<'a>]),
+    Expression(&'a Expression<'a>),
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionPlan<'a> {
     pub id: usize,
     pub name: String,
     pub root_scope: ScopeId,
     pub params: Vec<ParamPlan<'a>>,
-    pub body: &'a [Statement<'a>],
+    pub body: FunctionBodyPlan<'a>,
     /// Hoisted `function` declarations, evaluated at function entry.
     pub children: Vec<usize>,
     /// Function and arrow expressions, keyed by the address of the AST node.
@@ -107,7 +112,7 @@ pub fn build_program_plan<'a>(
         None,
         "__script".to_string(),
         Vec::new(),
-        program.body.as_slice(),
+        FunctionBodyPlan::Statements(program.body.as_slice()),
         true,
         None,
     )?;
@@ -196,7 +201,7 @@ impl<'a> Planner<'a> {
         parent_scope: Option<ScopeId>,
         name: String,
         params: Vec<ParamPlan<'a>>,
-        body: &'a [Statement<'a>],
+        body: FunctionBodyPlan<'a>,
         is_script: bool,
         self_binding: Option<&'a str>,
     ) -> Result<usize, Error> {
@@ -229,7 +234,14 @@ impl<'a> Planner<'a> {
                 self.scan_expression(id, root_scope, init)?;
             }
         }
-        self.scan_statements(id, root_scope, body)?;
+        match body {
+            FunctionBodyPlan::Statements(statements) => {
+                self.scan_statements(id, root_scope, statements)?;
+            }
+            FunctionBodyPlan::Expression(expression) => {
+                self.scan_expression(id, root_scope, expression)?;
+            }
+        }
         self.functions[id].params = params;
         Ok(id)
     }
@@ -241,19 +253,13 @@ impl<'a> Planner<'a> {
         scope: ScopeId,
         key: usize,
         params: &'a FormalParameters<'a>,
-        body: &'a FunctionBody<'a>,
+        body: FunctionBodyPlan<'a>,
         self_binding: Option<&'a str>,
     ) -> Result<(), Error> {
         let params = collect_params(params)?;
         let name = format!("js_fn_{}", self.functions.len());
-        let child = self.build_function_plan(
-            Some(scope),
-            name,
-            params,
-            body.statements.as_slice(),
-            false,
-            self_binding,
-        )?;
+        let child =
+            self.build_function_plan(Some(scope), name, params, body, false, self_binding)?;
         self.mark_captured(scope);
         self.functions[plan_id].nested.insert(key, child);
         Ok(())
@@ -494,7 +500,7 @@ impl<'a> Planner<'a> {
             Some(root),
             child_name,
             params,
-            body.statements.as_slice(),
+            FunctionBodyPlan::Statements(body.statements.as_slice()),
             false,
             None,
         )?;
@@ -538,17 +544,23 @@ impl<'a> Planner<'a> {
                     scope,
                     node_key(&**func),
                     &func.params,
-                    body,
+                    FunctionBodyPlan::Statements(body.statements.as_slice()),
                     func.id.as_ref().map(|id| id.name.as_str()),
                 )?;
             }
             Expression::ArrowFunctionExpression(arrow) => {
+                let body = match &arrow.body {
+                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                        FunctionBodyPlan::Statements(body.statements.as_slice())
+                    }
+                    expression => FunctionBodyPlan::Expression(expression.to_expression()),
+                };
                 self.add_nested_function(
                     plan_id,
                     scope,
                     node_key(&**arrow),
                     &arrow.params,
-                    &arrow.body,
+                    body,
                     None,
                 )?;
             }
