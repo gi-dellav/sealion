@@ -10,6 +10,8 @@ pub enum Error {
     Linker(String),
     #[cfg(feature = "jit")]
     Jit(String),
+    #[cfg(feature = "jit")]
+    Loader(String),
 }
 
 impl fmt::Display for Error {
@@ -23,6 +25,8 @@ impl fmt::Display for Error {
             Self::Linker(m) => write!(f, "linker error: {m}"),
             #[cfg(feature = "jit")]
             Self::Jit(m) => write!(f, "jit error: {m}"),
+            #[cfg(feature = "jit")]
+            Self::Loader(m) => write!(f, "loader error: {m}"),
         }
     }
 }

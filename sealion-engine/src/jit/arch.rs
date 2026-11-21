@@ -20,6 +20,13 @@ pub(super) trait Arch {
         encoding: RelocationEncoding,
     ) -> Result<(), Error>;
 
+    fn read_absolute(
+        base: *const u8,
+        offset: usize,
+        size: u8,
+        encoding: RelocationEncoding,
+    ) -> Result<u64, Error>;
+
     fn write_pcrel(
         base: *mut u8,
         offset: usize,
@@ -102,6 +109,28 @@ impl Arch for X86_64 {
             }
         }
         Ok(())
+    }
+
+    fn read_absolute(
+        base: *const u8,
+        offset: usize,
+        size: u8,
+        encoding: RelocationEncoding,
+    ) -> Result<u64, Error> {
+        match (size, encoding) {
+            (64, _) => Ok(unsafe { ptr::read_unaligned(base.add(offset).cast::<u64>()) }),
+            (32, RelocationEncoding::X86Signed) => {
+                let value = unsafe { ptr::read_unaligned(base.add(offset).cast::<i32>()) };
+                Ok(value as i64 as u64)
+            }
+            (32, _) => Ok(u64::from(unsafe {
+                ptr::read_unaligned(base.add(offset).cast::<u32>())
+            })),
+            _ => Err(Error::Loader(format!(
+                "unsupported {0} absolute relocation size {size}",
+                Self::NAME
+            ))),
+        }
     }
 
     fn write_pcrel(

@@ -1,28 +1,56 @@
 use std::collections::{HashMap, HashSet};
 
 use object::{
-    Object, ObjectSection, ObjectSymbol, Relocation, RelocationKind, RelocationTarget,
-    SectionFlags, SectionIndex, SectionKind, SymbolIndex, SymbolSection,
+    Object, ObjectSection, ObjectSymbol, Relocation, RelocationEncoding, RelocationKind,
+    RelocationTarget, SectionFlags, SectionIndex, SectionKind, SymbolIndex, SymbolKind,
+    SymbolSection,
     elf::{SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE},
     read::elf::ElfFile64,
 };
 
 use crate::Error;
 
-use super::{
-    arch::Arch,
-    os::{Memory, Os},
-};
+use super::arch::Arch;
 
-pub(super) struct LoadedImage<M: Memory> {
-    _memory: M,
-    main: usize,
+/// A fully linked image, produced during precompilation.
+///
+/// All relocations between sections of this object have been resolved. The only
+/// work left for the loader is to copy the image into executable memory, apply
+/// external symbol fixups, and publish it.
+pub(super) struct LinkedImage {
+    pub image: Vec<u8>,
+    pub text_len: usize,
+    pub data_offset: usize,
+    pub entry: usize,
+    pub functions: Vec<LinkedFunction>,
+    pub imports: Vec<ImportFixup>,
+    pub base_fixups: Vec<BaseFixup>,
 }
 
-impl<M: Memory> LoadedImage<M> {
-    pub(super) fn main(&self) -> usize {
-        self.main
-    }
+pub(super) struct LinkedFunction {
+    pub name: String,
+    pub start: u32,
+    pub length: u32,
+}
+
+/// An external symbol reference that must be resolved at load time.
+pub(super) struct ImportFixup {
+    pub name: String,
+    pub offset: u32,
+    pub addend: i64,
+    pub size: u8,
+    pub encoding: RelocationEncoding,
+    /// When true, `offset` points at a veneer slot in the text section and the
+    /// loader writes a jump to the external symbol there.
+    pub veneer: bool,
+}
+
+/// A base-relative absolute relocation. The image stores the offset from the
+/// start of the image and the loader adds the final load address.
+pub(super) struct BaseFixup {
+    pub offset: u32,
+    pub size: u8,
+    pub encoding: RelocationEncoding,
 }
 
 struct SectionInfo {
@@ -43,65 +71,81 @@ struct SectionLayout {
 
 struct ImageLayout {
     veneer_offsets: HashMap<SymbolIndex, usize>,
+    got_offsets: HashMap<SymbolIndex, usize>,
     sections: HashMap<SectionIndex, SectionLayout>,
     text_len: usize,
     total_len: usize,
 }
 
 enum SymbolValue {
-    Address(usize),
+    ImageOffset(usize),
+    Absolute(u64),
     External(String),
 }
 
-pub(super) fn load<A: Arch, O: Os>(object: &[u8]) -> Result<LoadedImage<O::Memory>, Error> {
+pub(super) fn link<A: Arch>(object: &[u8], page: usize) -> Result<LinkedImage, Error> {
     let file = ElfFile64::parse(object)
-        .map_err(|e| Error::Jit(format!("failed to parse JIT object: {e}")))?;
+        .map_err(|e| Error::Loader(format!("failed to parse object: {e}")))?;
     A::validate(&file)?;
 
-    let page = O::page_size();
     if page == 0 || !page.is_power_of_two() {
         return Err(error(format!("invalid page size {page}")));
     }
 
     let infos = collect_sections(&file, page)?;
     let veneers = collect_veneers(&file, &infos)?;
-    let image_layout = layout::<A>(&infos, &veneers, page)?;
+    let got_symbols = collect_got_symbols(&file, &infos)?;
+    let image_layout = layout::<A>(&infos, &veneers, &got_symbols, page)?;
     let text_len = image_layout.text_len;
-    let total = image_layout.total_len;
-    let veneer_offsets = image_layout.veneer_offsets;
+    let total_len = image_layout.total_len;
     let layouts = image_layout.sections;
+    let veneer_offsets = image_layout.veneer_offsets;
+    let got_offsets = image_layout.got_offsets;
 
-    let memory = O::allocate(total)?;
-    if memory.len() != total {
-        return Err(error("JIT memory allocation returned an unexpected size"));
-    }
-    copy_sections::<O>(&file, &infos, &layouts, &memory)?;
+    let mut image = vec![0u8; total_len];
+    copy_sections(&file, &infos, &layouts, &mut image)?;
 
-    let base_address = memory.base() as usize;
-    let symbols = collect_symbols(&file, &layouts, base_address)?;
-    let main = find_main(&file, &layouts, &symbols)?;
+    let symbols = collect_symbols(&file, &layouts)?;
+    let entry = find_main(&file, &layouts, &symbols)?;
 
-    let mut external_cache = HashMap::new();
-    write_veneers::<A, O>(&memory, &veneer_offsets, &symbols, &mut external_cache)?;
-    apply_relocations::<A, O>(
+    let mut imports = Vec::new();
+    let mut base_fixups = Vec::new();
+    fill_got::<A>(
+        &symbols,
+        &got_offsets,
+        &mut image,
+        &mut imports,
+        &mut base_fixups,
+    )?;
+    apply_relocations::<A>(
         &file,
         &infos,
         &layouts,
         &symbols,
         &veneer_offsets,
-        &memory,
-        &mut external_cache,
+        &got_offsets,
+        &mut image,
+        &mut imports,
+        &mut base_fixups,
     )?;
 
-    let mut memory = memory;
-    unsafe {
-        memory.publish(text_len)?;
-    }
-    A::flush_icache(memory.base(), text_len);
+    append_veneer_imports(&symbols, &veneer_offsets, &mut imports)?;
+    imports.sort_by_key(|import| import.offset);
+    base_fixups.sort_by_key(|fixup| fixup.offset);
 
-    Ok(LoadedImage {
-        _memory: memory,
-        main,
+    let functions = collect_functions(&file, &layouts, text_len)?;
+    if functions.is_empty() {
+        return Err(error("object has no function symbols"));
+    }
+
+    Ok(LinkedImage {
+        image,
+        text_len,
+        data_offset: text_len,
+        entry,
+        functions,
+        imports,
+        base_fixups,
     })
 }
 
@@ -110,14 +154,14 @@ fn collect_sections(file: &ElfFile64<'_>, page: usize) -> Result<Vec<SectionInfo
     for section in file.sections() {
         let flags = match section.flags() {
             SectionFlags::Elf { sh_flags } => sh_flags,
-            _ => return Err(error("JIT loader requires ELF sections")),
+            _ => return Err(error("loader requires ELF sections")),
         };
         if flags & u64::from(SHF_ALLOC) == 0 {
             continue;
         }
         if flags & u64::from(SHF_TLS) != 0 {
             return Err(error(format!(
-                "TLS section {:?} is not supported by the JIT loader",
+                "TLS section {:?} is not supported",
                 section.name().unwrap_or("<unnamed>")
             )));
         }
@@ -186,9 +230,35 @@ fn collect_veneers(file: &ElfFile64<'_>, infos: &[SectionInfo]) -> Result<Vec<Sy
     Ok(required)
 }
 
+fn collect_got_symbols(
+    file: &ElfFile64<'_>,
+    infos: &[SectionInfo],
+) -> Result<Vec<SymbolIndex>, Error> {
+    let mut required = HashSet::new();
+    for info in infos {
+        let section = file
+            .section_by_index(info.index)
+            .map_err(|e| error(format!("failed to read section: {e}")))?;
+        for (_, relocation) in section.relocations() {
+            if relocation.kind() != RelocationKind::GotRelative {
+                continue;
+            }
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                continue;
+            };
+            required.insert(index);
+        }
+    }
+
+    let mut required: Vec<_> = required.into_iter().collect();
+    required.sort_by_key(|index| index.0);
+    Ok(required)
+}
+
 fn layout<A: Arch>(
     infos: &[SectionInfo],
     veneers: &[SymbolIndex],
+    got_symbols: &[SymbolIndex],
     page: usize,
 ) -> Result<ImageLayout, Error> {
     if !veneers.is_empty() && A::VENEER_SIZE == 0 {
@@ -204,7 +274,7 @@ fn layout<A: Arch>(
     other.sort_by_key(|info| (info.writable, info.index.0));
 
     if executable.is_empty() {
-        return Err(error("JIT object has no executable section"));
+        return Err(error("object has no executable section"));
     }
 
     let mut layouts = HashMap::new();
@@ -221,7 +291,7 @@ fn layout<A: Arch>(
         );
         cursor = cursor
             .checked_add(info.size)
-            .ok_or_else(|| error("JIT image layout overflow"))?;
+            .ok_or_else(|| error("image layout overflow"))?;
     }
 
     let mut veneer_offsets = HashMap::new();
@@ -230,11 +300,19 @@ fn layout<A: Arch>(
         veneer_offsets.insert(*index, veneer_cursor);
         veneer_cursor = veneer_cursor
             .checked_add(A::VENEER_SIZE)
-            .ok_or_else(|| error("JIT veneer layout overflow"))?;
+            .ok_or_else(|| error("veneer layout overflow"))?;
     }
 
     let text_len = page_align(veneer_cursor, page)?;
+    let mut got_offsets = HashMap::new();
     let mut cursor = text_len;
+    for index in got_symbols {
+        cursor = align_up(cursor, 8)?;
+        got_offsets.insert(*index, cursor);
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| error("GOT layout overflow"))?;
+    }
     for info in &other {
         cursor = align_up(cursor, info.align)?;
         layouts.insert(
@@ -247,35 +325,31 @@ fn layout<A: Arch>(
         );
         cursor = cursor
             .checked_add(info.size)
-            .ok_or_else(|| error("JIT image layout overflow"))?;
+            .ok_or_else(|| error("image layout overflow"))?;
     }
-    let total = page_align(cursor, page)?;
-    if total == 0 {
-        return Err(error("JIT image is empty"));
+    let total_len = page_align(cursor, page)?;
+    if total_len == 0 {
+        return Err(error("image is empty"));
     }
 
     Ok(ImageLayout {
         veneer_offsets,
+        got_offsets,
         sections: layouts,
         text_len,
-        total_len: total,
+        total_len,
     })
 }
 
-fn copy_sections<O: Os>(
+fn copy_sections(
     file: &ElfFile64<'_>,
     infos: &[SectionInfo],
     layouts: &HashMap<SectionIndex, SectionLayout>,
-    memory: &O::Memory,
+    image: &mut [u8],
 ) -> Result<(), Error> {
-    let base = memory.base();
     for info in infos {
         let layout = layouts[&info.index];
-        let destination = unsafe { base.add(layout.offset) };
         if info.nobits {
-            unsafe {
-                std::ptr::write_bytes(destination, 0, layout.size);
-            }
             continue;
         }
 
@@ -293,9 +367,7 @@ fn copy_sections<O: Os>(
                 layout.size
             )));
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
-        }
+        image[layout.offset..layout.offset + layout.size].copy_from_slice(data);
     }
     Ok(())
 }
@@ -303,7 +375,6 @@ fn copy_sections<O: Os>(
 fn collect_symbols(
     file: &ElfFile64<'_>,
     layouts: &HashMap<SectionIndex, SectionLayout>,
-    base_address: usize,
 ) -> Result<HashMap<SymbolIndex, SymbolValue>, Error> {
     let mut symbols = HashMap::new();
     for symbol in file.symbols() {
@@ -322,13 +393,11 @@ fn collect_symbols(
                 }
                 symbols.insert(
                     symbol.index(),
-                    SymbolValue::Address(base_address + layout.offset + address),
+                    SymbolValue::ImageOffset(layout.offset + address),
                 );
             }
             SymbolSection::Absolute => {
-                let address = usize::try_from(symbol.address())
-                    .map_err(|_| error("absolute symbol address does not fit in usize"))?;
-                symbols.insert(symbol.index(), SymbolValue::Address(address));
+                symbols.insert(symbol.index(), SymbolValue::Absolute(symbol.address()));
             }
             SymbolSection::Undefined => {
                 let Ok(name) = symbol.name() else {
@@ -362,18 +431,17 @@ fn find_main(
         if !layout.executable {
             return Err(error("main is not in an executable section"));
         }
-        if let Some(SymbolValue::Address(address)) = symbols.get(&symbol.index()) {
+        if let Some(SymbolValue::ImageOffset(address)) = symbols.get(&symbol.index()) {
             return Ok(*address);
         }
     }
-    Err(error("JIT object has no defined main symbol"))
+    Err(error("object has no defined main symbol"))
 }
 
-fn write_veneers<A: Arch, O: Os>(
-    memory: &O::Memory,
-    veneer_offsets: &HashMap<SymbolIndex, usize>,
+fn append_veneer_imports(
     symbols: &HashMap<SymbolIndex, SymbolValue>,
-    external_cache: &mut HashMap<String, usize>,
+    veneer_offsets: &HashMap<SymbolIndex, usize>,
+    imports: &mut Vec<ImportFixup>,
 ) -> Result<(), Error> {
     let mut offsets: Vec<_> = veneer_offsets.iter().collect();
     offsets.sort_by_key(|(index, _)| index.0);
@@ -381,40 +449,102 @@ fn write_veneers<A: Arch, O: Os>(
         let Some(SymbolValue::External(name)) = symbols.get(index) else {
             return Err(error("veneers can only target external symbols"));
         };
-        let address = resolve_external::<O>(name, external_cache)?;
-        A::write_veneer(memory.base(), *offset, address);
+        imports.push(ImportFixup {
+            name: name.clone(),
+            offset: u32::try_from(*offset)
+                .map_err(|_| error("veneer offset does not fit in 32 bits"))?,
+            addend: 0,
+            size: 0,
+            encoding: RelocationEncoding::Generic,
+            veneer: true,
+        });
     }
     Ok(())
 }
 
-fn apply_relocations<A: Arch, O: Os>(
+fn fill_got<A: Arch>(
+    symbols: &HashMap<SymbolIndex, SymbolValue>,
+    got_offsets: &HashMap<SymbolIndex, usize>,
+    image: &mut [u8],
+    imports: &mut Vec<ImportFixup>,
+    base_fixups: &mut Vec<BaseFixup>,
+) -> Result<(), Error> {
+    let mut slots: Vec<_> = got_offsets.iter().collect();
+    slots.sort_by_key(|(index, _)| index.0);
+    for (index, offset) in slots {
+        match symbols.get(index) {
+            Some(SymbolValue::ImageOffset(value)) => {
+                A::write_absolute(
+                    image.as_mut_ptr(),
+                    *offset,
+                    *value as u64,
+                    64,
+                    RelocationEncoding::Generic,
+                )?;
+                base_fixups.push(BaseFixup {
+                    offset: u32::try_from(*offset)
+                        .map_err(|_| error("GOT offset does not fit in 32 bits"))?,
+                    size: 64,
+                    encoding: RelocationEncoding::Generic,
+                });
+            }
+            Some(SymbolValue::Absolute(value)) => {
+                A::write_absolute(
+                    image.as_mut_ptr(),
+                    *offset,
+                    *value,
+                    64,
+                    RelocationEncoding::Generic,
+                )?;
+            }
+            Some(SymbolValue::External(name)) => {
+                imports.push(ImportFixup {
+                    name: name.clone(),
+                    offset: u32::try_from(*offset)
+                        .map_err(|_| error("GOT offset does not fit in 32 bits"))?,
+                    addend: 0,
+                    size: 64,
+                    encoding: RelocationEncoding::Generic,
+                    veneer: false,
+                });
+            }
+            None => {
+                return Err(error(format!("GOT entry targets unknown symbol {index}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_relocations<A: Arch>(
     file: &ElfFile64<'_>,
     infos: &[SectionInfo],
     layouts: &HashMap<SectionIndex, SectionLayout>,
     symbols: &HashMap<SymbolIndex, SymbolValue>,
     veneer_offsets: &HashMap<SymbolIndex, usize>,
-    memory: &O::Memory,
-    external_cache: &mut HashMap<String, usize>,
+    got_offsets: &HashMap<SymbolIndex, usize>,
+    image: &mut [u8],
+    imports: &mut Vec<ImportFixup>,
+    base_fixups: &mut Vec<BaseFixup>,
 ) -> Result<(), Error> {
-    let base = memory.base();
-    let base_address = base as usize;
-
     for info in infos {
         let layout = layouts[&info.index];
         let section = file
             .section_by_index(info.index)
             .map_err(|e| error(format!("failed to read section: {e}")))?;
         for (offset, relocation) in section.relocations() {
-            apply_relocation::<A, O>(
+            apply_relocation::<A>(
                 &layout,
                 offset,
                 &relocation,
                 layouts,
                 symbols,
                 veneer_offsets,
-                base,
-                base_address,
-                external_cache,
+                got_offsets,
+                image,
+                imports,
+                base_fixups,
             )?;
         }
     }
@@ -422,16 +552,17 @@ fn apply_relocations<A: Arch, O: Os>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_relocation<A: Arch, O: Os>(
+fn apply_relocation<A: Arch>(
     layout: &SectionLayout,
     offset: u64,
     relocation: &Relocation,
     layouts: &HashMap<SectionIndex, SectionLayout>,
     symbols: &HashMap<SymbolIndex, SymbolValue>,
     veneer_offsets: &HashMap<SymbolIndex, usize>,
-    base: *mut u8,
-    base_address: usize,
-    external_cache: &mut HashMap<String, usize>,
+    got_offsets: &HashMap<SymbolIndex, usize>,
+    image: &mut [u8],
+    imports: &mut Vec<ImportFixup>,
+    base_fixups: &mut Vec<BaseFixup>,
 ) -> Result<(), Error> {
     if relocation.subtractor().is_some() {
         return Err(error("symbol-subtracting relocations are not supported"));
@@ -454,59 +585,101 @@ fn apply_relocation<A: Arch, O: Os>(
         .offset
         .checked_add(offset)
         .ok_or_else(|| error("relocation place overflow"))?;
-    let p = base_address
-        .checked_add(place)
-        .ok_or_else(|| error("relocation address overflow"))?;
 
-    let (mut target, external_symbol) = match relocation.target() {
-        RelocationTarget::Symbol(index) => match symbols.get(&index) {
-            Some(SymbolValue::Address(address)) => (*address, None),
-            Some(SymbolValue::External(name)) => {
-                let address = resolve_external::<O>(name, external_cache)?;
-                (address, Some(index))
-            }
-            None => {
-                return Err(error(format!("relocation targets unknown symbol {index}")));
-            }
-        },
-        RelocationTarget::Section(index) => {
-            let target = layouts
-                .get(&index)
-                .ok_or_else(|| error("relocation targets a non-loaded section"))?;
-            (base_address + target.offset, None)
-        }
-        RelocationTarget::Absolute => (0, None),
-        _ => return Err(error("unsupported relocation target")),
-    };
+    let kind = relocation.kind();
+    if kind == RelocationKind::None {
+        return Ok(());
+    }
 
-    match relocation.kind() {
-        RelocationKind::None => Ok(()),
+    let (target, external, base_relative) = resolve_target(&relocation.target(), layouts, symbols)?;
+    let addend = relocation.addend();
+
+    match kind {
         RelocationKind::Absolute => {
-            let value = (target as i128)
-                .checked_add(i128::from(relocation.addend()))
+            if let Some(name) = external {
+                imports.push(ImportFixup {
+                    name: name.to_string(),
+                    offset: u32::try_from(place)
+                        .map_err(|_| error("relocation place does not fit in 32 bits"))?,
+                    addend,
+                    size,
+                    encoding: relocation.encoding(),
+                    veneer: false,
+                });
+                return Ok(());
+            }
+            let value = target
+                .checked_add(i128::from(addend))
                 .and_then(|value| u64::try_from(value).ok())
                 .ok_or_else(|| error("absolute relocation value does not fit in 64 bits"))?;
-            A::write_absolute(base, place, value, size, relocation.encoding())
+            A::write_absolute(
+                image.as_mut_ptr(),
+                place,
+                value,
+                size,
+                relocation.encoding(),
+            )?;
+            if base_relative {
+                base_fixups.push(BaseFixup {
+                    offset: u32::try_from(place)
+                        .map_err(|_| error("relocation place does not fit in 32 bits"))?,
+                    size,
+                    encoding: relocation.encoding(),
+                });
+            }
+            Ok(())
         }
         RelocationKind::Relative | RelocationKind::PltRelative => {
-            if let Some(index) = external_symbol {
-                if relocation.kind() == RelocationKind::PltRelative {
-                    let veneer = veneer_offsets
-                        .get(&index)
-                        .ok_or_else(|| error("external PC-relative relocation has no veneer"))?;
-                    target = base_address + veneer;
+            let mut target = target;
+            if let Some(name) = external {
+                if kind == RelocationKind::PltRelative {
+                    let RelocationTarget::Symbol(index) = relocation.target() else {
+                        unreachable!();
+                    };
+                    let veneer = veneer_offsets.get(&index).ok_or_else(|| {
+                        error(format!(
+                            "external PC-relative relocation to '{name}' has no veneer"
+                        ))
+                    })?;
+                    target = *veneer as i128;
                 } else {
                     return Err(error(
                         "external non-branch PC-relative relocations are not supported",
                     ));
                 }
             }
-            let value = (target as i128)
-                .checked_sub(p as i128)
-                .and_then(|value| value.checked_add(i128::from(relocation.addend())))
+            let value = target
+                .checked_sub(place as i128)
+                .and_then(|value| value.checked_add(i128::from(addend)))
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| error("PC-relative relocation value does not fit in 64 bits"))?;
-            A::write_pcrel(base, place, value, size, relocation.encoding())
+            A::write_pcrel(
+                image.as_mut_ptr(),
+                place,
+                value,
+                size,
+                relocation.encoding(),
+            )
+        }
+        RelocationKind::GotRelative => {
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                return Err(error("GOT relocation does not target a symbol"));
+            };
+            let slot = got_offsets
+                .get(&index)
+                .ok_or_else(|| error("GOT relocation has no slot"))?;
+            let value = (*slot as i128)
+                .checked_sub(place as i128)
+                .and_then(|value| value.checked_add(i128::from(addend)))
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| error("GOT-relative relocation value does not fit in 64 bits"))?;
+            A::write_pcrel(
+                image.as_mut_ptr(),
+                place,
+                value,
+                size,
+                relocation.encoding(),
+            )
         }
         kind => Err(error(format!(
             "unsupported {0} relocation {kind:?}",
@@ -515,21 +688,85 @@ fn apply_relocation<A: Arch, O: Os>(
     }
 }
 
-fn resolve_external<O: Os>(name: &str, cache: &mut HashMap<String, usize>) -> Result<usize, Error> {
-    if let Some(address) = cache.get(name) {
-        return Ok(*address);
+fn resolve_target<'a>(
+    target: &RelocationTarget,
+    layouts: &HashMap<SectionIndex, SectionLayout>,
+    symbols: &'a HashMap<SymbolIndex, SymbolValue>,
+) -> Result<(i128, Option<&'a str>, bool), Error> {
+    match target {
+        RelocationTarget::Symbol(index) => match symbols.get(index) {
+            Some(SymbolValue::ImageOffset(value)) => Ok((*value as i128, None, true)),
+            Some(SymbolValue::Absolute(value)) => Ok((*value as i128, None, false)),
+            Some(SymbolValue::External(name)) => Ok((0, Some(name.as_str()), false)),
+            None => Err(error(format!("relocation targets unknown symbol {index}"))),
+        },
+        RelocationTarget::Section(index) => {
+            let target = layouts
+                .get(index)
+                .ok_or_else(|| error("relocation targets a non-loaded section"))?;
+            Ok((target.offset as i128, None, true))
+        }
+        RelocationTarget::Absolute => Ok((0, None, false)),
+        _ => Err(error("unsupported relocation target")),
     }
-    let address =
-        O::lookup(name).ok_or_else(|| error(format!("unresolved external symbol '{name}'")))?;
-    cache.insert(name.to_string(), address);
-    Ok(address)
+}
+
+fn collect_functions(
+    file: &ElfFile64<'_>,
+    layouts: &HashMap<SectionIndex, SectionLayout>,
+    text_len: usize,
+) -> Result<Vec<LinkedFunction>, Error> {
+    let mut functions = Vec::new();
+    for symbol in file.symbols() {
+        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let Some(layout) = layouts.get(&section_index) else {
+            continue;
+        };
+        if !layout.executable {
+            continue;
+        }
+        let address = usize::try_from(symbol.address())
+            .map_err(|_| error("function address does not fit in usize"))?;
+        let length = usize::try_from(symbol.size())
+            .map_err(|_| error("function size does not fit in usize"))?;
+        let start = layout
+            .offset
+            .checked_add(address)
+            .ok_or_else(|| error("function start overflow"))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| error("function end overflow"))?;
+        if end > text_len || end > layout.offset + layout.size {
+            return Err(error(format!(
+                "function {name:?} extends outside the text section"
+            )));
+        }
+        functions.push(LinkedFunction {
+            name: name.to_string(),
+            start: u32::try_from(start).map_err(|_| error("function offset overflow"))?,
+            length: u32::try_from(length).map_err(|_| error("function size overflow"))?,
+        });
+    }
+    functions.sort_by_key(|function| (function.start, function.name.clone()));
+    Ok(functions)
 }
 
 fn align_up(value: usize, align: usize) -> Result<usize, Error> {
     value
         .checked_add(align - 1)
         .map(|value| value & !(align - 1))
-        .ok_or_else(|| error("JIT image alignment overflow"))
+        .ok_or_else(|| error("image alignment overflow"))
 }
 
 fn page_align(value: usize, page: usize) -> Result<usize, Error> {
@@ -537,5 +774,5 @@ fn page_align(value: usize, page: usize) -> Result<usize, Error> {
 }
 
 fn error(message: impl Into<String>) -> Error {
-    Error::Jit(message.into())
+    Error::Loader(message.into())
 }

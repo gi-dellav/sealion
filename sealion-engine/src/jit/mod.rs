@@ -1,23 +1,40 @@
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::str::FromStr;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use target_lexicon::Triple;
 
-use crate::{CompileOptions, Error, IrFunction};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::CompileOptions;
+use crate::{Error, IrFunction};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod arch;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod artifact;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod loader;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod os;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use artifact::{
+    ARTIFACT_FORMAT_VERSION, BaseFixupRecord, EngineMetadata, FuncKey, FunctionInfo, FunctionLoc,
+    ImportRecord, METADATA_SCHEMA_VERSION, Module, ModuleInfo,
+};
+
 pub struct JitProgram {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    image: loader::LoadedImage<os::LinuxMemory>,
+    module: artifact::Module,
     functions: Vec<IrFunction>,
 }
 
 impl JitProgram {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn from_parts(module: artifact::Module, functions: Vec<IrFunction>) -> Self {
+        Self { module, functions }
+    }
+
     pub fn clif(&self) -> String {
         let mut out = String::new();
         for function in &self.functions {
@@ -34,12 +51,29 @@ impl JitProgram {
         &self.functions
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn module(&self) -> &artifact::Module {
+        &self.module
+    }
+
+    /// The artifact bytes that produced this program.
+    pub fn serialize(&self) -> Result<Vec<u8>, Error> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.module.serialize()
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            Err(Error::Unsupported(
+                "JIT is only supported on Linux x86-64".to_string(),
+            ))
+        }
+    }
+
     pub fn run(&self) -> i32 {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let main: unsafe extern "C" fn(i32, i64) -> i32 =
-                unsafe { std::mem::transmute(self.image.main()) };
-            unsafe { main(0, 0) }
+            self.module.run()
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
@@ -52,6 +86,7 @@ pub(crate) fn supported() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn check_target(options: &CompileOptions) -> Result<(), Error> {
     let host = Triple::host();
     let requested = match &options.target {
@@ -68,7 +103,7 @@ pub(crate) fn check_target(options: &CompileOptions) -> Result<(), Error> {
         && requested.pointer_width().ok() == host.pointer_width().ok();
 
     if !compatible {
-        return Err(Error::Jit(format!(
+        return Err(Error::Loader(format!(
             "in-process JIT cannot cross-compile: requested {requested}, host {host}"
         )));
     }
@@ -76,17 +111,17 @@ pub(crate) fn check_target(options: &CompileOptions) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn load(object: &[u8], functions: Vec<IrFunction>) -> Result<JitProgram, Error> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        let image = loader::load::<arch::X86_64, os::Linux>(object)?;
-        Ok(JitProgram { image, functions })
-    }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    {
-        let _ = (object, functions);
-        Err(Error::Unsupported(
-            "JIT is only supported on Linux x86-64".to_string(),
-        ))
-    }
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn load(artifact: &[u8]) -> Result<Module, Error> {
+    artifact::load(artifact)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn build(
+    object: &[u8],
+    options: &CompileOptions,
+    target: &Triple,
+    source_checksum: u64,
+) -> Result<Vec<u8>, Error> {
+    artifact::build(object, options, target, source_checksum)
 }

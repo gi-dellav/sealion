@@ -16,9 +16,14 @@
 //! lowered.
 //!
 //! With the `jit` feature on Linux x86-64, `Engine::compile_jit` compiles the
-//! same object image and publishes it in process as a `JitProgram`. Cranelift
-//! traps such as temporal-dead-zone violations abort the process; trap recovery
-//! is not implemented. The AOT object and executable APIs are unchanged.
+//! same object image and publishes it in process as a `JitProgram`.
+//! `Engine::precompile_module` produces a self-contained ELF artifact with
+//! resolved internal relocations and runtime metadata; it can be persisted and
+//! loaded later with `Engine::deserialize`, `Engine::deserialize_file` or
+//! `Engine::deserialize_raw`, or serialized from an already-compiled module
+//! with `IrModule::serialize`. Cranelift traps such as temporal-dead-zone
+//! violations abort the process; trap recovery is not implemented. The AOT
+//! object and executable APIs are unchanged.
 //!
 //! The 0.6.0 subset supports functions (declarations, expressions, named
 //! expressions and arrow functions), closures, variables (`var`, `let` and
@@ -120,6 +125,11 @@ mod value;
 pub use error::Error;
 #[cfg(feature = "jit")]
 pub use jit::JitProgram;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub use jit::{
+    ARTIFACT_FORMAT_VERSION, BaseFixupRecord, EngineMetadata, FuncKey, FunctionInfo, FunctionLoc,
+    ImportRecord, METADATA_SCHEMA_VERSION, Module, ModuleInfo,
+};
 
 use std::{
     path::Path,
@@ -133,7 +143,9 @@ use cranelift_codegen::{
     isa,
     settings::{self, Configurable},
 };
-use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
+use cranelift_module::{
+    DataDescription, Linkage, Module as CraneliftModule, default_libcall_names,
+};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
@@ -254,22 +266,90 @@ impl Engine {
         self.compile_jit_with_options(source, &CompileOptions::default())
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn compile_jit_with_options(
         &self,
         source: &str,
         options: &CompileOptions,
     ) -> Result<JitProgram, Error> {
-        if !jit::supported() {
-            return Err(Error::Unsupported(
-                "JIT is only supported on Linux x86-64".to_string(),
-            ));
-        }
         jit::check_target(options)?;
         let mut ir = self.compile_with_options_internal(source, options, true)?;
-        let object = ir.emit_object()?;
+        let artifact = ir.serialize()?;
         let functions = ir.into_functions();
-        jit::load(&object, functions)
+        let module = jit::load(&artifact)?;
+        Ok(JitProgram::from_parts(module, functions))
+    }
+
+    #[cfg(all(feature = "jit", not(all(target_os = "linux", target_arch = "x86_64"))))]
+    pub fn compile_jit_with_options(
+        &self,
+        _source: &str,
+        _options: &CompileOptions,
+    ) -> Result<JitProgram, Error> {
+        Err(Error::Unsupported(
+            "JIT is only supported on Linux x86-64".to_string(),
+        ))
+    }
+
+    /// Compile `source` directly to a precompiled artifact.
+    ///
+    /// This is the build-pipeline entry point: it does not execute or publish
+    /// the module. The resulting bytes can be persisted and later loaded with
+    /// [`Engine::deserialize`], [`Engine::deserialize_file`] or
+    /// [`Engine::deserialize_raw`].
+    #[cfg(feature = "jit")]
+    pub fn precompile_module(&self, source: &str) -> Result<Vec<u8>, Error> {
+        self.precompile_module_with_options(source, &CompileOptions::default())
+    }
+
+    /// Compile `source` to a precompiled artifact with explicit options.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub fn precompile_module_with_options(
+        &self,
+        source: &str,
+        options: &CompileOptions,
+    ) -> Result<Vec<u8>, Error> {
+        jit::check_target(options)?;
+        let mut ir = self.compile_with_options_internal(source, options, true)?;
+        ir.serialize()
+    }
+
+    #[cfg(all(feature = "jit", not(all(target_os = "linux", target_arch = "x86_64"))))]
+    pub fn precompile_module_with_options(
+        &self,
+        _source: &str,
+        _options: &CompileOptions,
+    ) -> Result<Vec<u8>, Error> {
+        Err(Error::Unsupported(
+            "precompilation is only supported on Linux x86-64".to_string(),
+        ))
+    }
+
+    /// Hash the settings that make two engines artifact-compatible.
+    ///
+    /// This is a cheaper check than loading an artifact. It covers the target,
+    /// ABI-affecting compiler settings, the feature bits required by the image,
+    /// and the engine version.
+    #[cfg(feature = "jit")]
+    pub fn precompile_compatibility_hash(&self, options: &CompileOptions) -> u64 {
+        let mut hash = FNV_OFFSET;
+        let target = options
+            .target
+            .clone()
+            .unwrap_or_else(|| Triple::host().to_string());
+        fnv1a(&mut hash, target.as_bytes());
+        fnv1a(&mut hash, options.opt_level.as_str().as_bytes());
+        fnv1a(
+            &mut hash,
+            options.target_cpu.as_deref().unwrap_or("").as_bytes(),
+        );
+        fnv1a(&mut hash, &[options.is_pic as u8]);
+        fnv1a(&mut hash, &[options.unwind_info as u8]);
+        fnv1a(&mut hash, &[options.preserve_frame_pointers as u8]);
+        fnv1a(&mut hash, &[options.enable_alias_analysis as u8]);
+        fnv1a(&mut hash, &[options.enable_verifier as u8]);
+        fnv1a(&mut hash, env!("CARGO_PKG_VERSION").as_bytes());
+        hash
     }
 
     fn compile_with_options_internal(
@@ -331,12 +411,13 @@ impl Engine {
 
         let program = build_program_plan(&program)?;
 
-        let triple = match &options.target {
+        let target = match &options.target {
             Some(target) => Triple::from_str(target)
                 .map_err(|e| Error::Codegen(format!("invalid target triple '{target}': {e}")))?,
             None => Triple::host(),
         };
-        let mut isa_builder = isa::lookup(triple).map_err(|e| Error::Codegen(e.to_string()))?;
+        let mut isa_builder =
+            isa::lookup(target.clone()).map_err(|e| Error::Codegen(e.to_string()))?;
         let mut flag_builder = settings::builder();
         set_flag(&mut flag_builder, "is_pic", options.is_pic)?;
         set_flag(&mut flag_builder, "opt_level", options.opt_level.as_str())?;
@@ -418,6 +499,9 @@ impl Engine {
             functions,
             module: Some(module),
             is_pic: options.is_pic,
+            options: options.clone(),
+            target,
+            source_checksum: source_checksum(source),
         })
     }
 }
@@ -427,10 +511,17 @@ pub struct IrFunction {
     pub function: Function,
 }
 
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 pub struct IrModule {
     functions: Vec<IrFunction>,
     module: Option<ObjectModule>,
     is_pic: bool,
+    options: CompileOptions,
+    target: Triple,
+    source_checksum: u64,
 }
 
 impl IrModule {
@@ -450,9 +541,26 @@ impl IrModule {
         out
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn into_functions(self) -> Vec<IrFunction> {
         self.functions
+    }
+
+    /// Serialize this compiled module as a self-contained artifact.
+    ///
+    /// The image is pre-linked and its internal relocations are resolved, so
+    /// loading it does not need a compiler or a linker.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub fn serialize(&mut self) -> Result<Vec<u8>, Error> {
+        let object = self.emit_object()?;
+        jit::build(&object, &self.options, &self.target, self.source_checksum)
+    }
+
+    #[cfg(all(feature = "jit", not(all(target_os = "linux", target_arch = "x86_64"))))]
+    pub fn serialize(&mut self) -> Result<Vec<u8>, Error> {
+        Err(Error::Unsupported(
+            "artifact serialization is only supported on Linux x86-64".to_string(),
+        ))
     }
 
     pub fn emit_object(&mut self) -> Result<Vec<u8>, Error> {
@@ -496,6 +604,22 @@ impl IrModule {
 #[cfg(feature = "jit")]
 pub fn jit_supported() -> bool {
     jit::supported()
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn source_checksum(source: &str) -> u64 {
+    let mut hash = FNV_OFFSET;
+    fnv1a(&mut hash, source.as_bytes());
+    hash
 }
 
 pub fn compile(source: &str) -> Result<IrModule, Error> {

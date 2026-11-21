@@ -13,7 +13,8 @@ use sealion_engine::{CompileOptions, Engine, OptLevel};
 #[command(name = "sealionjs", version, about)]
 struct Cli {
     /// JavaScript or TypeScript source file to compile.
-    input: PathBuf,
+    #[arg(required_unless_present = "run_artifact")]
+    input: Option<PathBuf>,
 
     /// Write a native executable to this path instead of running it.
     #[arg(short, long, value_name = "PATH")]
@@ -22,6 +23,19 @@ struct Cli {
     /// Write a Cranelift object file to this path.
     #[arg(long, value_name = "PATH")]
     object: Option<PathBuf>,
+
+    /// Write a precompiled artifact to this path instead of running.
+    #[arg(long, value_name = "PATH", alias = "precompile", conflicts_with_all = ["output", "object"])]
+    artifact: Option<PathBuf>,
+
+    /// Load and run a precompiled artifact.
+    #[arg(
+        long,
+        value_name = "PATH",
+        alias = "load-artifact",
+        conflicts_with = "artifact"
+    )]
+    run_artifact: Option<PathBuf>,
 
     /// Print Cranelift IR to stdout.
     #[arg(long)]
@@ -107,10 +121,30 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    let source = fs::read_to_string(&cli.input)
-        .map_err(|e| format!("failed to read {}: {e}", cli.input.display()))?;
-
     let engine = Engine::new();
+
+    #[cfg(feature = "jit")]
+    if let Some(path) = &cli.run_artifact {
+        if cli.emit_ir || cli.object.is_some() || cli.output.is_some() {
+            return Err("--run-artifact cannot be combined with compile-only flags".to_string());
+        }
+        let module = engine
+            .deserialize_file(path)
+            .map_err(|e| format!("failed to load {}: {e}", path.display()))?;
+        return Ok(ExitCode::from((module.run() & 0xff) as u8));
+    }
+    #[cfg(not(feature = "jit"))]
+    if cli.run_artifact.is_some() {
+        return Err("--run-artifact requires the jit feature".to_string());
+    }
+
+    let input = cli
+        .input
+        .as_ref()
+        .ok_or_else(|| "missing input source file".to_string())?;
+    let source = fs::read_to_string(input)
+        .map_err(|e| format!("failed to read {}: {e}", input.display()))?;
+
     let options = CompileOptions {
         typescript: cli.ts,
         es2026: cli.es2026,
@@ -127,14 +161,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     if cli.emit_ir {
         let ir = engine
             .compile_with_options(&source, &options)
-            .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+            .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
         print!("{}", ir.clif());
+    }
+
+    #[cfg(feature = "jit")]
+    if let Some(artifact_path) = &cli.artifact {
+        let bytes = engine
+            .precompile_module_with_options(&source, &options)
+            .map_err(|e| format!("failed to precompile {}: {e}", input.display()))?;
+        fs::write(artifact_path, bytes)
+            .map_err(|e| format!("failed to write {}: {e}", artifact_path.display()))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    #[cfg(not(feature = "jit"))]
+    if cli.artifact.is_some() {
+        return Err("--artifact requires the jit feature".to_string());
     }
 
     if let Some(object_path) = &cli.object {
         let mut ir = engine
             .compile_with_options(&source, &options)
-            .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+            .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
         let object = ir
             .emit_object()
             .map_err(|e| format!("failed to emit object file: {e}"))?;
@@ -145,7 +193,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     if let Some(output_path) = &cli.output {
         let mut ir = engine
             .compile_with_options(&source, &options)
-            .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+            .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
         ir.emit_binary(output_path)
             .map_err(|e| format!("failed to emit binary: {e}"))?;
     }
@@ -159,13 +207,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         warn_ignored_jit_flags(&cli);
         let program = engine
             .compile_jit_with_options(&source, &options)
-            .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+            .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
         return Ok(ExitCode::from((program.run() & 0xff) as u8));
     }
 
     let mut ir = engine
         .compile_with_options(&source, &options)
-        .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+        .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
     let binary_path = temporary_executable_path();
     ir.emit_binary(&binary_path)
         .map_err(|e| format!("failed to emit binary: {e}"))?;

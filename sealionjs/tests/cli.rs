@@ -311,3 +311,27 @@ fn runs_in_process_jit_and_warns_on_ignored_flags() {
     assert!(stderr.contains("--no-pic is ignored"));
     assert!(stderr.contains("--no-unwind-info is ignored"));
 }
+
+#[cfg(feature = "jit")]
+#[test]
+fn writes_and_runs_precompiled_artifact() {
+    let input = write_source("function f(x) { return x * 2; } f(21);");
+    let artifact = temp_path("program.art");
+
+    let status = Command::new(bin())
+        .arg("--artifact")
+        .arg(&artifact)
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let run = Command::new(bin())
+        .arg("--run-artifact")
+        .arg(&artifact)
+        .status()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&artifact);
+    assert_eq!(run.code(), Some(42));
+}

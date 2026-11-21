@@ -1,12 +1,12 @@
 [package]
 name = "sealion-engine"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.98"
 
 [features]
 default = []
-jit = ["dep:object", "dep:libc"]
+jit = ["dep:object", "dep:libc", "dep:postcard", "dep:serde"]
 
 [dependencies]
 cranelift-codegen = { version = "0.132.3", features = ["x86", "arm64"] }
@@ -20,5 +20,7 @@ oxc_parser = "0.159.0"
 oxc_span = "0.159.0"
 oxc_transformer = "0.159.0"
 oxc_semantic = "0.159.0"
-object = { version = "0.39", optional = true, default-features = false, features = ["read_core", "elf", "std"] }
+object = { version = "0.39", optional = true, default-features = false, features = ["read_core", "write_core", "elf", "std"] }
 libc = { version = "0.2", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+postcard = { version = "1.1", optional = true }

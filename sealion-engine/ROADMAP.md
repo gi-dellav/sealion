@@ -56,6 +56,7 @@
 ## 0.7.0
 
 - [x] Optional in-process JIT on Linux x86-64 (`jit` Cargo feature)
+- [x] Precompiled artifacts: `Engine::precompile_module`, `IrModule::serialize`, `Engine::deserialize*`, and the `--artifact` / `--run-artifact` CLI flags
 - [ ] `StaticArray(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`); inside the engine, it's a static container of `number` values
 - [ ] `Array`, JS's `array` type, based on sealion's StaticArray; the compiler offers a `--array-length` to define the static length, by default 1024
 - [ ] `string`, which are based on sealion's StaticArray; the compiler offers a `--string-length` to define the static length, by default 1024
