@@ -4,6 +4,10 @@ version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 
+[features]
+default = []
+jit = ["sealion-engine/jit"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 sealion-engine = { path = "../sealion-engine" }

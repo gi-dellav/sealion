@@ -294,3 +294,20 @@ fn rejects_invalid_target_cpu() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("target CPU"));
 }
+
+#[cfg(feature = "jit")]
+#[test]
+fn runs_in_process_jit_and_warns_on_ignored_flags() {
+    let input = write_source("function f(a) { return a * 2; } f(21);");
+    let output = Command::new(bin())
+        .arg("--no-pic")
+        .arg("--no-unwind-info")
+        .arg(&input)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input);
+    assert_eq!(output.status.code(), Some(42));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--no-pic is ignored"));
+    assert!(stderr.contains("--no-unwind-info is ignored"));
+}

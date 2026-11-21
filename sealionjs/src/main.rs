@@ -154,6 +154,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    #[cfg(feature = "jit")]
+    if use_jit(&cli) {
+        warn_ignored_jit_flags(&cli);
+        let program = engine
+            .compile_jit_with_options(&source, &options)
+            .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
+        return Ok(ExitCode::from((program.run() & 0xff) as u8));
+    }
+
     let mut ir = engine
         .compile_with_options(&source, &options)
         .map_err(|e| format!("failed to compile {}: {e}", cli.input.display()))?;
@@ -168,6 +177,35 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::from(
         u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
     ))
+}
+
+#[cfg(feature = "jit")]
+fn use_jit(cli: &Cli) -> bool {
+    if !sealion_engine::jit_supported() {
+        return false;
+    }
+    if cli.emit_ir || cli.object.is_some() || cli.output.is_some() {
+        return false;
+    }
+    if cli.target.is_some() {
+        eprintln!("sealionjs: warning: explicit --target disables the in-process JIT; using AOT");
+        return false;
+    }
+    true
+}
+
+#[cfg(feature = "jit")]
+fn warn_ignored_jit_flags(cli: &Cli) {
+    if cli.no_pic {
+        eprintln!(
+            "sealionjs: warning: --no-pic is ignored by the in-process JIT; non-PIC code is always used"
+        );
+    }
+    if cli.no_unwind_info {
+        eprintln!(
+            "sealionjs: warning: --no-unwind-info is ignored by the in-process JIT; unwind information is not registered"
+        );
+    }
 }
 
 fn temporary_executable_path() -> PathBuf {

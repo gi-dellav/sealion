@@ -8,6 +8,8 @@ pub enum Error {
     Codegen(String),
     Io(std::io::Error),
     Linker(String),
+    #[cfg(feature = "jit")]
+    Jit(String),
 }
 
 impl fmt::Display for Error {
@@ -19,6 +21,8 @@ impl fmt::Display for Error {
             Self::Codegen(m) => write!(f, "codegen error: {m}"),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Linker(m) => write!(f, "linker error: {m}"),
+            #[cfg(feature = "jit")]
+            Self::Jit(m) => write!(f, "jit error: {m}"),
         }
     }
 }

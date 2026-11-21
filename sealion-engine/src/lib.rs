@@ -15,6 +15,11 @@
 //! transforms, and Cranelift code-generation settings before the AST is
 //! lowered.
 //!
+//! With the `jit` feature on Linux x86-64, `Engine::compile_jit` compiles the
+//! same object image and publishes it in process as a `JitProgram`. Cranelift
+//! traps such as temporal-dead-zone violations abort the process; trap recovery
+//! is not implemented. The AOT object and executable APIs are unchanged.
+//!
 //! The 0.6.0 subset supports functions (declarations, expressions, named
 //! expressions and arrow functions), closures, variables (`var`, `let` and
 //! `const`) with block scoping and a temporal dead zone, default parameters,
@@ -107,10 +112,14 @@
 mod builtins;
 mod compiler;
 mod error;
+#[cfg(feature = "jit")]
+mod jit;
 mod plan;
 mod value;
 
 pub use error::Error;
+#[cfg(feature = "jit")]
+pub use jit::JitProgram;
 
 use std::{
     path::Path,
@@ -237,6 +246,43 @@ impl Engine {
         source: &str,
         options: &CompileOptions,
     ) -> Result<IrModule, Error> {
+        self.compile_with_options_internal(source, options, false)
+    }
+
+    #[cfg(feature = "jit")]
+    pub fn compile_jit(&self, source: &str) -> Result<JitProgram, Error> {
+        self.compile_jit_with_options(source, &CompileOptions::default())
+    }
+
+    #[cfg(feature = "jit")]
+    pub fn compile_jit_with_options(
+        &self,
+        source: &str,
+        options: &CompileOptions,
+    ) -> Result<JitProgram, Error> {
+        if !jit::supported() {
+            return Err(Error::Unsupported(
+                "JIT is only supported on Linux x86-64".to_string(),
+            ));
+        }
+        jit::check_target(options)?;
+        let mut ir = self.compile_with_options_internal(source, options, true)?;
+        let object = ir.emit_object()?;
+        let functions = ir.into_functions();
+        jit::load(&object, functions)
+    }
+
+    fn compile_with_options_internal(
+        &self,
+        source: &str,
+        options: &CompileOptions,
+        force_non_pic: bool,
+    ) -> Result<IrModule, Error> {
+        let mut effective = options.clone();
+        if force_non_pic {
+            effective.is_pic = false;
+        }
+        let options = &effective;
         let allocator = Allocator::default();
         let source_type = if options.typescript {
             SourceType::ts()
@@ -404,6 +450,11 @@ impl IrModule {
         out
     }
 
+    #[cfg(feature = "jit")]
+    pub(crate) fn into_functions(self) -> Vec<IrFunction> {
+        self.functions
+    }
+
     pub fn emit_object(&mut self) -> Result<Vec<u8>, Error> {
         let module = self
             .module
@@ -440,6 +491,11 @@ impl IrModule {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "jit")]
+pub fn jit_supported() -> bool {
+    jit::supported()
 }
 
 pub fn compile(source: &str) -> Result<IrModule, Error> {

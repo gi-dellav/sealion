@@ -4,6 +4,10 @@ version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 
+[features]
+default = []
+jit = ["dep:object", "dep:libc"]
+
 [dependencies]
 cranelift-codegen = { version = "0.132.3", features = ["x86", "arm64"] }
 cranelift-frontend = "0.132.3"
@@ -16,3 +20,5 @@ oxc_parser = "0.159.0"
 oxc_span = "0.159.0"
 oxc_transformer = "0.159.0"
 oxc_semantic = "0.159.0"
+object = { version = "0.39", optional = true, default-features = false, features = ["read_core", "elf", "std"] }
+libc = { version = "0.2", optional = true }
