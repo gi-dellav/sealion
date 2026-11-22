@@ -1,11 +1,11 @@
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::FloatCC, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{
-    BinaryOperator, BindingPattern, BlockStatement, Expression, IfStatement, Statement,
-    TryStatement, UnaryOperator, VariableDeclaration, VariableDeclarationKind,
+    BindingPattern, BlockStatement, Expression, IfStatement, Statement, TryStatement,
+    UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
-use super::expr::compile_expr;
+use super::expr::{compile_compare, compile_expr};
 use super::flow::{
     break_target, continue_target, emit_pending_exception, emit_unwind, set_exception,
     take_exception,
@@ -13,7 +13,7 @@ use super::flow::{
 use super::loops::{
     compile_do_while, compile_for, compile_labelled, compile_switch, compile_while,
 };
-use super::numeric::{expr_is_number, number_value};
+use super::numeric::expr_is_number;
 use super::support::{enter_scope, node_scope, store_var};
 use super::{Cleanup, CodegenCtx, ExceptionTarget, Flow, StmtOutcome};
 use crate::{Error, plan::node_key, value};
@@ -197,23 +197,22 @@ pub(super) fn compile_condition<'a>(
             Ok(builder.ins().icmp_imm(IntCC::Equal, cond, 0))
         }
         Expression::BinaryExpression(binary) if binary.operator.is_compare() => {
-            let op = binary.operator;
             let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
             let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
-            let lhs = number_value(builder, lhs, expr_is_number(ctx, &binary.left));
-            let rhs = number_value(builder, rhs, expr_is_number(ctx, &binary.right));
-            let cc = match op {
-                BinaryOperator::GreaterThan => FloatCC::GreaterThan,
-                BinaryOperator::GreaterEqualThan => FloatCC::GreaterThanOrEqual,
-                BinaryOperator::LessThan => FloatCC::LessThan,
-                BinaryOperator::LessEqualThan => FloatCC::LessThanOrEqual,
-                _ => unreachable!(),
-            };
-            Ok(builder.ins().fcmp(cc, lhs, rhs))
+            let result = compile_compare(
+                builder,
+                ctx,
+                binary.operator,
+                lhs,
+                rhs,
+                expr_is_number(ctx, &binary.left),
+                expr_is_number(ctx, &binary.right),
+            )?;
+            Ok(value::truthy(builder, result, ctx.strings.as_ref()))
         }
         _ => {
             let value = compile_expr(builder, ctx, flow, expr)?;
-            Ok(value::truthy(builder, value))
+            Ok(value::truthy(builder, value, ctx.strings.as_ref()))
         }
     }
 }

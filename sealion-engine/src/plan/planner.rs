@@ -15,6 +15,8 @@ pub fn build_program_plan<'a>(
     let mut planner = Planner {
         functions: Vec::new(),
         scopes: Vec::new(),
+        strings: Vec::new(),
+        seen_strings: HashSet::new(),
     };
     planner.build_function_plan(
         None,
@@ -28,15 +30,24 @@ pub fn build_program_plan<'a>(
     Ok(Program {
         functions: planner.functions,
         scopes: planner.scopes,
+        strings: planner.strings,
     })
 }
 
 struct Planner<'a> {
     functions: Vec<FunctionPlan<'a>>,
     scopes: Vec<ScopePlan<'a>>,
+    strings: Vec<String>,
+    seen_strings: HashSet<String>,
 }
 
 impl<'a> Planner<'a> {
+    fn add_string(&mut self, text: String) {
+        if self.seen_strings.insert(text.clone()) {
+            self.strings.push(text);
+        }
+    }
+
     fn new_scope(&mut self, owner: usize, parent: Option<ScopeId>) -> ScopeId {
         let id = ScopeId(self.scopes.len());
         self.scopes.push(ScopePlan {
@@ -442,6 +453,17 @@ impl<'a> Planner<'a> {
         expr: &'a Expression<'a>,
     ) -> Result<(), Error> {
         match expr {
+            Expression::StringLiteral(lit) => self.add_string(lit.value.display().to_string()),
+            Expression::TemplateLiteral(template) => {
+                for quasi in &template.quasis {
+                    if let Some(cooked) = &quasi.value.cooked {
+                        self.add_string(cooked.display().to_string());
+                    }
+                }
+                for expression in &template.expressions {
+                    self.scan_expression(plan_id, scope, expression)?;
+                }
+            }
             Expression::FunctionExpression(func) => {
                 let body = func
                     .body

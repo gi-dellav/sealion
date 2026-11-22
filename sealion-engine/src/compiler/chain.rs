@@ -93,18 +93,22 @@ pub(super) fn compile_chain_static_member<'a>(
     result: Variable,
 ) -> Result<Value, Error> {
     if builtin_member(ctx, access).is_some() {
-        return compile_property_access(builder, ctx, access);
+        return compile_property_access(builder, ctx, flow, access);
     }
 
     let object = compile_chain_expr(builder, ctx, flow, &access.object, short, result)?;
-    if !access.optional {
-        return Ok(value::undefined(builder));
+    if access.optional {
+        let ok = builder.create_block();
+        let nullish = value::is_nullish(builder, object);
+        builder.ins().brif(nullish, short, &[], ok, &[]);
+        builder.switch_to_block(ok);
     }
-
-    let ok = builder.create_block();
-    let nullish = value::is_nullish(builder, object);
-    builder.ins().brif(nullish, short, &[], ok, &[]);
-    builder.switch_to_block(ok);
+    if access.property.name.as_str() == "length"
+        && let Some(ops) = ctx.strings.as_ref()
+    {
+        let call = builder.ins().call(ops.length, &[object]);
+        return Ok(builder.inst_results(call)[0]);
+    }
     Ok(value::undefined(builder))
 }
 

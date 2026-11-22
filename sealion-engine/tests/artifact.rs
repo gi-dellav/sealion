@@ -210,3 +210,13 @@ fn serializes_a_normally_compiled_module() {
     let loaded = engine.deserialize(&artifact).unwrap();
     assert_eq!(loaded.run(), 42);
 }
+
+#[test]
+fn string_helpers_survive_precompile_roundtrip() {
+    let engine = Engine::new();
+    let artifact = engine
+        .precompile_module(r#"var s = "hello"; s + "!" === "hello!" ? s.length : 0;"#)
+        .unwrap();
+    let module = engine.deserialize(&artifact).unwrap();
+    assert_eq!(module.run(), 5);
+}

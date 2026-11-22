@@ -84,6 +84,8 @@ pub struct FunctionPlan<'a> {
 pub struct Program<'a> {
     pub functions: Vec<FunctionPlan<'a>>,
     pub scopes: Vec<ScopePlan<'a>>,
+    /// Unique string literal contents, emitted as read-only data.
+    pub strings: Vec<String>,
 }
 
 impl<'a> Program<'a> {

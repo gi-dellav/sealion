@@ -142,7 +142,7 @@ pub(super) fn compile_for<'a>(
     flow: &mut Flow<'a>,
 ) -> Result<StmtOutcome, Error> {
     let parent_env = ctx.env;
-    let mut ctx = *ctx;
+    let mut ctx = ctx.clone();
     let mut fresh: Option<(usize, Value)> = None;
     let has_lexical_init = matches!(
         &for_stmt.init,
@@ -189,7 +189,7 @@ pub(super) fn compile_for<'a>(
     let header_ctx = if per_iteration {
         ctx.enter(ctx.scope, builder.use_var(env_var))
     } else {
-        ctx
+        ctx.clone()
     };
     match &for_stmt.test {
         Some(condition) => {
@@ -205,7 +205,7 @@ pub(super) fn compile_for<'a>(
     let body_ctx = if per_iteration {
         ctx.enter(ctx.scope, builder.use_var(env_var))
     } else {
-        ctx
+        ctx.clone()
     };
     flow.loops.push(LoopTarget {
         labels: labels.to_vec(),
@@ -227,7 +227,7 @@ pub(super) fn compile_for<'a>(
         builder.def_var(env_var, env);
         ctx.enter(ctx.scope, env)
     } else {
-        ctx
+        ctx.clone()
     };
     if let Some(update) = &for_stmt.update {
         compile_expr(builder, &step_ctx, flow, update)?;
@@ -274,8 +274,8 @@ pub(super) fn compile_switch<'a>(
         let is_last = n + 1 == tests.len();
         let matched_value = compile_expr(builder, &inner, flow, condition)?;
         let target = builder.use_var(value_var);
-        let equal = value::strict_equal(builder, target, matched_value);
-        let cond = value::truthy(builder, equal);
+        let equal = value::strict_equal(builder, target, matched_value, ctx.strings.as_ref());
+        let cond = value::truthy(builder, equal, inner.strings.as_ref());
         let next = if is_last {
             no_match
         } else {

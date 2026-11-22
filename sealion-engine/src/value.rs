@@ -12,6 +12,7 @@
 //! | `0x7FFB` | boolean        | `0` or `1`           |
 //! | `0x7FFC` | uninitialized  | —                    |
 //! | `0x7FFD` | function       | closure pointer      |
+//! | `0x7FFE` | string         | `JsString` pointer   |
 //!
 //! The uninitialized tag implements the temporal dead zone for `let`, `const`
 //! and parameters: loading such a slot traps until the declaration has run.
@@ -26,11 +27,30 @@ pub const TAG_NULL: u64 = 0x7FFA;
 pub const TAG_BOOLEAN: u64 = 0x7FFB;
 pub const TAG_UNINITIALIZED: u64 = 0x7FFC;
 pub const TAG_FUNCTION: u64 = 0x7FFD;
+pub const TAG_STRING: u64 = 0x7FFE;
 
 /// `2**32`, the modulus used by `ToInt32`/`ToUint32`.
 const TWO_POW_32: f64 = 4_294_967_296.0;
 
-const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+pub(crate) const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// Runtime entry points that implement string semantics.
+///
+/// The AOT backend leaves this unset and rejects string literals; the dynamic
+/// (JIT) backend fills it in from the engine's host helpers.
+#[derive(Clone, Copy)]
+pub struct StringOps {
+    pub from_utf8: FuncRef,
+    pub add: FuncRef,
+    pub strict_equal: FuncRef,
+    pub loose_equal: FuncRef,
+    pub same_value: FuncRef,
+    pub truthy: FuncRef,
+    pub to_number: FuncRef,
+    pub to_string: FuncRef,
+    pub compare: FuncRef,
+    pub length: FuncRef,
+}
 
 pub fn undefined(builder: &mut FunctionBuilder) -> Value {
     let bits = builder
@@ -64,7 +84,13 @@ pub fn function(builder: &mut FunctionBuilder, ptr: Value) -> Value {
     builder.ins().bitcast(types::F64, MemFlags::new(), bits)
 }
 
-/// Strips the tag, yielding the raw pointer bits of a closure value.
+pub fn string(builder: &mut FunctionBuilder, ptr: Value) -> Value {
+    let tag = builder.ins().iconst(types::I64, (TAG_STRING << 48) as i64);
+    let bits = builder.ins().bor(tag, ptr);
+    builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+}
+
+/// Strips the tag, yielding the raw pointer bits of a closure or string value.
 pub fn payload(builder: &mut FunctionBuilder, value: Value) -> Value {
     let bits = builder.ins().bitcast(types::I64, MemFlags::new(), value);
     builder.ins().band_imm(bits, PAYLOAD_MASK as i64)
@@ -82,7 +108,7 @@ fn tag_of(builder: &mut FunctionBuilder, value: Value) -> Value {
 pub fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
     let tag = tag_of(builder, value);
     let low = builder.ins().iconst(types::I64, TAG_UNDEFINED as i64);
-    let high = builder.ins().iconst(types::I64, TAG_FUNCTION as i64);
+    let high = builder.ins().iconst(types::I64, TAG_STRING as i64);
     let ge = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, tag, low);
@@ -115,6 +141,16 @@ fn is_boolean(builder: &mut FunctionBuilder, value: Value) -> Value {
     tag_is(builder, value, TAG_BOOLEAN)
 }
 
+fn call1(builder: &mut FunctionBuilder, func_ref: FuncRef, arg: Value) -> Value {
+    let call = builder.ins().call(func_ref, &[arg]);
+    builder.inst_results(call)[0]
+}
+
+fn call2(builder: &mut FunctionBuilder, func_ref: FuncRef, lhs: Value, rhs: Value) -> Value {
+    let call = builder.ins().call(func_ref, &[lhs, rhs]);
+    builder.inst_results(call)[0]
+}
+
 /// `true` when the value is a number that is `NaN`; tagged values are quiet
 /// NaNs too, so they have to be excluded explicitly.
 pub fn is_nan(builder: &mut FunctionBuilder, value: Value) -> Value {
@@ -141,10 +177,10 @@ pub fn from_bool(builder: &mut FunctionBuilder, value: Value) -> Value {
     builder.ins().bitcast(types::F64, MemFlags::new(), bits)
 }
 
-/// Truthiness: functions and tagged `true` are truthy, the other tagged values
-/// are not, and numbers keep the plain `!= 0` test (which is already false for
-/// NaNs).
-pub fn truthy(builder: &mut FunctionBuilder, value: Value) -> Value {
+/// Truthiness: functions, non-empty strings and tagged `true` are truthy, the
+/// other tagged values are not, and numbers keep the plain `!= 0` test (which
+/// is already false for NaNs).
+pub fn truthy(builder: &mut FunctionBuilder, value: Value, strings: Option<&StringOps>) -> Value {
     let tagged = is_tagged(builder, value);
     let tag = tag_of(builder, value);
     let fn_tag = builder.ins().iconst(types::I64, TAG_FUNCTION as i64);
@@ -154,15 +190,28 @@ pub fn truthy(builder: &mut FunctionBuilder, value: Value) -> Value {
     let low = builder.ins().band_imm(bits, 1);
     let bool_true = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
     let bool_truthy = builder.ins().band(is_bool, bool_true);
-    let tagged_truthy = builder.ins().bor(is_fn, bool_truthy);
+    let mut tagged_truthy = builder.ins().bor(is_fn, bool_truthy);
+    if let Some(ops) = strings {
+        let string_truthy = call1(builder, ops.truthy, value);
+        tagged_truthy = builder.ins().bor(tagged_truthy, string_truthy);
+    }
     let zero = builder.ins().f64const(0.0);
     let num = builder.ins().fcmp(FloatCC::OrderedNotEqual, value, zero);
     builder.ins().select(tagged, tagged_truthy, num)
 }
 
-/// `===` over the NaN-boxed encoding: bit equality when either side is tagged,
-/// numeric equality otherwise (`0 === -0` is true, `NaN === NaN` is false).
-pub fn strict_equal(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+/// `===` over the NaN-boxed encoding: string contents compare equal, bit
+/// equality applies when either side is tagged, and numeric equality otherwise
+/// (`0 === -0` is true, `NaN === NaN` is false).
+pub fn strict_equal(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+    strings: Option<&StringOps>,
+) -> Value {
+    if let Some(ops) = strings {
+        return call2(builder, ops.strict_equal, lhs, rhs);
+    }
     let lhs_bits = bits_of(builder, lhs);
     let rhs_bits = bits_of(builder, rhs);
     let bits_eq = builder.ins().icmp(IntCC::Equal, lhs_bits, rhs_bits);
@@ -195,11 +244,20 @@ fn boolean_to_number(builder: &mut FunctionBuilder, value: Value) -> Value {
 }
 
 /// `==` for the current value domain (numbers, booleans, `undefined`, `null`,
-/// functions): strict equality, `null == undefined`, and booleans compared as
-/// numbers. Strings and objects would need coercions that do not exist yet.
-pub fn loose_equal(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
-    let strict = strict_equal(builder, lhs, rhs);
-    let strict_true = truthy(builder, strict);
+/// functions and strings): strict equality, `null == undefined`, booleans
+/// compared as numbers, and strings converted to numbers when compared with a
+/// primitive of another type.
+pub fn loose_equal(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+    strings: Option<&StringOps>,
+) -> Value {
+    if let Some(ops) = strings {
+        return call2(builder, ops.loose_equal, lhs, rhs);
+    }
+    let strict = strict_equal(builder, lhs, rhs, None);
+    let strict_true = truthy(builder, strict, None);
     let lhs_nullish = is_nullish(builder, lhs);
     let rhs_nullish = is_nullish(builder, rhs);
     let both_nullish = builder.ins().band(lhs_nullish, rhs_nullish);
@@ -217,7 +275,15 @@ pub fn loose_equal(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Val
 }
 
 /// ECMAScript `SameValue`, used by `Object.is`.
-pub fn same_value(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+pub fn same_value(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+    strings: Option<&StringOps>,
+) -> Value {
+    if let Some(ops) = strings {
+        return call2(builder, ops.same_value, lhs, rhs);
+    }
     let lhs_bits = bits_of(builder, lhs);
     let rhs_bits = bits_of(builder, rhs);
     let bits_eq = builder.ins().icmp(IntCC::Equal, lhs_bits, rhs_bits);
@@ -229,8 +295,16 @@ pub fn same_value(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Valu
 }
 
 /// ECMAScript `ToNumber` for the current primitive domain: booleans become
-/// `1`/`0`, `null` becomes `0`, and `undefined` and functions become `NaN`.
-pub fn to_number(builder: &mut FunctionBuilder, value: Value) -> Value {
+/// `1`/`0`, `null` becomes `0`, strings parse as numbers, and `undefined` and
+/// functions become `NaN`.
+pub fn to_number(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    strings: Option<&StringOps>,
+) -> Value {
+    if let Some(ops) = strings {
+        return call1(builder, ops.to_number, value);
+    }
     let bits = bits_of(builder, value);
     let tagged = is_tagged(builder, value);
     let low = builder.ins().band_imm(bits, 1);
@@ -244,11 +318,46 @@ pub fn to_number(builder: &mut FunctionBuilder, value: Value) -> Value {
     builder.ins().select(tagged, tagged_number, value)
 }
 
+/// ECMAScript `ToString`, available only with the dynamic runtime.
+pub fn to_string(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    strings: Option<&StringOps>,
+) -> Option<Value> {
+    strings.map(|ops| call1(builder, ops.to_string, value))
+}
+
+/// The JavaScript `+` operator, including string concatenation.
+pub fn add(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+    strings: Option<&StringOps>,
+) -> Option<Value> {
+    strings.map(|ops| call2(builder, ops.add, lhs, rhs))
+}
+
+/// Abstract relational comparison: returns `-1`, `0`, `1`, or `i32::MIN` when
+/// the operands are unordered (`NaN`).
+pub fn compare(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+    strings: Option<&StringOps>,
+) -> Option<Value> {
+    strings.map(|ops| call2(builder, ops.compare, lhs, rhs))
+}
+
 /// ECMAScript `ToInt32`: `x` modulo `2**32`, truncated toward zero, reinterpreted
 /// as a two's-complement 32-bit integer. `fmod` yields `NaN` for `NaN`/`±Inf` and
 /// the saturating conversion maps `NaN` to `0`, exactly as the spec requires.
-pub fn to_int32(builder: &mut FunctionBuilder, fmod_ref: FuncRef, value: Value) -> Value {
-    let value = to_number(builder, value);
+pub fn to_int32(
+    builder: &mut FunctionBuilder,
+    fmod_ref: FuncRef,
+    value: Value,
+    strings: Option<&StringOps>,
+) -> Value {
+    let value = to_number(builder, value, strings);
     let modulus = builder.ins().f64const(TWO_POW_32);
     let call = builder.ins().call(fmod_ref, &[value, modulus]);
     let remainder = builder.inst_results(call)[0];

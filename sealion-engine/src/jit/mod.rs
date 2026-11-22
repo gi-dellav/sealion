@@ -16,6 +16,8 @@ mod artifact;
 mod loader;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod os;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod strings;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use artifact::{

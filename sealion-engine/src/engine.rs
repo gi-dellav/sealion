@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr};
+use std::{collections::HashMap, path::Path, str::FromStr};
 
 #[cfg(feature = "jit")]
 use std::sync::Arc;
@@ -79,7 +79,7 @@ impl Engine {
         source: &str,
         options: &CompileOptions,
     ) -> Result<IrModule, Error> {
-        self.compile_with_options_internal(source, options, false)
+        self.compile_with_options_internal(source, options, false, false)
     }
 
     #[cfg(feature = "jit")]
@@ -94,7 +94,7 @@ impl Engine {
         options: &CompileOptions,
     ) -> Result<JitProgram, Error> {
         jit::check_target(options)?;
-        let mut ir = self.compile_with_options_internal(source, options, true)?;
+        let mut ir = self.compile_with_options_internal(source, options, true, true)?;
         let artifact = ir.serialize()?;
         let functions = ir.into_functions();
         let module = jit::load(&artifact)?;
@@ -131,7 +131,7 @@ impl Engine {
         options: &CompileOptions,
     ) -> Result<Vec<u8>, Error> {
         jit::check_target(options)?;
-        let mut ir = self.compile_with_options_internal(source, options, true)?;
+        let mut ir = self.compile_with_options_internal(source, options, true, true)?;
         ir.serialize()
     }
 
@@ -178,6 +178,7 @@ impl Engine {
         source: &str,
         options: &CompileOptions,
         force_non_pic: bool,
+        dynamic: bool,
     ) -> Result<IrModule, Error> {
         let mut effective = options.clone();
         if force_non_pic {
@@ -272,6 +273,19 @@ impl Engine {
         let mut module = ObjectModule::new(obj_builder);
         let builtins = builtins::Builtins::new(&mut module)?;
 
+        let mut string_ids = HashMap::new();
+        if dynamic {
+            for (index, text) in program.strings.iter().enumerate() {
+                let name = format!("__string_{index}");
+                let id = module.declare_data(&name, Linkage::Local, true, false)?;
+                let mut data = DataDescription::new();
+                data.define(text.as_bytes().to_vec().into_boxed_slice());
+                data.set_align(1);
+                module.define_data(id, &data)?;
+                string_ids.insert(text.clone(), id);
+            }
+        }
+
         let js_sig = compiler::make_js_signature(&module);
         let calloc_sig = compiler::make_calloc_signature(&module);
         let f64_binary_sig = compiler::make_f64_binary_signature(&module);
@@ -307,6 +321,8 @@ impl Engine {
             &js_sig,
             &imports,
             &builtins,
+            &string_ids,
+            dynamic,
         )?;
         functions.push(compiler::compile_main(
             &mut module,
@@ -314,6 +330,8 @@ impl Engine {
             main_id,
             &main_sig,
             exception_id,
+            &builtins,
+            dynamic,
         )?);
 
         Ok(IrModule::new(

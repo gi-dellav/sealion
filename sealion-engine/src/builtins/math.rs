@@ -101,6 +101,7 @@ pub(super) fn min_or_max(
     args: &[Value],
     maximum: bool,
     known: &[bool],
+    strings: Option<&value::StringOps>,
 ) -> Value {
     let identity = if maximum {
         f64::NEG_INFINITY
@@ -112,14 +113,19 @@ pub(super) fn min_or_max(
         let arg = if known.get(index).copied().unwrap_or(false) {
             arg
         } else {
-            value::to_number(builder, arg)
+            value::to_number(builder, arg, strings)
         };
         acc = extremum(builder, acc, arg, maximum);
     }
     acc
 }
 
-pub(super) fn hypot(builder: &mut FunctionBuilder, args: &[Value], known: &[bool]) -> Value {
+pub(super) fn hypot(
+    builder: &mut FunctionBuilder,
+    args: &[Value],
+    known: &[bool],
+    strings: Option<&value::StringOps>,
+) -> Value {
     let mut scale = builder.ins().f64const(0.0);
     let mut sum = builder.ins().f64const(0.0);
     let mut has_nan = builder.ins().iconst(types::I8, 0);
@@ -133,7 +139,7 @@ pub(super) fn hypot(builder: &mut FunctionBuilder, args: &[Value], known: &[bool
         let x = if known.get(index).copied().unwrap_or(false) {
             arg
         } else {
-            value::to_number(builder, arg)
+            value::to_number(builder, arg, strings)
         };
         let abs = builder.ins().fabs(x);
         let x_nan = builder.ins().fcmp(FloatCC::Unordered, x, x);

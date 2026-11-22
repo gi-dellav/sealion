@@ -101,3 +101,54 @@ fn rejects_cross_compilation() {
         Err(error) => assert!(error.to_string().contains("cannot cross-compile")),
     }
 }
+
+#[test]
+fn strings_flow_through_the_dynamic_runtime() {
+    assert_eq!(run(r#""hello" === "hello" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""hello" === "world" ? 1 : 0;"#), 0);
+    assert_eq!(run(r#"var s = "abc"; s.length;"#), 3);
+    assert_eq!(run(r#""a" + "b" === "ab" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""n=" + 42 === "n=42" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""5" - 2;"#), 3);
+    assert_eq!(run(r#""10" < "9" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""10" < 9 ? 1 : 0;"#), 0);
+    assert_eq!(run(r#"Number("42") + 1;"#), 43);
+    assert_eq!(run(r#"String(123) === "123" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var r = 0; if ("") { r = 1; } else { r = 2; } r;"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var r = 0; if ("x") { r = 1; } else { r = 2; } r;"#),
+        1
+    );
+    assert_eq!(run(r#"Object.is("a", "a") ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var name = "world"; `hello ${name}` === "hello world" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn strings_capture_and_cross_calls() {
+    assert_eq!(
+        run(
+            r#"function make() { var s = "captured"; return function () { return s; }; } make()() === "captured" ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(r#"function id(s) { return s; } id("value") === "value" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn console_log_accepts_strings_and_other_values() {
+    assert_eq!(
+        run(
+            r#"var s = "world"; console.log("hello", s); console.log(42, true, null, undefined); 0;"#
+        ),
+        0
+    );
+}

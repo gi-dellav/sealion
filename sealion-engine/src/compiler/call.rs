@@ -77,6 +77,7 @@ pub(super) fn compile_builtin_call<'a>(
         name,
         &values,
         &known_numbers,
+        ctx.strings.as_ref(),
     )
 }
 
@@ -96,19 +97,27 @@ pub(super) fn builtin_callee(
     }
 }
 
-pub(super) fn compile_property_access(
+pub(super) fn compile_property_access<'a>(
     builder: &mut FunctionBuilder,
-    ctx: &CodegenCtx<'_>,
-    access: &StaticMemberExpression<'_>,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    access: &'a StaticMemberExpression<'a>,
 ) -> Result<Value, Error> {
     let constant = builtin_member(ctx, access)
         .and_then(|(namespace, name)| ctx.builtins.constant(namespace, name));
-    match constant {
-        Some(value) => Ok(builder.ins().f64const(value)),
-        None => Err(Error::Unsupported(
-            "only builtin constants can be read as properties".to_string(),
-        )),
+    if let Some(value) = constant {
+        return Ok(builder.ins().f64const(value));
     }
+    if access.property.name.as_str() == "length"
+        && let Some(ops) = ctx.strings.as_ref()
+    {
+        let object = compile_expr(builder, ctx, flow, &access.object)?;
+        let call = builder.ins().call(ops.length, &[object]);
+        return Ok(builder.inst_results(call)[0]);
+    }
+    Err(Error::Unsupported(
+        "only builtin constants and string length can be read as properties".to_string(),
+    ))
 }
 
 pub(super) fn compile_call<'a>(

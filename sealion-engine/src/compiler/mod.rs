@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use cranelift_codegen::ir::{
     Block, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature, UserFuncName, Value,
@@ -33,7 +36,7 @@ use numeric::analyze_numeric_bindings;
 use stmt::compile_statements;
 use support::{alloc_env, declare_vars, init_local_slots, init_slots, new_closure, store_var};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CodegenCtx<'a> {
     program: &'a Program<'a>,
     plan_id: usize,
@@ -49,6 +52,8 @@ struct CodegenCtx<'a> {
     vars: &'a HashMap<(ScopeId, usize), Variable>,
     numeric: &'a HashSet<(ScopeId, usize)>,
     exception: Value,
+    strings: Option<value::StringOps>,
+    string_literals: Rc<HashMap<String, (Value, i64)>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -69,8 +74,25 @@ impl<'a> CodegenCtx<'a> {
             vars: self.vars,
             numeric: self.numeric,
             exception: self.exception,
+            strings: self.strings,
+            string_literals: Rc::clone(&self.string_literals),
         }
     }
+}
+
+fn string_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::StringOps> {
+    Some(value::StringOps {
+        from_utf8: *refs.get("sealion_string_from_utf8")?,
+        add: *refs.get("sealion_string_add")?,
+        strict_equal: *refs.get("sealion_string_strict_equal")?,
+        loose_equal: *refs.get("sealion_string_loose_equal")?,
+        same_value: *refs.get("sealion_string_same_value")?,
+        truthy: *refs.get("sealion_string_truthy")?,
+        to_number: *refs.get("sealion_string_to_number")?,
+        to_string: *refs.get("sealion_string_to_string")?,
+        compare: *refs.get("sealion_string_compare")?,
+        length: *refs.get("sealion_string_length")?,
+    })
 }
 
 #[derive(Default)]
@@ -134,6 +156,7 @@ pub struct Imports {
     pub exception: DataId,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compile_functions<'a>(
     module: &mut ObjectModule,
     program: &'a Program<'a>,
@@ -141,6 +164,8 @@ pub fn compile_functions<'a>(
     js_sig: &Signature,
     imports: &Imports,
     builtins: &'a Builtins,
+    string_ids: &HashMap<String, DataId>,
+    dynamic: bool,
 ) -> Result<Vec<IrFunction>, Error> {
     let numeric = analyze_numeric_bindings(program, builtins);
     let mut raws = Vec::new();
@@ -160,6 +185,14 @@ pub fn compile_functions<'a>(
             child_refs.insert(child, child_ref);
         }
 
+        let string_data: Vec<(String, cranelift_codegen::ir::GlobalValue, i64)> = string_ids
+            .iter()
+            .map(|(text, &id)| {
+                let data = module.declare_data_in_func(id, &mut func);
+                (text.clone(), data, text.len() as i64)
+            })
+            .collect();
+
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
         let js_sig_ref = builder.import_signature(js_sig.clone());
@@ -172,6 +205,22 @@ pub fn compile_functions<'a>(
         let args_param = builder.block_params(entry)[1];
         let self_param = builder.block_params(entry)[2];
         let exception = builder.ins().global_value(types::I64, exception_global);
+        let string_literals: HashMap<String, (Value, i64)> = string_data
+            .into_iter()
+            .map(|(text, data, len)| {
+                let pointer = builder.ins().global_value(types::I64, data);
+                (text, (pointer, len))
+            })
+            .collect();
+        let string_literals = Rc::new(string_literals);
+        let strings = if dynamic {
+            Some(
+                string_ops(&builtin_refs)
+                    .ok_or_else(|| Error::Codegen("missing string runtime".to_string()))?,
+            )
+        } else {
+            None
+        };
         let root_scope = program.scope(plan.root_scope);
         let vars = declare_vars(&mut builder, program, plan.id);
         let env = if root_scope.has_env() {
@@ -198,6 +247,8 @@ pub fn compile_functions<'a>(
             vars: &vars,
             numeric: &numeric,
             exception,
+            strings,
+            string_literals,
         };
 
         let mut flow = Flow::new();
@@ -275,10 +326,22 @@ pub fn compile_main(
     main_id: FuncId,
     main_sig: &Signature,
     exception_id: DataId,
+    builtins: &Builtins,
+    dynamic: bool,
 ) -> Result<IrFunction, Error> {
     let mut func = Function::with_name_signature(UserFuncName::testcase("main"), main_sig.clone());
     let script_ref = module.declare_func_in_func(script_id, &mut func);
     let exception_global = module.declare_data_in_func(exception_id, &mut func);
+    let builtin_refs = if dynamic {
+        builtins.declare_in(module, &mut func)
+    } else {
+        HashMap::new()
+    };
+    let strings = if dynamic {
+        string_ops(&builtin_refs)
+    } else {
+        None
+    };
 
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
@@ -307,7 +370,7 @@ pub fn compile_main(
     builder.ins().return_(&[failure]);
 
     builder.switch_to_block(ok);
-    let result = value::to_number(&mut builder, result);
+    let result = value::to_number(&mut builder, result, strings.as_ref());
     let code = builder.ins().fcvt_to_sint_sat(types::I32, result);
     builder.ins().return_(&[code]);
 

@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use cranelift_codegen::ir::Value;
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{
-    AssignmentOperator, AssignmentTarget, BindingPattern, CallExpression, ChainElement, Expression,
-    ForStatementInit, Statement, StaticMemberExpression, UnaryOperator, VariableDeclaration,
-    VariableDeclarationKind,
+    AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, CallExpression,
+    ChainElement, Expression, ForStatementInit, Statement, StaticMemberExpression, UnaryOperator,
+    VariableDeclaration, VariableDeclarationKind,
 };
 
 use super::CodegenCtx;
@@ -85,7 +85,12 @@ pub(super) fn known_number_expr(
             None => builtins.global_constant(id.name.as_str()).is_some(),
         },
         Expression::BinaryExpression(binary) => {
-            binary.operator.is_arithmetic() || binary.operator.is_bitwise()
+            if binary.operator == BinaryOperator::Addition {
+                known_number_expr(program, builtins, numeric, scope, &binary.left)
+                    && known_number_expr(program, builtins, numeric, scope, &binary.right)
+            } else {
+                binary.operator.is_arithmetic() || binary.operator.is_bitwise()
+            }
         }
         Expression::UnaryExpression(unary) => matches!(
             unary.operator,
@@ -125,11 +130,16 @@ pub(super) fn binding_is_number(ctx: &CodegenCtx<'_>, name: &str) -> bool {
     resolve_binding(ctx.program, ctx.scope, name).is_some_and(|key| ctx.numeric.contains(&key))
 }
 
-pub(super) fn number_value(builder: &mut FunctionBuilder, value: Value, known: bool) -> Value {
+pub(super) fn number_value(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    known: bool,
+    strings: Option<&value::StringOps>,
+) -> Value {
     if known {
         value
     } else {
-        value::to_number(builder, value)
+        value::to_number(builder, value, strings)
     }
 }
 
@@ -145,6 +155,7 @@ pub(super) fn assignment_write_is_numeric(
 ) -> bool {
     match op {
         AssignmentOperator::Assign
+        | AssignmentOperator::Addition
         | AssignmentOperator::LogicalAnd
         | AssignmentOperator::LogicalOr
         | AssignmentOperator::LogicalNullish => {

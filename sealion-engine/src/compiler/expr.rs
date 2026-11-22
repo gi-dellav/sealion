@@ -47,6 +47,73 @@ pub(super) fn compile_default<'a>(
     Ok(builder.use_var(result_var))
 }
 
+fn compile_string_data(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    text: &str,
+) -> Result<Value, Error> {
+    let ops = ctx.strings.as_ref().ok_or_else(|| {
+        Error::Unsupported("string values require the dynamic runtime".to_string())
+    })?;
+    let (pointer, len) = *ctx
+        .string_literals
+        .get(text)
+        .ok_or_else(|| Error::Codegen("missing string literal data".to_string()))?;
+    let len = builder.ins().iconst(types::I64, len);
+    let call = builder.ins().call(ops.from_utf8, &[pointer, len]);
+    let raw = builder.inst_results(call)[0];
+    Ok(value::string(builder, raw))
+}
+
+fn compile_template<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    template: &'a oxc_ast::ast::TemplateLiteral<'a>,
+) -> Result<Value, Error> {
+    if template.expressions.is_empty() {
+        let text = template.quasis[0]
+            .value
+            .cooked
+            .as_ref()
+            .map(|value| value.display().to_string())
+            .unwrap_or_default();
+        return compile_string_data(builder, ctx, &text);
+    }
+
+    let first = template.quasis[0]
+        .value
+        .cooked
+        .as_ref()
+        .map(|value| value.display().to_string())
+        .unwrap_or_default();
+    let mut result = compile_string_data(builder, ctx, &first)?;
+    for (index, expression) in template.expressions.iter().enumerate() {
+        let expression = compile_expr(builder, ctx, flow, expression)?;
+        let expression =
+            value::to_string(builder, expression, ctx.strings.as_ref()).ok_or_else(|| {
+                Error::Unsupported("template literals require the dynamic runtime".to_string())
+            })?;
+        result =
+            value::add(builder, result, expression, ctx.strings.as_ref()).ok_or_else(|| {
+                Error::Unsupported("template literals require the dynamic runtime".to_string())
+            })?;
+        let quasi = template
+            .quasis
+            .get(index + 1)
+            .and_then(|quasi| quasi.value.cooked.as_ref())
+            .map(|value| value.display().to_string())
+            .unwrap_or_default();
+        if !quasi.is_empty() {
+            let quasi = compile_string_data(builder, ctx, &quasi)?;
+            result = value::add(builder, result, quasi, ctx.strings.as_ref()).ok_or_else(|| {
+                Error::Unsupported("template literals require the dynamic runtime".to_string())
+            })?;
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn compile_expr<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -57,11 +124,13 @@ pub(super) fn compile_expr<'a>(
         Expression::NumericLiteral(lit) => Ok(builder.ins().f64const(lit.value)),
         Expression::BooleanLiteral(lit) => Ok(value::boolean(builder, lit.value)),
         Expression::NullLiteral(_) => Ok(value::null(builder)),
-        Expression::StringLiteral(_)
-        | Expression::BigIntLiteral(_)
-        | Expression::RegExpLiteral(_)
-        | Expression::TemplateLiteral(_) => Err(Error::Unsupported(
-            "string and bigint literals are not supported".to_string(),
+        Expression::StringLiteral(lit) => {
+            let text = lit.value.display().to_string();
+            compile_string_data(builder, ctx, &text)
+        }
+        Expression::TemplateLiteral(template) => compile_template(builder, ctx, flow, template),
+        Expression::BigIntLiteral(_) | Expression::RegExpLiteral(_) => Err(Error::Unsupported(
+            "this literal is not supported".to_string(),
         )),
         Expression::Identifier(id) => {
             let name = id.name.as_str();
@@ -102,7 +171,9 @@ pub(super) fn compile_expr<'a>(
             compile_closure(builder, ctx, node_key(&**arrow))
         }
         Expression::ChainExpression(chain) => compile_chain(builder, ctx, flow, chain),
-        Expression::StaticMemberExpression(access) => compile_property_access(builder, ctx, access),
+        Expression::StaticMemberExpression(access) => {
+            compile_property_access(builder, ctx, flow, access)
+        }
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
@@ -133,6 +204,7 @@ pub(super) fn compile_binary<'a>(
     } else if op.is_equality() || op.is_compare() {
         compile_relational(
             builder,
+            ctx,
             op,
             lhs,
             rhs,
@@ -185,8 +257,8 @@ pub(super) fn compile_logical<'a>(
     op: LogicalOperator,
 ) -> Result<Value, Error> {
     let (cond, rhs_when_true) = match op {
-        LogicalOperator::And => (value::truthy(builder, lhs), true),
-        LogicalOperator::Or => (value::truthy(builder, lhs), false),
+        LogicalOperator::And => (value::truthy(builder, lhs, ctx.strings.as_ref()), true),
+        LogicalOperator::Or => (value::truthy(builder, lhs, ctx.strings.as_ref()), false),
         LogicalOperator::Coalesce => (value::is_nullish(builder, lhs), true),
     };
 
@@ -219,8 +291,14 @@ pub(super) fn compile_arithmetic(
     lhs_numeric: bool,
     rhs_numeric: bool,
 ) -> Result<Value, Error> {
-    let lhs = number_value(builder, lhs, lhs_numeric);
-    let rhs = number_value(builder, rhs, rhs_numeric);
+    if op == BinaryOperator::Addition
+        && !(lhs_numeric && rhs_numeric)
+        && let Some(value) = value::add(builder, lhs, rhs, ctx.strings.as_ref())
+    {
+        return Ok(value);
+    }
+    let lhs = number_value(builder, lhs, lhs_numeric, ctx.strings.as_ref());
+    let rhs = number_value(builder, rhs, rhs_numeric, ctx.strings.as_ref());
     let value = match op {
         BinaryOperator::Addition => builder.ins().fadd(lhs, rhs),
         BinaryOperator::Subtraction => builder.ins().fsub(lhs, rhs),
@@ -245,8 +323,8 @@ pub(super) fn compile_bitwise(
     lhs: Value,
     rhs: Value,
 ) -> Value {
-    let lhs = value::to_int32(builder, ctx.fmod_ref, lhs);
-    let rhs = value::to_int32(builder, ctx.fmod_ref, rhs);
+    let lhs = value::to_int32(builder, ctx.fmod_ref, lhs, ctx.strings.as_ref());
+    let rhs = value::to_int32(builder, ctx.fmod_ref, rhs, ctx.strings.as_ref());
 
     let result = match op {
         BinaryOperator::BitwiseAnd => builder.ins().band(lhs, rhs),
@@ -270,8 +348,50 @@ pub(super) fn compile_bitwise(
     value::from_int32(builder, result)
 }
 
+pub(super) fn compile_compare(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    op: BinaryOperator,
+    lhs: Value,
+    rhs: Value,
+    lhs_numeric: bool,
+    rhs_numeric: bool,
+) -> Result<Value, Error> {
+    if !(lhs_numeric && rhs_numeric)
+        && let Some(ordering) = value::compare(builder, lhs, rhs, ctx.strings.as_ref())
+    {
+        let unordered = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, ordering, i64::from(i32::MIN));
+        let cc = match op {
+            BinaryOperator::GreaterThan => IntCC::SignedGreaterThan,
+            BinaryOperator::GreaterEqualThan => IntCC::SignedGreaterThanOrEqual,
+            BinaryOperator::LessThan => IntCC::SignedLessThan,
+            BinaryOperator::LessEqualThan => IntCC::SignedLessThanOrEqual,
+            _ => unreachable!(),
+        };
+        let cond = builder.ins().icmp_imm(cc, ordering, 0);
+        let ordered = builder.ins().icmp_imm(IntCC::Equal, unordered, 0);
+        let cond = builder.ins().band(cond, ordered);
+        return Ok(value::from_bool(builder, cond));
+    }
+
+    let lhs = number_value(builder, lhs, lhs_numeric, ctx.strings.as_ref());
+    let rhs = number_value(builder, rhs, rhs_numeric, ctx.strings.as_ref());
+    let cc = match op {
+        BinaryOperator::GreaterThan => FloatCC::GreaterThan,
+        BinaryOperator::GreaterEqualThan => FloatCC::GreaterThanOrEqual,
+        BinaryOperator::LessThan => FloatCC::LessThan,
+        BinaryOperator::LessEqualThan => FloatCC::LessThanOrEqual,
+        _ => unreachable!(),
+    };
+    let cmp = builder.ins().fcmp(cc, lhs, rhs);
+    Ok(value::from_bool(builder, cmp))
+}
+
 pub(super) fn compile_relational(
     builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
     op: BinaryOperator,
     lhs: Value,
     rhs: Value,
@@ -279,15 +399,17 @@ pub(super) fn compile_relational(
     rhs_numeric: bool,
 ) -> Result<Value, Error> {
     match op {
-        BinaryOperator::Equality => Ok(value::loose_equal(builder, lhs, rhs)),
-        BinaryOperator::StrictEquality => Ok(value::strict_equal(builder, lhs, rhs)),
+        BinaryOperator::Equality => Ok(value::loose_equal(builder, lhs, rhs, ctx.strings.as_ref())),
+        BinaryOperator::StrictEquality => {
+            Ok(value::strict_equal(builder, lhs, rhs, ctx.strings.as_ref()))
+        }
         BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
             let eq = if op == BinaryOperator::Inequality {
-                value::loose_equal(builder, lhs, rhs)
+                value::loose_equal(builder, lhs, rhs, ctx.strings.as_ref())
             } else {
-                value::strict_equal(builder, lhs, rhs)
+                value::strict_equal(builder, lhs, rhs, ctx.strings.as_ref())
             };
-            let eq = value::truthy(builder, eq);
+            let eq = value::truthy(builder, eq, ctx.strings.as_ref());
             let not = builder.ins().icmp_imm(IntCC::Equal, eq, 0);
             Ok(value::from_bool(builder, not))
         }
@@ -295,17 +417,7 @@ pub(super) fn compile_relational(
         | BinaryOperator::GreaterEqualThan
         | BinaryOperator::LessThan
         | BinaryOperator::LessEqualThan => {
-            let lhs = number_value(builder, lhs, lhs_numeric);
-            let rhs = number_value(builder, rhs, rhs_numeric);
-            let cc = match op {
-                BinaryOperator::GreaterThan => FloatCC::GreaterThan,
-                BinaryOperator::GreaterEqualThan => FloatCC::GreaterThanOrEqual,
-                BinaryOperator::LessThan => FloatCC::LessThan,
-                BinaryOperator::LessEqualThan => FloatCC::LessThanOrEqual,
-                _ => unreachable!(),
-            };
-            let cmp = builder.ins().fcmp(cc, lhs, rhs);
-            Ok(value::from_bool(builder, cmp))
+            compile_compare(builder, ctx, op, lhs, rhs, lhs_numeric, rhs_numeric)
         }
         other => Err(Error::Unsupported(format!(
             "relational operator not supported: {other:?}"
@@ -325,21 +437,27 @@ pub(super) fn compile_unary<'a>(
     let target = compile_expr(builder, ctx, flow, &unary.argument)?;
     match unary.operator {
         UnaryOperator::UnaryNegation => {
-            let target = number_value(builder, target, expr_is_number(ctx, &unary.argument));
+            let target = number_value(
+                builder,
+                target,
+                expr_is_number(ctx, &unary.argument),
+                ctx.strings.as_ref(),
+            );
             Ok(builder.ins().fneg(target))
         }
         UnaryOperator::UnaryPlus => Ok(number_value(
             builder,
             target,
             expr_is_number(ctx, &unary.argument),
+            ctx.strings.as_ref(),
         )),
         UnaryOperator::LogicalNot => {
-            let cond = value::truthy(builder, target);
+            let cond = value::truthy(builder, target, ctx.strings.as_ref());
             let not = builder.ins().icmp_imm(IntCC::Equal, cond, 0);
             Ok(value::from_bool(builder, not))
         }
         UnaryOperator::BitwiseNot => {
-            let int = value::to_int32(builder, ctx.fmod_ref, target);
+            let int = value::to_int32(builder, ctx.fmod_ref, target, ctx.strings.as_ref());
             let inverted = builder.ins().bxor_imm(int, -1);
             Ok(value::from_int32(builder, inverted))
         }
@@ -415,7 +533,7 @@ pub(super) fn compile_assign<'a>(
             check_tdz(builder, old);
         }
         let cond = if use_truthy {
-            value::truthy(builder, old)
+            value::truthy(builder, old, ctx.strings.as_ref())
         } else {
             value::is_nullish(builder, old)
         };
@@ -496,7 +614,12 @@ pub(super) fn compile_update<'a>(
         ));
     }
     let old = load_var(builder, ctx, name)?;
-    let old = number_value(builder, old, binding_is_number(ctx, name));
+    let old = number_value(
+        builder,
+        old,
+        binding_is_number(ctx, name),
+        ctx.strings.as_ref(),
+    );
     let one = builder.ins().f64const(1.0);
     let new_value = match update.operator {
         UpdateOperator::Increment => builder.ins().fadd(old, one),

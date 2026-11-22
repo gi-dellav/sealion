@@ -13,3 +13,5 @@ while (times > 0) {
 }
 
 counter;
+
+console.log("Hello World!");

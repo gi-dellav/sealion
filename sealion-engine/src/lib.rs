@@ -46,13 +46,16 @@
 //! quiet-NaN tag ranges. Consequences of the current encoding:
 //!
 //! - `===`/`!==` distinguish the tagged values, so `true === 1` is false.
-//! - `==`/`!=` implement strict equality, `null == undefined`, and boolean to
-//!   number coercion; string/object coercions arrive with those types.
+//! - `==`/`!=` implement strict equality, `null == undefined`, boolean to
+//!   number coercion, and string-to-number comparison.
 //! - Arithmetic, relational operators, `++`/`--` and Math calls apply
 //!   `ToNumber` to their operands (`null + 1` is `1`, `undefined + 1` is NaN).
 //! - Bitwise operators convert through `ToInt32` (`undefined | 0` is `0`).
 //! - Bitwise results are signed 32-bit values except for `>>>`, as per the spec.
-//! - String literals are rejected outright; strings arrive with the object work.
+//! - The dynamic (JIT) runtime stores strings as tagged pointers to
+//!   `sealion-string` values, so literals, concatenation, comparison, `.length`,
+//!   `String(value)` and `console.log` work there. The AOT emitter still rejects
+//!   string values because it cannot link the host string runtime.
 //!
 //! Blocks are real lexical scopes: `let`/`const` shadow their enclosing scope
 //! and disappear at the closing brace, while `var` and function declarations
@@ -111,8 +114,8 @@
 //! outer loops or labelled blocks.
 //!
 //! `undefined` is a non-writable global and `debugger` is accepted as a no-op.
-//! Objects, arrays, strings and `for..in`/`for..of` loops are intentionally
-//! deferred to later roadmap versions.
+//! Objects, arrays and `for..in`/`for..of` loops are intentionally deferred to
+//! later roadmap versions.
 
 mod builtins;
 mod compiler;

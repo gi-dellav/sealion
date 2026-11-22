@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cranelift_codegen::ir::{FuncRef, Function};
+use cranelift_codegen::ir::{AbiParam, FuncRef, Function, Signature, types};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::ObjectModule;
 
@@ -35,6 +35,7 @@ pub enum Namespace {
     Number,
     Object,
     Date,
+    Console,
 }
 
 /// libm entry points taking one `f64`.
@@ -60,6 +61,9 @@ const OBJECT_INLINE: &[&str] = &["is"];
 
 /// `Date` functions implemented inline.
 const DATE_INLINE: &[&str] = &["now"];
+
+/// `console` functions implemented by the dynamic runtime.
+const CONSOLE_INLINE: &[&str] = &["log"];
 
 const MATH_CONSTANTS: &[(&str, f64)] = &[
     ("PI", std::f64::consts::PI),
@@ -112,6 +116,48 @@ impl Builtins {
         let time_id = module.declare_function("time", Linkage::Import, &time_sig)?;
         funcs.insert("now", time_id);
 
+        let string_from_utf8_sig = make_i64_pair_to_i64_signature(module);
+        let from_utf8_id = module.declare_function(
+            "sealion_string_from_utf8",
+            Linkage::Import,
+            &string_from_utf8_sig,
+        )?;
+        funcs.insert("sealion_string_from_utf8", from_utf8_id);
+        let f64_predicate_sig = make_f64_predicate_signature(module);
+        let truthy_id = module.declare_function(
+            "sealion_string_truthy",
+            Linkage::Import,
+            &f64_predicate_sig,
+        )?;
+        funcs.insert("sealion_string_truthy", truthy_id);
+        let f64_binary_to_i32_sig = make_f64_binary_to_i32_signature(module);
+        let compare_id = module.declare_function(
+            "sealion_string_compare",
+            Linkage::Import,
+            &f64_binary_to_i32_sig,
+        )?;
+        funcs.insert("sealion_string_compare", compare_id);
+        let void_sig = make_i64_pair_void_signature(module);
+        let console_log_id =
+            module.declare_function("sealion_console_log", Linkage::Import, &void_sig)?;
+        funcs.insert("sealion_console_log", console_log_id);
+        let length_id =
+            module.declare_function("sealion_string_length", Linkage::Import, &unary_sig)?;
+        funcs.insert("sealion_string_length", length_id);
+        for name in ["sealion_string_to_number", "sealion_string_to_string"] {
+            let id = module.declare_function(name, Linkage::Import, &unary_sig)?;
+            funcs.insert(name, id);
+        }
+        for name in [
+            "sealion_string_add",
+            "sealion_string_strict_equal",
+            "sealion_string_loose_equal",
+            "sealion_string_same_value",
+        ] {
+            let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
+            funcs.insert(name, id);
+        }
+
         let names = MATH_CONSTANTS
             .iter()
             .map(|(name, _)| *name)
@@ -122,6 +168,7 @@ impl Builtins {
             .chain(NUMBER_INLINE.iter().copied())
             .chain(OBJECT_INLINE.iter().copied())
             .chain(DATE_INLINE.iter().copied())
+            .chain(CONSOLE_INLINE.iter().copied())
             .collect();
 
         Ok(Self { names, funcs })
@@ -134,6 +181,7 @@ impl Builtins {
             "Number" => Some(Namespace::Number),
             "Object" => Some(Namespace::Object),
             "Date" => Some(Namespace::Date),
+            "console" => Some(Namespace::Console),
             _ => None,
         }
     }
@@ -145,6 +193,7 @@ impl Builtins {
             "isFinite" => Some("isFinite"),
             "Boolean" => Some("Boolean"),
             "Number" => Some("Number"),
+            "String" => Some("String"),
             _ => None,
         }
     }
@@ -188,6 +237,7 @@ impl Builtins {
             Namespace::Number => NUMBER_INLINE.contains(&name),
             Namespace::Object => OBJECT_INLINE.contains(&name),
             Namespace::Date => DATE_INLINE.contains(&name),
+            Namespace::Console => CONSOLE_INLINE.contains(&name),
         }
     }
 
@@ -196,7 +246,7 @@ impl Builtins {
         let table = match namespace {
             Namespace::Math => MATH_CONSTANTS,
             Namespace::Number => NUMBER_CONSTANTS,
-            Namespace::Object | Namespace::Date => return None,
+            Namespace::Object | Namespace::Date | Namespace::Console => return None,
         };
         table
             .iter()
@@ -213,4 +263,34 @@ impl Builtins {
             .map(|(name, id)| (*name, module.declare_func_in_func(*id, func)))
             .collect()
     }
+}
+
+fn make_i64_pair_to_i64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+fn make_f64_predicate_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.returns.push(AbiParam::new(types::I8));
+    sig
+}
+
+fn make_f64_binary_to_i32_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::F64));
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+fn make_i64_pair_void_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
+    sig
 }
