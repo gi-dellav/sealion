@@ -124,6 +124,8 @@ mod ir;
 mod jit;
 mod options;
 mod plan;
+#[cfg(feature = "jit")]
+mod runtime;
 mod value;
 
 pub use engine::Engine;

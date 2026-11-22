@@ -6,6 +6,8 @@ pub enum Error {
     Scope(String),
     Unsupported(String),
     Codegen(String),
+    Host(String),
+    Trap(String),
     Io(std::io::Error),
     Linker(String),
     #[cfg(feature = "jit")]
@@ -21,6 +23,8 @@ impl fmt::Display for Error {
             Self::Scope(m) => write!(f, "scope error: {m}"),
             Self::Unsupported(m) => write!(f, "unsupported feature: {m}"),
             Self::Codegen(m) => write!(f, "codegen error: {m}"),
+            Self::Host(m) => write!(f, "host error: {m}"),
+            Self::Trap(m) => write!(f, "trap: {m}"),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Linker(m) => write!(f, "linker error: {m}"),
             #[cfg(feature = "jit")]

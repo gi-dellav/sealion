@@ -1,5 +1,8 @@
 use std::{path::Path, str::FromStr};
 
+#[cfg(feature = "jit")]
+use std::sync::Arc;
+
 use cranelift_codegen::{
     isa,
     settings::{self, Configurable},
@@ -24,6 +27,7 @@ use crate::{
     JitProgram,
     fnv::{FNV_OFFSET, fnv1a},
     jit,
+    runtime::{FuncType, RegisteredType, RuntimeState},
 };
 
 fn set_flag(
@@ -39,17 +43,31 @@ fn set_flag(
     })
 }
 
-pub struct Engine;
+#[derive(Clone)]
+pub struct Engine {
+    #[cfg(feature = "jit")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    runtime: Arc<RuntimeState>,
+}
 
 impl Default for Engine {
     fn default() -> Self {
-        Self
+        Self::new()
     }
 }
 
 impl Engine {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(feature = "jit")]
+            runtime: Arc::new(RuntimeState::default()),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn register_type(&self, ty: FuncType) -> Result<RegisteredType, Error> {
+        self.runtime.types.register(ty)
     }
 
     pub fn compile(&self, source: &str) -> Result<IrModule, Error> {
