@@ -1201,7 +1201,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sealion-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "sealionjs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "sealion-engine",

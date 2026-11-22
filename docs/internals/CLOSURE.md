@@ -24,9 +24,9 @@ Closures pass through three phases:
 
 ```text
 oxc AST
-  -> program plan (plan.rs)     lexical scopes, bindings, capture analysis, function table
-  -> Cranelift IR (compiler.rs) environments, closure records, indirect calls
-  -> object file / executable   (lib.rs)
+  -> program plan (plan/)       lexical scopes, bindings, capture analysis, function table
+  -> Cranelift IR (compiler/)   environments, closure records, indirect calls
+  -> object file / executable   (engine.rs, ir.rs)
 ```
 
 The planning pass runs before any code is generated. This is what makes
@@ -34,16 +34,16 @@ environment depth and slot offsets compile-time constants.
 
 | Phase | Entry point | Responsibility |
 | --- | --- | --- |
-| Planning | `build_program_plan` (`plan.rs:104`) | Build the scope tree, function plans and capture flags. |
-| IR generation | `compile_functions` (`compiler.rs:92`) | Lower each function plan with a uniform ABI. |
-| Main generation | `compile_main` (`compiler.rs:227`) | Call `__script` and translate the result / pending exception into an exit code. |
-| Emission | `IrModule::emit_object`, `emit_binary` (`lib.rs:313`, `lib.rs:322`) | Emit the object and link with `cc -lm`. |
+| Planning | `build_program_plan` (`sealion-engine/src/plan/planner.rs:12`) | Build the scope tree, function plans and capture flags. |
+| IR generation | `compile_functions` (`sealion-engine/src/compiler/mod.rs:137`) | Lower each function plan with a uniform ABI. |
+| Main generation | `compile_main` (`sealion-engine/src/compiler/mod.rs:272`) | Call `__script` and translate the result / pending exception into an exit code. |
+| Emission | `IrModule::emit_object`, `emit_binary` (`sealion-engine/src/ir.rs:91`, `sealion-engine/src/ir.rs:100`) | Emit the object and link with `cc -lm`. |
 
 ## 2. Lexical planning
 
 ### 2.1 Scope tree
 
-`ScopePlan` (`plan.rs:32`) describes one lexical scope:
+`ScopePlan` (`sealion-engine/src/plan/mod.rs:33`) describes one lexical scope:
 
 - `parent`: the enclosing lexical scope.
 - `owner`: the function plan that owns the scope.
@@ -55,8 +55,8 @@ environment depth and slot offsets compile-time constants.
 `let` and `const` declarations bind in the nearest enclosing block scope. A `{}`
 block, a `switch` body, a catch clause and a `for` initializer with a lexical
 declaration each create a scope. `var` declarations and `function` declarations
-are hoisted to the root scope of their function (`plan.rs:290`, `plan.rs:299`,
-`plan.rs:480`).
+are hoisted to the root scope of their function (`sealion-engine/src/plan/planner.rs:200`, `sealion-engine/src/plan/planner.rs:302`,
+`sealion-engine/src/plan/planner.rs:398`).
 
 ```js
 function outer() {
@@ -79,7 +79,7 @@ captured" rule: creating a nested function marks the current scope and **every
 lexical ancestor** as captured.
 
 ```rust
-// plan.rs:147
+// sealion-engine/src/plan/planner.rs:55
 fn mark_captured(&mut self, start: ScopeId) {
     let mut current = Some(start);
     while let Some(id) = current {
@@ -92,10 +92,10 @@ fn mark_captured(&mut self, start: ScopeId) {
 
 The rule is applied in two places:
 
-- `add_nested_function` (`plan.rs:250`) handles function expressions and arrow
+- `add_nested_function` (`sealion-engine/src/plan/planner.rs:158`) handles function expressions and arrow
   functions. It builds the child plan with the current scope as parent and then
   calls `mark_captured(scope)`.
-- `add_function_declaration` (`plan.rs:480`) hoists the name to the function
+- `add_function_declaration` (`sealion-engine/src/plan/planner.rs:388`) hoists the name to the function
   root and builds the child with the root scope as parent, then calls
   `mark_captured(root)`.
 
@@ -113,14 +113,14 @@ Consequences:
 
 ### 2.3 Function plans and stable AST identity
 
-Each function or arrow gets a `FunctionPlan` (`plan.rs:64`) with its own root
+Each function or arrow gets a `FunctionPlan` (`sealion-engine/src/plan/mod.rs:65`) with its own root
 scope, parameters, body and a table of nested functions:
 
 - `children`: hoisted function declarations, evaluated at function entry.
 - `nested`: function and arrow expressions, keyed by the address of the AST
   node.
 
-The key is obtained with `node_key` (`plan.rs:100`):
+The key is obtained with `node_key` (`sealion-engine/src/plan/mod.rs:101`):
 
 ```rust
 pub fn node_key<T>(node: &T) -> usize {
@@ -133,7 +133,7 @@ addresses are stable between planning and code generation. `compile_closure`
 uses the same key to find the child plan for a function expression:
 
 ```rust
-// compiler.rs:2607
+// sealion-engine/src/compiler/call.rs:173
 fn compile_closure(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
@@ -159,7 +159,7 @@ for nested functions. These names are only debug and linkage names; they are not
 visible to JavaScript.
 
 Named function expressions additionally record `self_binding`
-(`plan.rs:80`). For example, `var f = function g() { ... }` creates a binding
+(`sealion-engine/src/plan/mod.rs:81`). For example, `var f = function g() { ... }` creates a binding
 named `g` in the function's own root scope. It is initialised from the callee
 value passed to every call (section 4.2).
 
@@ -167,16 +167,16 @@ value passed to every call (section 4.2).
 
 Two different lookups are used:
 
-- `resolve_binding` (`plan.rs:668`) returns the scope that owns a name and its
+- `resolve_binding` (`sealion-engine/src/plan/resolve.rs:30`) returns the scope that owns a name and its
   slot. `place` uses it to choose between environment and register storage, and
   the builtin/global recognisers use it to check whether a name is shadowed.
   `is_const` and `needs_tdz_check` walk the same scope tree separately for their
   compile-time diagnostics.
-- `resolve` (`plan.rs:686`) returns `(depth, slot)`, where `depth` counts only
+- `resolve` (`sealion-engine/src/plan/resolve.rs:48`) returns `(depth, slot)`, where `depth` counts only
   scopes that have an environment:
 
 ```rust
-// plan.rs:686
+// sealion-engine/src/plan/resolve.rs:48
 pub fn resolve(program: &Program<'_>, start: ScopeId, name: &str) -> Option<(usize, usize)> {
     let mut depth = 0usize;
     let mut current = Some(start);
@@ -194,7 +194,7 @@ pub fn resolve(program: &Program<'_>, start: ScopeId, name: &str) -> Option<(usi
 }
 ```
 
-At runtime `place` (`compiler.rs:1019`) starts from the current environment
+At runtime `place` (`sealion-engine/src/compiler/support.rs:166`) starts from the current environment
 pointer and follows the parent pointer exactly `depth` times. The slot is then
 loaded or stored at offset `8 + 8 * slot`.
 
@@ -204,14 +204,14 @@ the runtime chain.
 ### 2.5 Temporal dead zone and constness
 
 Parameters and `let`/`const` bindings are registered in the scope's `tdz` set
-(`plan.rs:226`, `plan.rs:182`). Their slots are initialised with the
+(`sealion-engine/src/plan/planner.rs:107`, `sealion-engine/src/plan/planner.rs:74`). Their slots are initialised with the
 `TAG_UNINITIALIZED` value, and every read of a TDZ binding emits a trap check.
 This applies inside closures too: a closure can capture a binding before its
 initializer has run, but reading it through the closure traps until the
 initializer executes.
 
 `const` names are recorded in `consts` and assignment is rejected during code
-generation by `is_const` (`plan.rs:641`).
+generation by `is_const` (`sealion-engine/src/plan/resolve.rs:3`).
 
 ## 3. Runtime representation
 
@@ -227,7 +227,7 @@ A function value uses the reserved quiet-NaN tag `0x7FFD` (see
 +----------+--------------------------------------------+
 ```
 
-`new_closure` (`compiler.rs:766`) allocates and fills the record:
+`new_closure` (`sealion-engine/src/compiler/support.rs:32`) allocates and fills the record:
 
 ```rust
 fn new_closure(
@@ -267,7 +267,7 @@ value is an untagged number.
 ### 3.2 Environment records
 
 An environment record is allocated with `calloc(1, 8 + 8 * slots)`
-(`alloc_env`, `compiler.rs:754`):
+(`alloc_env`, `sealion-engine/src/compiler/support.rs:20`):
 
 ```text
 environment:
@@ -284,7 +284,7 @@ environment:
   parent the environment captured by its closure, not the caller's current
   environment. This is lexical, not dynamic, scoping.
 - Slots are initialised to `undefined`, or to `TAG_UNINITIALIZED` when they are
-  in the TDZ (`init_slots`, `compiler.rs:778`).
+  in the TDZ (`init_slots`, `sealion-engine/src/compiler/support.rs:44`).
 
 The closure record's `env` field points at the environment that was current when
 the closure value was created. Multiple closures over the same activation share
@@ -321,7 +321,7 @@ through other closures over the same call.
 
 Every JavaScript function, including the script, top-level declarations,
 expressions and arrows, has the same signature (`make_js_signature`,
-`compiler.rs:31`):
+`sealion-engine/src/compiler/signature.rs:4`):
 
 ```text
 (i64 env, i64 args, f64 callee) -> f64
@@ -345,28 +345,28 @@ The argument block layout is:
 ```
 
 The block is `8 + 8 * MAX_ARGS = 264` bytes, with `MAX_ARGS = 32`
-(`compiler.rs:29`, `compiler.rs:2444`).
+(`sealion-engine/src/compiler/call.rs:12`, `sealion-engine/src/compiler/call.rs:128`).
 
 ### 4.2 Function entry
 
-`compile_functions` (`compiler.rs:92`) emits the same prologue for every
+`compile_functions` (`sealion-engine/src/compiler/mod.rs:137`) emits the same prologue for every
 function:
 
-1. Read the exception state global (`compiler.rs:129`).
+1. Read the exception state global (`sealion-engine/src/compiler/mod.rs:137`).
 2. Declare a Cranelift variable for every binding owned by this function whose
-   scope is not captured (`declare_vars`, `compiler.rs:791`).
+   scope is not captured (`declare_vars`, `sealion-engine/src/compiler/support.rs:59`).
 3. If the root scope is captured, allocate a fresh root environment whose parent
    is the incoming `env` parameter and initialise its slots. Otherwise initialise
    the register variables and keep `env` as the incoming parameter
-   (`compiler.rs:132`).
+   (`sealion-engine/src/compiler/mod.rs:137`).
 4. Store the `callee` argument into the self binding, if this is a named function
-   expression (`compiler.rs:159`).
+   expression (`sealion-engine/src/compiler/mod.rs:137`).
 5. Load parameters from the argument block. Missing arguments are `undefined`;
    default initializers run only when the resulting value is `undefined`
-   (`compiler.rs:163`).
+   (`sealion-engine/src/compiler/mod.rs:137`).
 6. Create closures for hoisted function declarations and store them in their
-   bindings (`compiler.rs:184`).
-7. Compile the body and return its last value, or `undefined` (`compiler.rs:194`).
+   bindings (`sealion-engine/src/compiler/mod.rs:137`).
+7. Compile the body and return its last value, or `undefined` (`sealion-engine/src/compiler/mod.rs:137`).
 
 Step 6 is important: a function declaration does not execute anything at its
 source position. Its closure is built once per activation of the enclosing
@@ -375,7 +375,7 @@ function, at entry, from the root environment.
 Parameter loading demonstrates the bounds check and the uniform ABI:
 
 ```rust
-// compiler.rs:163
+// sealion-engine/src/compiler/mod.rs:137
 if !plan.is_script {
     let undef = value::undefined(&mut builder);
     let len = builder
@@ -412,10 +412,10 @@ at function entry with the root environment.
 
 ### 4.4 Calling a closure
 
-`compile_call_value` (`compiler.rs:2423`) implements dynamic dispatch:
+`compile_call_value` (`sealion-engine/src/compiler/call.rs:128`) implements dynamic dispatch:
 
 ```rust
-// compiler.rs:2435
+// sealion-engine/src/compiler/call.rs:128
 let callee_ptr = value::payload(builder, callee);
 let code = builder
     .ins()
@@ -475,7 +475,7 @@ do not use this closure-call path.
 
 ### 4.5 Environment-backed and register-backed access
 
-`Place` (`compiler.rs:1011`) is the abstraction over both storage classes:
+`Place` (`sealion-engine/src/compiler/mod.rs:124`) is the abstraction over both storage classes:
 
 ```rust
 #[derive(Clone, Copy)]
@@ -485,10 +485,10 @@ enum Place {
 }
 ```
 
-`place` (`compiler.rs:1019`) decides based on the home scope:
+`place` (`sealion-engine/src/compiler/support.rs:166`) decides based on the home scope:
 
 ```rust
-// compiler.rs:1019
+// sealion-engine/src/compiler/support.rs:166
 fn place(builder: &mut FunctionBuilder, ctx: &CodegenCtx<'_>, name: &str) -> Result<Place, Error> {
     let (home, slot) = resolve_binding(ctx.program, ctx.scope, name)
         .ok_or_else(|| Error::Scope(format!("unresolved identifier: {name}")))?;
@@ -519,10 +519,10 @@ scope captured during planning.
 
 ### 4.6 Block scopes and per-iteration environments
 
-`enter_scope` (`compiler.rs:864`) runs every time execution enters a scope:
+`enter_scope` (`sealion-engine/src/compiler/support.rs:104`) runs every time execution enters a scope:
 
 ```rust
-// compiler.rs:864
+// sealion-engine/src/compiler/support.rs:104
 fn enter_scope<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -562,7 +562,7 @@ is created once before the initializer, but at the end of each iteration its
 slots are copied into a fresh environment before the update expression runs:
 
 ```rust
-// compiler.rs:1657
+// sealion-engine/src/compiler/loops.rs:137
 builder.switch_to_block(step);
 let step_ctx = if let Some((slots, _)) = fresh {
     let previous = builder.use_var(env_var);
@@ -576,7 +576,7 @@ let step_ctx = if let Some((slots, _)) = fresh {
 builder.ins().jump(header, &[]);
 ```
 
-`copy_env` (`compiler.rs:882`) allocates a new environment with the **original
+`copy_env` (`sealion-engine/src/compiler/support.rs:122`) allocates a new environment with the **original
 parent** (saved before entering the loop scope), copies every slot, and stores
 the new pointer in `env_var`. The header and body read `env_var`, so a closure
 created in the body keeps the environment for its own iteration, while the update
@@ -593,7 +593,7 @@ For `var f = function g() { ... }`:
 - The planner adds `g` to the function's root scope and records it as
   `self_binding`.
 - At entry, the third ABI argument (the callee value) is stored into `g` before
-  parameters are processed (`compiler.rs:159`).
+  parameters are processed (`sealion-engine/src/compiler/mod.rs:137`).
 - Every call to the closure passes the same closure value as the third argument,
   so `g` is always the function value itself. `g === f` is true when `f` holds
   the closure, and recursive calls work.

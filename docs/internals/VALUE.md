@@ -407,7 +407,7 @@ checked at runtime.
 ## 5. Static numeric analysis
 
 Unboxing `ToNumber` at every arithmetic operation would be costly and
-unnecessary for most code. `analyze_numeric_bindings` (`compiler.rs:650`) computes
+unnecessary for most code. `analyze_numeric_bindings` (`sealion-engine/src/compiler/numeric.rs:383`) computes
 the greatest fixed point of lexical bindings that are guaranteed to hold
 untagged numbers. The result is a `HashSet<(ScopeId, usize)>` of binding slots.
 
@@ -417,12 +417,12 @@ The analysis starts with every slot in every `tdz` set. Only `let` and `const`
 slots are ever inserted: `var` bindings can be read as `undefined` before their
 initializer, and parameters, function declaration names, self bindings and catch
 parameters are not in a TDZ set. Parameters are then explicitly removed from the
-set (`compiler.rs:662`), including parameters with defaults, because a missing
+set (`sealion-engine/src/compiler/numeric.rs:383`), including parameters with defaults, because a missing
 argument or a non-numeric default is possible.
 
 ### Refinement
 
-A `NumericWalker` (`compiler.rs:424`) walks every function plan and removes a
+A `NumericWalker` (`sealion-engine/src/compiler/numeric.rs:157`) walks every function plan and removes a
 binding when it can receive a value that is not provably numeric:
 
 - A lexical binding with no initializer or a non-numeric initializer is removed.
@@ -432,7 +432,7 @@ binding when it can receive a value that is not provably numeric:
 - The walker does not descend into nested function bodies; each plan is visited
   separately in the outer loop.
 
-`known_number_expr` (`compiler.rs:338`) defines the provable cases:
+`known_number_expr` (`sealion-engine/src/compiler/numeric.rs:71`) defines the provable cases:
 
 | Expression | Why it is numeric |
 | --- | --- |
@@ -454,7 +454,7 @@ non-numeric binding can invalidate another binding initialised from it.
 
 ### Using the result
 
-`number_value` (`compiler.rs:395`) is the wrapper used at arithmetic,
+`number_value` (`sealion-engine/src/compiler/numeric.rs:128`) is the wrapper used at arithmetic,
 comparison and coercion sites:
 
 ```rust
@@ -523,7 +523,7 @@ records are described in detail in [CLOSURE.md](CLOSURE.md).
 
 ## 7. Calling convention
 
-Every JavaScript function has one signature (`compiler.rs:31`):
+Every JavaScript function has one signature (`sealion-engine/src/compiler/signature.rs:4`):
 
 ```text
 (i64 env, i64 args, f64 callee) -> f64
@@ -536,10 +536,10 @@ Every JavaScript function has one signature (`compiler.rs:31`):
   self bindings. It is not `this`.
 - The return value is a NaN-boxed `f64`.
 
-`compile_call_value` (`compiler.rs:2423`) allocates the argument block with
+`compile_call_value` (`sealion-engine/src/compiler/call.rs:128`) allocates the argument block with
 `calloc(1, 8 + 8 * 32)`, stores the argument count at offset 0 and each argument
 starting at offset 8, then performs an indirect call through the closure record.
-At most 32 arguments are supported per call site (`MAX_ARGS`, `compiler.rs:29`).
+At most 32 arguments are supported per call site (`MAX_ARGS`, `sealion-engine/src/compiler/call.rs:12`).
 Arguments beyond a function's parameter count are evaluated and stored but
 ignored; parameters beyond the supplied count become `undefined`.
 
@@ -547,7 +547,7 @@ This uniform ABI is what makes values and closures first-class: a function can
 be passed as an `f64`, returned, stored in an environment, compared with `===`
 and called through a closure record without any tag-specific call sequence.
 
-The `main` wrapper (`compile_main`, `compiler.rs:227`) calls `__script` with
+The `main` wrapper (`compile_main`, `sealion-engine/src/compiler/mod.rs:272`) calls `__script` with
 `env = 0`, `args = 0` and `callee = undefined`. It then:
 
 - returns exit code 1 if the exception flag is set;
@@ -560,7 +560,7 @@ the outside world observes a compiled program.
 ## 8. Exceptions as a side channel
 
 Exceptions are a value, but they do not travel through the normal return
-channel. `lib.rs:243` defines a 16-byte zero-initialised global data object,
+channel. `sealion-engine/src/engine.rs:265` defines a 16-byte zero-initialised global data object,
 `sealion_exception`:
 
 ```text
@@ -569,12 +569,12 @@ channel. `lib.rs:243` defines a 16-byte zero-initialised global data object,
 ```
 
 - `throw` evaluates its argument, stores the value at `+8` and sets the flag
-  (`set_exception`, `compiler.rs:1113`).
-- A `catch` block calls `take_exception` (`compiler.rs:1102`), which loads the
+  (`set_exception`, `sealion-engine/src/compiler/flow.rs:74`).
+- A `catch` block calls `take_exception` (`sealion-engine/src/compiler/flow.rs:63`), which loads the
   value and clears the flag.
-- `has_exception` (`compiler.rs:1095`) loads the flag. Every dynamically
+- `has_exception` (`sealion-engine/src/compiler/flow.rs:56`) loads the flag. Every dynamically
   dispatched call checks it after returning, then unwinds through the
-  appropriate `finally` blocks (`emit_exception_check`, `compiler.rs:1205`).
+  appropriate `finally` blocks (`emit_exception_check`, `sealion-engine/src/compiler/flow.rs:166`).
 - If an exception reaches `main`, the process exits with status 1.
 
 Because the state is a single global, exception propagation is not thread-safe.
@@ -605,7 +605,7 @@ Environment slots are mutable cells. Copying a closure value copies the `f64`
 pointer, so all copies share the same closure record and the same environment.
 There is no structural copy of environments, even at closure creation. The one
 deliberate copy is the `for` loop's per-iteration environment
-(`copy_env`, `compiler.rs:882`), which is required by the specification.
+(`copy_env`, `sealion-engine/src/compiler/support.rs:122`), which is required by the specification.
 
 ## 10. Current limits and future work
 
@@ -637,10 +637,10 @@ The value domain is deliberately narrow:
 | --- | --- |
 | Tags and bit helpers | `sealion-engine/src/value.rs` |
 | Truthiness, equality, coercions | `sealion-engine/src/value.rs:120` onward |
-| Numeric analysis | `sealion-engine/src/compiler.rs:285`, `compiler.rs:650` |
-| Calling convention | `sealion-engine/src/compiler.rs:31`, `compiler.rs:2423` |
-| Argument block and closure calls | `sealion-engine/src/compiler.rs:2423` |
-| Exception state | `sealion-engine/src/lib.rs:243`, `compiler.rs:1095` |
+| Numeric analysis | `sealion-engine/src/compiler/numeric.rs:18`, `sealion-engine/src/compiler/numeric.rs:383` |
+| Calling convention | `sealion-engine/src/compiler/signature.rs:4`, `sealion-engine/src/compiler/call.rs:128` |
+| Argument block and closure calls | `sealion-engine/src/compiler/call.rs:128` |
+| Exception state | `sealion-engine/src/engine.rs:265`, `sealion-engine/src/compiler/flow.rs:56` |
 | Closure and environment layout | [CLOSURE.md](CLOSURE.md) |
 
 Inspect the lowered representation with:

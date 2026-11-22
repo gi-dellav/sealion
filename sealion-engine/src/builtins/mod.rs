@@ -1,0 +1,216 @@
+//! The `Math`, `Number`, `Object` and `Date` namespaces.
+//!
+//! They are not objects: they are compile-time namespaces whose members are
+//! either constants (folded to an `f64` literal) or builtin functions (compiled
+//! to a libm call or a short instruction sequence). The global `isNaN`,
+//! `isFinite`, `Boolean` and `Number` functions are compiled the same way, as
+//! are the global `NaN` and `Infinity` constants.
+//!
+//! Because there are no objects yet, the namespaces cannot be used as values:
+//! only `Math.member`, `Number.member`, `Object.member` and `Date.member` are
+//! accepted.
+
+use std::collections::{HashMap, HashSet};
+
+use cranelift_codegen::ir::{FuncRef, Function};
+use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_object::ObjectModule;
+
+use crate::{
+    Error,
+    compiler::{
+        make_f64_binary_signature, make_f64_unary_signature, make_i64_unary_signature,
+        make_nullary_f64_signature,
+    },
+};
+
+mod dispatch;
+mod math;
+
+pub use dispatch::call;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Math,
+    Number,
+    Object,
+    Date,
+}
+
+/// libm entry points taking one `f64`.
+const UNARY_LIBM: &[&str] = &[
+    "cbrt", "exp", "expm1", "log", "log10", "log1p", "log2", "sin", "cos", "tan", "asin", "acos",
+    "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+];
+
+/// libm entry points taking two `f64`s.
+pub(super) const BINARY_LIBM: &[&str] = &["pow", "atan2"];
+
+/// `Math` functions implemented inline rather than by a libm call.
+const MATH_INLINE: &[&str] = &[
+    "abs", "ceil", "floor", "round", "trunc", "sqrt", "fround", "min", "max", "clz32", "imul",
+    "sign", "hypot", "random", "f16round",
+];
+
+/// `Number` functions implemented inline.
+const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeInteger"];
+
+/// `Object` functions implemented inline.
+const OBJECT_INLINE: &[&str] = &["is"];
+
+/// `Date` functions implemented inline.
+const DATE_INLINE: &[&str] = &["now"];
+
+const MATH_CONSTANTS: &[(&str, f64)] = &[
+    ("PI", std::f64::consts::PI),
+    ("E", std::f64::consts::E),
+    ("LN2", std::f64::consts::LN_2),
+    ("LN10", std::f64::consts::LN_10),
+    ("LOG2E", std::f64::consts::LOG2_E),
+    ("LOG10E", std::f64::consts::LOG10_E),
+    ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+    ("SQRT2", std::f64::consts::SQRT_2),
+];
+
+const NUMBER_CONSTANTS: &[(&str, f64)] = &[
+    ("MAX_VALUE", f64::MAX),
+    ("MIN_VALUE", f64::from_bits(1)),
+    ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+    ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+    ("EPSILON", f64::EPSILON),
+    ("NaN", f64::NAN),
+    ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+    ("POSITIVE_INFINITY", f64::INFINITY),
+];
+
+/// `2**53 - 1`, the largest integer a double represents exactly.
+pub(super) const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+pub struct Builtins {
+    /// Property names, so that a member expression can be recognised.
+    names: HashSet<&'static str>,
+    funcs: HashMap<&'static str, FuncId>,
+}
+
+impl Builtins {
+    pub fn new(module: &mut ObjectModule) -> Result<Self, Error> {
+        let unary_sig = make_f64_unary_signature(module);
+        let binary_sig = make_f64_binary_signature(module);
+        let mut funcs = HashMap::new();
+        for &name in UNARY_LIBM {
+            let id = module.declare_function(name, Linkage::Import, &unary_sig)?;
+            funcs.insert(name, id);
+        }
+        for &name in BINARY_LIBM {
+            let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
+            funcs.insert(name, id);
+        }
+        let nullary_sig = make_nullary_f64_signature(module);
+        let random_id = module.declare_function("drand48", Linkage::Import, &nullary_sig)?;
+        funcs.insert("random", random_id);
+        let time_sig = make_i64_unary_signature(module);
+        let time_id = module.declare_function("time", Linkage::Import, &time_sig)?;
+        funcs.insert("now", time_id);
+
+        let names = MATH_CONSTANTS
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(NUMBER_CONSTANTS.iter().map(|(name, _)| *name))
+            .chain(UNARY_LIBM.iter().copied())
+            .chain(BINARY_LIBM.iter().copied())
+            .chain(MATH_INLINE.iter().copied())
+            .chain(NUMBER_INLINE.iter().copied())
+            .chain(OBJECT_INLINE.iter().copied())
+            .chain(DATE_INLINE.iter().copied())
+            .collect();
+
+        Ok(Self { names, funcs })
+    }
+
+    /// The namespace a bare identifier names.
+    pub fn namespace(&self, name: &str) -> Option<Namespace> {
+        match name {
+            "Math" => Some(Namespace::Math),
+            "Number" => Some(Namespace::Number),
+            "Object" => Some(Namespace::Object),
+            "Date" => Some(Namespace::Date),
+            _ => None,
+        }
+    }
+
+    /// A free global function such as `isNaN` or `Boolean`.
+    pub fn global_function(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "isNaN" => Some("isNaN"),
+            "isFinite" => Some("isFinite"),
+            "Boolean" => Some("Boolean"),
+            "Number" => Some("Number"),
+            _ => None,
+        }
+    }
+
+    /// A free global constant such as `NaN` or `Infinity`.
+    pub fn global_constant(&self, name: &str) -> Option<f64> {
+        match name {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            _ => None,
+        }
+    }
+
+    pub fn is_undefined(&self, name: &str) -> bool {
+        name == "undefined"
+    }
+
+    /// True when `name` is one of the engine's builtin globals.
+    pub fn is_global(&self, name: &str) -> bool {
+        self.namespace(name).is_some()
+            || self.global_function(name).is_some()
+            || self.global_constant(name).is_some()
+            || self.is_undefined(name)
+    }
+
+    pub fn property(&self, name: &str) -> Option<&'static str> {
+        self.names.get(name).copied()
+    }
+
+    /// True when `name` is a constant or function member of `namespace`.
+    pub fn has(&self, namespace: Namespace, name: &str) -> bool {
+        if self.constant(namespace, name).is_some() {
+            return true;
+        }
+        match namespace {
+            Namespace::Math => {
+                UNARY_LIBM.contains(&name)
+                    || BINARY_LIBM.contains(&name)
+                    || MATH_INLINE.contains(&name)
+            }
+            Namespace::Number => NUMBER_INLINE.contains(&name),
+            Namespace::Object => OBJECT_INLINE.contains(&name),
+            Namespace::Date => DATE_INLINE.contains(&name),
+        }
+    }
+
+    /// The constant folded into the program for `namespace.member`, if any.
+    pub fn constant(&self, namespace: Namespace, name: &str) -> Option<f64> {
+        let table = match namespace {
+            Namespace::Math => MATH_CONSTANTS,
+            Namespace::Number => NUMBER_CONSTANTS,
+            Namespace::Object | Namespace::Date => return None,
+        };
+        table
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == name).then_some(*value))
+    }
+
+    pub fn declare_in(
+        &self,
+        module: &mut ObjectModule,
+        func: &mut Function,
+    ) -> HashMap<&'static str, FuncRef> {
+        self.funcs
+            .iter()
+            .map(|(name, id)| (*name, module.declare_func_in_func(*id, func)))
+            .collect()
+    }
+}
