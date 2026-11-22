@@ -21,3 +21,9 @@ fast-float2 = "0.2.4"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
