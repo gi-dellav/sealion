@@ -389,6 +389,50 @@ pub(super) fn compile_compare(
     Ok(value::from_bool(builder, cmp))
 }
 
+/// Compiles a comparison or equality as an untagged condition. Numeric
+/// operands use a direct `fcmp`, avoiding the tagged-boolean round trip that
+/// compiling the expression and then calling `truthy` would perform.
+pub(super) fn compile_condition_compare<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    binary: &'a BinaryExpression<'a>,
+) -> Result<Value, Error> {
+    let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
+    let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
+    let lhs_numeric = expr_is_number(ctx, &binary.left);
+    let rhs_numeric = expr_is_number(ctx, &binary.right);
+    if lhs_numeric && rhs_numeric {
+        let cond = match binary.operator {
+            BinaryOperator::LessThan => builder.ins().fcmp(FloatCC::LessThan, lhs, rhs),
+            BinaryOperator::LessEqualThan => builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs, rhs),
+            BinaryOperator::GreaterThan => builder.ins().fcmp(FloatCC::GreaterThan, lhs, rhs),
+            BinaryOperator::GreaterEqualThan => {
+                builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs)
+            }
+            BinaryOperator::Equality | BinaryOperator::StrictEquality => {
+                builder.ins().fcmp(FloatCC::Equal, lhs, rhs)
+            }
+            BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+                let eq = builder.ins().fcmp(FloatCC::Equal, lhs, rhs);
+                builder.ins().icmp_imm(IntCC::Equal, eq, 0)
+            }
+            _ => unreachable!("not a comparison operator"),
+        };
+        return Ok(cond);
+    }
+    let tagged = compile_relational(
+        builder,
+        ctx,
+        binary.operator,
+        lhs,
+        rhs,
+        lhs_numeric,
+        rhs_numeric,
+    )?;
+    Ok(value::truthy(builder, tagged, ctx.strings.as_ref()))
+}
+
 pub(super) fn compile_relational(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,

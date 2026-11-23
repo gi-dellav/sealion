@@ -25,12 +25,12 @@ now_ns() {
 
 echo "compiling C with $CC_BIN"
 c_compile_start=$(now_ns)
-"$CC_BIN" -O3 -o "$BUILD/loopmath_c" "$DIR/loopmath.c" -lm || exit 1
+"$CC_BIN" -O3 -fno-pic -no-pie -o "$BUILD/loopmath_c" "$DIR/loopmath.c" -lm || exit 1
 c_compile_end=$(now_ns)
 
 echo "compiling with sealionjs (AOT)"
 sealion_compile_start=$(now_ns)
-sealionjs "$DIR/loopmath.js" -o "$BUILD/loopmath_sealion" || exit 1
+sealionjs --no-pic "$DIR/loopmath.js" -o "$BUILD/loopmath_sealion" || exit 1
 sealion_compile_end=$(now_ns)
 
 echo "compiling with sealionjs (cache artifact)"
@@ -48,7 +48,7 @@ awk -v c_start="$c_compile_start" -v c_end="$c_compile_end" \
 
 printf '0;\n' > "$BUILD/jit_probe.js"
 jit_available=0
-sealionjs --no-pic "$BUILD/jit_probe.js" >/dev/null 2>"$BUILD/jit_probe.log" || true
+sealionjs --no-cache --no-pic "$BUILD/jit_probe.js" >/dev/null 2>"$BUILD/jit_probe.log" || true
 if grep -q "in-process JIT" "$BUILD/jit_probe.log"; then
     jit_available=1
 fi
@@ -73,15 +73,20 @@ time_cmd() {
     local runs=$2
     shift 2
     local total=0
-    local start end i
+    local worst=0
+    local start end i dur
     for ((i = 0; i < runs; i++)); do
         start=$(now_ns)
         "$@" >/dev/null 2>&1
         end=$(now_ns)
-        total=$((total + end - start))
+        dur=$((end - start))
+        total=$((total + dur))
+        if [ "$dur" -gt "$worst" ]; then
+            worst=$dur
+        fi
     done
-    awk -v name="$name" -v total="$total" -v runs="$runs" 'BEGIN {
-        printf "%-16s %10.1f ms/run  (%d runs)\n", name, total / runs / 1000000, runs
+    awk -v name="$name" -v total="$total" -v worst="$worst" -v runs="$runs" 'BEGIN {
+        printf "%-16s %10.1f ms/run  worst %10.1f ms  (%d runs)\n", name, total / runs / 1000000, worst / 1000000, runs
     }'
 }
 
@@ -101,7 +106,7 @@ printf "%-16s %s\n" "Sealion (Cache)" "$cache_sum"
 jit_sum="n/a"
 if [ "$jit_available" -eq 1 ]; then
     jit_sum=0
-    sealionjs "$DIR/loopmath.js" >/dev/null 2>&1 || jit_sum=$?
+    sealionjs --no-cache "$DIR/loopmath.js" >/dev/null 2>&1 || jit_sum=$?
     printf "%-16s %s\n" "Sealion JIT" "$jit_sum"
 else
     printf "%-16s %s\n" "Sealion JIT" "not enabled, skipped"
@@ -147,7 +152,7 @@ time_cmd "C" "$RUNS" "$BUILD/loopmath_c"
 time_cmd "Sealion AOT" "$RUNS" "$BUILD/loopmath_sealion"
 time_cmd "Sealion (Cache)" "$RUNS" sealionjs --run-artifact "$BUILD/loopmath_sealion.artifact"
 if [ "$jit_available" -eq 1 ]; then
-    time_cmd "Sealion JIT" "$RUNS" sealionjs "$DIR/loopmath.js"
+    time_cmd "Sealion JIT" "$RUNS" sealionjs --no-cache "$DIR/loopmath.js"
 fi
 if [ "$have_node" -eq 1 ]; then
     time_cmd "NodeJS" "$RUNS" run_node_js

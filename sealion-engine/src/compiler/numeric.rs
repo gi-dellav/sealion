@@ -402,8 +402,11 @@ pub(super) fn analyze_numeric_bindings<'a>(
         }
     }
     for plan in &program.functions {
+        let direct = program.direct_calls.safe.contains(&plan.id);
         for param in &plan.params {
-            if let Some(key) = resolve_binding(program, plan.root_scope, param.name) {
+            if let Some(key) = resolve_binding(program, plan.root_scope, param.name)
+                && !direct
+            {
                 numeric.remove(&key);
             }
         }
@@ -432,6 +435,34 @@ pub(super) fn analyze_numeric_bindings<'a>(
                 }
             }
         }
+
+        // Parameters of directly called functions stay numeric only while
+        // every call site passes a known number in that position.
+        for &plan_id in &program.direct_calls.safe {
+            let plan = program.function(plan_id);
+            let Some(calls) = program.direct_calls.calls.get(&plan_id) else {
+                continue;
+            };
+            for (index, param) in plan.params.iter().enumerate() {
+                let Some(key) = resolve_binding(program, plan.root_scope, param.name) else {
+                    continue;
+                };
+                if !numeric.contains(&key) || removed.contains(&key) {
+                    continue;
+                }
+                let all_numeric = calls.iter().all(|call| {
+                    call.args.get(index).is_some_and(|arg| {
+                        arg.as_expression().is_some_and(|expr| {
+                            known_number_expr(program, builtins, &numeric, call.scope, expr)
+                        })
+                    })
+                });
+                if !all_numeric {
+                    removed.insert(key);
+                }
+            }
+        }
+
         if removed.is_empty() {
             break;
         }

@@ -152,3 +152,55 @@ fn console_log_accepts_strings_and_other_values() {
         0
     );
 }
+
+#[test]
+fn direct_calls_respect_reassignment_and_escapes() {
+    assert_eq!(
+        run(
+            "function f(x) { return x + 1; } var g = f; f = function (x) { return x * 10; }; f(5) + g(1);"
+        ),
+        52
+    );
+}
+
+#[test]
+fn numeric_parameters_stay_correct_with_mixed_calls() {
+    assert_eq!(
+        run(
+            r#"function add(a, b) { return a + b; } add(1, 2) + (add("a", "b") === "ab" ? 10 : 0);"#
+        ),
+        13
+    );
+}
+
+#[test]
+fn missing_and_default_arguments_keep_their_values() {
+    assert_eq!(
+        run("function f(a, b) { return b; } f(1) === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("function f(a = 5) { return a; } f();"), 5);
+}
+
+#[test]
+fn initialized_loop_bindings_compile_without_tdz_checks() {
+    let ir = Engine::new()
+        .compile(
+            "function f(n) { let acc = 0.0; for (let i = 1; i <= n; i = i + 1) { acc = acc + Math.sqrt(i); } return acc; } f(10);",
+        )
+        .unwrap();
+    let clif = ir.clif();
+    assert!(!clif.contains("trapnz"), "{clif}");
+    assert!(clif.contains("fcmp le"), "{clif}");
+}
+
+#[test]
+fn numeric_comparison_conditions_match_js_semantics() {
+    assert_eq!(
+        run("var r = 0; if (NaN < 1) { r = 1; } else { r = 2; } r;"),
+        2
+    );
+    assert_eq!(run("NaN !== NaN ? 1 : 0;"), 1);
+    assert_eq!(run("-0 === 0 ? 1 : 0;"), 1);
+    assert_eq!(run("-0 < 0 ? 1 : 0;"), 0);
+}

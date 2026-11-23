@@ -1,6 +1,7 @@
 use std::{
     fs,
-    path::PathBuf,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
     process::{Command, ExitCode},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -90,6 +91,10 @@ struct Cli {
     /// Preserve frame pointers in generated functions.
     #[arg(long)]
     preserve_frame_pointers: bool,
+
+    /// Do not read or write the on-disk artifact cache used by the JIT.
+    #[arg(long)]
+    no_cache: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -205,9 +210,24 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     #[cfg(feature = "jit")]
     if use_jit(&cli) {
         warn_ignored_jit_flags(&cli);
+        let cache = if cli.no_cache {
+            None
+        } else {
+            artifact_cache_path(&engine, &source, &options)
+        };
+        if let Some(path) = &cache
+            && let Some(module) = load_cached_artifact(&engine, path)
+        {
+            return Ok(ExitCode::from((module.run() & 0xff) as u8));
+        }
         let program = engine
             .compile_jit_with_options(&source, &options)
             .map_err(|e| format!("failed to compile {}: {e}", input.display()))?;
+        if let Some(path) = &cache
+            && let Ok(bytes) = program.serialize()
+        {
+            store_cached_artifact(path, &bytes);
+        }
         return Ok(ExitCode::from((program.run() & 0xff) as u8));
     }
 
@@ -253,6 +273,67 @@ fn warn_ignored_jit_flags(cli: &Cli) {
         eprintln!(
             "sealionjs: warning: --no-unwind-info is ignored by the in-process JIT; unwind information is not registered"
         );
+    }
+}
+
+#[cfg(feature = "jit")]
+fn artifact_cache_path(engine: &Engine, source: &str, options: &CompileOptions) -> Option<PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    options.typescript.hash(&mut hasher);
+    options.es2026.hash(&mut hasher);
+    options.enable_alias_analysis.hash(&mut hasher);
+    options.enable_verifier.hash(&mut hasher);
+    engine
+        .precompile_compatibility_hash(options)
+        .hash(&mut hasher);
+    // Tie entries to this build so a rebuilt compiler never reuses stale code.
+    if let Ok(path) = std::env::current_exe()
+        && let Ok(metadata) = fs::metadata(path)
+    {
+        metadata.len().hash(&mut hasher);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(elapsed) = modified.duration_since(UNIX_EPOCH)
+        {
+            elapsed.as_nanos().hash(&mut hasher);
+        }
+    }
+    let key = hasher.finish();
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(
+        base.join("sealion")
+            .join("artifacts")
+            .join(format!("{key:016x}.sealion")),
+    )
+}
+
+#[cfg(feature = "jit")]
+fn load_cached_artifact(engine: &Engine, path: &Path) -> Option<sealion_engine::Module> {
+    let bytes = fs::read(path).ok()?;
+    match engine.deserialize(&bytes) {
+        Ok(module) => Some(module),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            None
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+fn store_cached_artifact(path: &Path, bytes: &[u8]) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    if fs::write(&temp, bytes).is_ok() {
+        let _ = fs::rename(&temp, path);
+    } else {
+        let _ = fs::remove_file(&temp);
     }
 }
 

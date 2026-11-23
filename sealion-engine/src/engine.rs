@@ -30,6 +30,11 @@ use crate::{
     runtime::{FuncType, RegisteredType, RuntimeState},
 };
 
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn needs_dynamic_runtime(message: &str) -> bool {
+    message.contains("dynamic runtime") || message.contains("string length")
+}
+
 fn set_flag(
     builder: &mut settings::Builder,
     name: &str,
@@ -94,10 +99,8 @@ impl Engine {
         options: &CompileOptions,
     ) -> Result<JitProgram, Error> {
         jit::check_target(options)?;
-        let mut ir = self.compile_with_options_internal(source, options, true, true)?;
-        let artifact = ir.serialize()?;
-        let functions = ir.into_functions();
-        let module = jit::load(&artifact)?;
+        let ir = self.compile_runtime_module(source, options)?;
+        let (module, functions) = ir.into_jit_parts()?;
         Ok(JitProgram::from_parts(module, functions))
     }
 
@@ -131,7 +134,7 @@ impl Engine {
         options: &CompileOptions,
     ) -> Result<Vec<u8>, Error> {
         jit::check_target(options)?;
-        let mut ir = self.compile_with_options_internal(source, options, true, true)?;
+        let mut ir = self.compile_runtime_module(source, options)?;
         ir.serialize()
     }
 
@@ -173,6 +176,22 @@ impl Engine {
         hash
     }
 
+    /// Compile for the in-process runtime, preferring the static value model
+    /// and falling back to the dynamic runtime only when the source needs it.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn compile_runtime_module(
+        &self,
+        source: &str,
+        options: &CompileOptions,
+    ) -> Result<IrModule, Error> {
+        match self.compile_with_options_internal(source, options, true, false) {
+            Err(Error::Unsupported(message)) if needs_dynamic_runtime(&message) => {
+                self.compile_with_options_internal(source, options, true, true)
+            }
+            result => result,
+        }
+    }
+
     fn compile_with_options_internal(
         &self,
         source: &str,
@@ -183,6 +202,8 @@ impl Engine {
         let mut effective = options.clone();
         if force_non_pic {
             effective.is_pic = false;
+            // The in-process loader does not register unwind information.
+            effective.unwind_info = false;
         }
         let options = &effective;
         let allocator = Allocator::default();

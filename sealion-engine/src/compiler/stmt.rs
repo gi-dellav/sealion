@@ -5,7 +5,7 @@ use oxc_ast::ast::{
     UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
-use super::expr::{compile_compare, compile_expr};
+use super::expr::{compile_condition_compare, compile_expr};
 use super::flow::{
     break_target, continue_target, emit_pending_exception, emit_unwind, set_exception,
     take_exception,
@@ -13,7 +13,6 @@ use super::flow::{
 use super::loops::{
     compile_do_while, compile_for, compile_labelled, compile_switch, compile_while,
 };
-use super::numeric::expr_is_number;
 use super::support::{enter_scope, node_scope, store_var};
 use super::{Cleanup, CodegenCtx, ExceptionTarget, Flow, StmtOutcome};
 use crate::{Error, plan::node_key, value};
@@ -196,19 +195,10 @@ pub(super) fn compile_condition<'a>(
             let cond = compile_condition(builder, ctx, flow, &unary.argument)?;
             Ok(builder.ins().icmp_imm(IntCC::Equal, cond, 0))
         }
-        Expression::BinaryExpression(binary) if binary.operator.is_compare() => {
-            let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
-            let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
-            let result = compile_compare(
-                builder,
-                ctx,
-                binary.operator,
-                lhs,
-                rhs,
-                expr_is_number(ctx, &binary.left),
-                expr_is_number(ctx, &binary.right),
-            )?;
-            Ok(value::truthy(builder, result, ctx.strings.as_ref()))
+        Expression::BinaryExpression(binary)
+            if binary.operator.is_compare() || binary.operator.is_equality() =>
+        {
+            compile_condition_compare(builder, ctx, flow, binary)
         }
         _ => {
             let value = compile_expr(builder, ctx, flow, expr)?;

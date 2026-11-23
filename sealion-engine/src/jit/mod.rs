@@ -113,7 +113,7 @@ pub(crate) fn check_target(options: &CompileOptions) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn load(artifact: &[u8]) -> Result<Module, Error> {
     artifact::load(artifact)
 }
@@ -126,4 +126,14 @@ pub(crate) fn build(
     source_checksum: u64,
 ) -> Result<Vec<u8>, Error> {
     artifact::build(object, options, target, source_checksum)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn build_module(
+    object: &[u8],
+    options: &CompileOptions,
+    target: &Triple,
+    source_checksum: u64,
+) -> Result<Module, Error> {
+    artifact::build_module(object, options, target, source_checksum)
 }

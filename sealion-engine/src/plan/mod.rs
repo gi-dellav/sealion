@@ -14,9 +14,11 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{Expression, Statement};
 
+mod calls;
 mod planner;
 mod resolve;
 
+pub use calls::DirectCallInfo;
 pub use planner::build_program_plan;
 pub use resolve::{is_const, needs_tdz_check, resolve, resolve_binding};
 
@@ -86,6 +88,10 @@ pub struct Program<'a> {
     pub scopes: Vec<ScopePlan<'a>>,
     /// Unique string literal contents, emitted as read-only data.
     pub strings: Vec<String>,
+    /// Direct-call and escaping information for hoisted function declarations.
+    pub direct_calls: DirectCallInfo<'a>,
+    /// Bindings whose loads and stores cannot observe the temporal dead zone.
+    pub no_tdz: HashSet<(ScopeId, usize)>,
 }
 
 impl<'a> Program<'a> {

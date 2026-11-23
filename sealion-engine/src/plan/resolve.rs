@@ -12,13 +12,14 @@ pub fn is_const(program: &Program<'_>, start: ScopeId, name: &str) -> bool {
     false
 }
 
-/// True when `name` resolves to a binding that starts in the temporal dead zone.
+/// True when `name` resolves to a binding that starts in the temporal dead zone
+/// and is not proven initialized before every load and store.
 pub fn needs_tdz_check(program: &Program<'_>, start: ScopeId, name: &str) -> bool {
     let mut current = Some(start);
     while let Some(id) = current {
         let scope = &program.scopes[id.0];
         if let Some(&slot) = scope.bindings.get(name) {
-            return scope.tdz.contains(&slot);
+            return scope.tdz.contains(&slot) && !program.no_tdz.contains(&(id, slot));
         }
         current = scope.parent;
     }

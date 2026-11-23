@@ -67,8 +67,10 @@ impl IrModule {
     }
 
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn into_functions(self) -> Vec<IrFunction> {
-        self.functions
+    pub(crate) fn into_jit_parts(mut self) -> Result<(jit::Module, Vec<IrFunction>), Error> {
+        let object = self.emit_object()?;
+        let module = jit::build_module(&object, &self.options, &self.target, self.source_checksum)?;
+        Ok((module, self.functions))
     }
 
     /// Serialize this compiled module as a self-contained artifact.

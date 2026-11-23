@@ -1,13 +1,19 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Value, types};
+use cranelift_codegen::ir::{
+    FuncRef, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value, types,
+};
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{Argument, CallExpression, Expression, StaticMemberExpression};
 
 use super::expr::compile_expr;
 use super::flow::emit_exception_check;
 use super::numeric::expr_is_number;
-use super::support::{call_calloc, new_closure};
+use super::support::new_closure;
 use super::{CodegenCtx, Flow};
-use crate::{Error, builtins, plan::resolve, value};
+use crate::{
+    Error, builtins,
+    plan::{resolve, resolve_binding},
+    value,
+};
 
 const MAX_ARGS: usize = 32;
 
@@ -130,15 +136,33 @@ pub(super) fn compile_call<'a>(
         return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
     }
 
+    if let Expression::Identifier(id) = &call.callee
+        && let Some(key) = resolve_binding(ctx.program, ctx.scope, id.name.as_str())
+        && let Some(&callee) = ctx.program.direct_calls.bindings.get(&key)
+        && ctx.program.direct_calls.safe.contains(&callee)
+        && let Some(&func_ref) = ctx.child_refs.get(&callee)
+    {
+        return compile_direct_call(
+            builder,
+            ctx,
+            flow,
+            func_ref,
+            &call.callee,
+            call.arguments.as_slice(),
+        );
+    }
+
     let callee = compile_expr(builder, ctx, flow, &call.callee)?;
     compile_call_value(builder, ctx, flow, callee, &call.arguments)
 }
 
-pub(super) fn compile_call_value<'a>(
+/// Evaluates call arguments into a stack buffer the callee reads in its
+/// prologue. The callee never retains the pointer, so no heap allocation is
+/// needed.
+fn compile_args<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     flow: &mut Flow<'a>,
-    callee: Value,
     args: &'a [Argument<'a>],
 ) -> Result<Value, Error> {
     if args.len() > MAX_ARGS {
@@ -147,15 +171,13 @@ pub(super) fn compile_call_value<'a>(
         )));
     }
 
-    let callee_ptr = value::payload(builder, callee);
-    let code = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), callee_ptr, 0i32);
-    let captured_env = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
-
-    let args_ptr = call_calloc(builder, ctx.calloc_ref, 8 + 8 * MAX_ARGS as i64);
+    let args_size = 8 + 8 * MAX_ARGS as u32;
+    let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        args_size,
+        3,
+    ));
+    let args_ptr = builder.ins().stack_addr(types::I64, args_slot, 0);
     let len = builder.ins().iconst(types::I64, args.len() as i64);
     builder.ins().store(MemFlags::new(), len, args_ptr, 0i32);
 
@@ -170,6 +192,47 @@ pub(super) fn compile_call_value<'a>(
             .ins()
             .store(MemFlags::new(), value, args_ptr, (8 + 8 * i) as i32);
     }
+
+    Ok(args_ptr)
+}
+
+fn compile_direct_call<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    func_ref: FuncRef,
+    callee_expr: &'a Expression<'a>,
+    args: &'a [Argument<'a>],
+) -> Result<Value, Error> {
+    let callee = compile_expr(builder, ctx, flow, callee_expr)?;
+    let callee_ptr = value::payload(builder, callee);
+    let captured_env = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
+    let args_ptr = compile_args(builder, ctx, flow, args)?;
+    let call = builder
+        .ins()
+        .call(func_ref, &[captured_env, args_ptr, callee]);
+    let result = builder.inst_results(call)[0];
+    emit_exception_check(builder, ctx, flow)?;
+    Ok(result)
+}
+
+pub(super) fn compile_call_value<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    callee: Value,
+    args: &'a [Argument<'a>],
+) -> Result<Value, Error> {
+    let callee_ptr = value::payload(builder, callee);
+    let code = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), callee_ptr, 0i32);
+    let captured_env = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
+    let args_ptr = compile_args(builder, ctx, flow, args)?;
 
     let call = builder
         .ins()

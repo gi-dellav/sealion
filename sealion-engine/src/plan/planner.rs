@@ -27,11 +27,17 @@ pub fn build_program_plan<'a>(
         None,
     )?;
 
-    Ok(Program {
+    let mut program = Program {
         functions: planner.functions,
         scopes: planner.scopes,
         strings: planner.strings,
-    })
+        direct_calls: Default::default(),
+        no_tdz: HashSet::new(),
+    };
+    let (direct_calls, no_tdz) = super::calls::analyze(&program);
+    program.direct_calls = direct_calls;
+    program.no_tdz = no_tdz;
+    Ok(program)
 }
 
 struct Planner<'a> {

@@ -18,7 +18,7 @@
 //! and parameters: loading such a slot traps until the declaration has run.
 
 use cranelift_codegen::ir::{
-    FuncRef, InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
+    BlockArg, FuncRef, InstBuilder, MemFlags, Value, condcodes::FloatCC, condcodes::IntCC, types,
 };
 use cranelift_frontend::FunctionBuilder;
 
@@ -190,14 +190,32 @@ pub fn truthy(builder: &mut FunctionBuilder, value: Value, strings: Option<&Stri
     let low = builder.ins().band_imm(bits, 1);
     let bool_true = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
     let bool_truthy = builder.ins().band(is_bool, bool_true);
-    let mut tagged_truthy = builder.ins().bor(is_fn, bool_truthy);
-    if let Some(ops) = strings {
-        let string_truthy = call1(builder, ops.truthy, value);
-        tagged_truthy = builder.ins().bor(tagged_truthy, string_truthy);
-    }
+    let tagged_truthy = builder.ins().bor(is_fn, bool_truthy);
     let zero = builder.ins().f64const(0.0);
     let num = builder.ins().fcmp(FloatCC::OrderedNotEqual, value, zero);
-    builder.ins().select(tagged, tagged_truthy, num)
+    let inline = builder.ins().select(tagged, tagged_truthy, num);
+
+    let Some(ops) = strings else {
+        return inline;
+    };
+    // Only strings need the host runtime; everything else is already decided.
+    let string_tag = builder.ins().iconst(types::I64, TAG_STRING as i64);
+    let is_string = builder.ins().icmp(IntCC::Equal, tag, string_tag);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let join = builder.create_block();
+    builder.append_block_param(join, types::I8);
+    builder.ins().brif(is_string, slow, &[], fast, &[]);
+
+    builder.switch_to_block(fast);
+    builder.ins().jump(join, &[BlockArg::Value(inline)]);
+
+    builder.switch_to_block(slow);
+    let string_truthy = call1(builder, ops.truthy, value);
+    builder.ins().jump(join, &[BlockArg::Value(string_truthy)]);
+
+    builder.switch_to_block(join);
+    builder.block_params(join)[0]
 }
 
 /// `===` over the NaN-boxed encoding: string contents compare equal, bit
@@ -210,7 +228,26 @@ pub fn strict_equal(
     strings: Option<&StringOps>,
 ) -> Value {
     if let Some(ops) = strings {
-        return call2(builder, ops.strict_equal, lhs, rhs);
+        let lhs_tagged = is_tagged(builder, lhs);
+        let rhs_tagged = is_tagged(builder, rhs);
+        let any_tagged = builder.ins().bor(lhs_tagged, rhs_tagged);
+        let fast = builder.create_block();
+        let slow = builder.create_block();
+        let join = builder.create_block();
+        builder.append_block_param(join, types::F64);
+        builder.ins().brif(any_tagged, slow, &[], fast, &[]);
+
+        builder.switch_to_block(fast);
+        let num_eq = builder.ins().fcmp(FloatCC::Equal, lhs, rhs);
+        let equal = from_bool(builder, num_eq);
+        builder.ins().jump(join, &[BlockArg::Value(equal)]);
+
+        builder.switch_to_block(slow);
+        let called = call2(builder, ops.strict_equal, lhs, rhs);
+        builder.ins().jump(join, &[BlockArg::Value(called)]);
+
+        builder.switch_to_block(join);
+        return builder.block_params(join)[0];
     }
     let lhs_bits = bits_of(builder, lhs);
     let rhs_bits = bits_of(builder, rhs);
@@ -254,7 +291,26 @@ pub fn loose_equal(
     strings: Option<&StringOps>,
 ) -> Value {
     if let Some(ops) = strings {
-        return call2(builder, ops.loose_equal, lhs, rhs);
+        let lhs_tagged = is_tagged(builder, lhs);
+        let rhs_tagged = is_tagged(builder, rhs);
+        let any_tagged = builder.ins().bor(lhs_tagged, rhs_tagged);
+        let fast = builder.create_block();
+        let slow = builder.create_block();
+        let join = builder.create_block();
+        builder.append_block_param(join, types::F64);
+        builder.ins().brif(any_tagged, slow, &[], fast, &[]);
+
+        builder.switch_to_block(fast);
+        let num_eq = builder.ins().fcmp(FloatCC::Equal, lhs, rhs);
+        let equal = from_bool(builder, num_eq);
+        builder.ins().jump(join, &[BlockArg::Value(equal)]);
+
+        builder.switch_to_block(slow);
+        let called = call2(builder, ops.loose_equal, lhs, rhs);
+        builder.ins().jump(join, &[BlockArg::Value(called)]);
+
+        builder.switch_to_block(join);
+        return builder.block_params(join)[0];
     }
     let strict = strict_equal(builder, lhs, rhs, None);
     let strict_true = truthy(builder, strict, None);
@@ -303,7 +359,22 @@ pub fn to_number(
     strings: Option<&StringOps>,
 ) -> Value {
     if let Some(ops) = strings {
-        return call1(builder, ops.to_number, value);
+        let tagged = is_tagged(builder, value);
+        let fast = builder.create_block();
+        let slow = builder.create_block();
+        let join = builder.create_block();
+        builder.append_block_param(join, types::F64);
+        builder.ins().brif(tagged, slow, &[], fast, &[]);
+
+        builder.switch_to_block(fast);
+        builder.ins().jump(join, &[BlockArg::Value(value)]);
+
+        builder.switch_to_block(slow);
+        let converted = call1(builder, ops.to_number, value);
+        builder.ins().jump(join, &[BlockArg::Value(converted)]);
+
+        builder.switch_to_block(join);
+        return builder.block_params(join)[0];
     }
     let bits = bits_of(builder, value);
     let tagged = is_tagged(builder, value);
@@ -334,7 +405,26 @@ pub fn add(
     rhs: Value,
     strings: Option<&StringOps>,
 ) -> Option<Value> {
-    strings.map(|ops| call2(builder, ops.add, lhs, rhs))
+    let ops = strings?;
+    let lhs_tagged = is_tagged(builder, lhs);
+    let rhs_tagged = is_tagged(builder, rhs);
+    let any_tagged = builder.ins().bor(lhs_tagged, rhs_tagged);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let join = builder.create_block();
+    builder.append_block_param(join, types::F64);
+    builder.ins().brif(any_tagged, slow, &[], fast, &[]);
+
+    builder.switch_to_block(fast);
+    let sum = builder.ins().fadd(lhs, rhs);
+    builder.ins().jump(join, &[BlockArg::Value(sum)]);
+
+    builder.switch_to_block(slow);
+    let called = call2(builder, ops.add, lhs, rhs);
+    builder.ins().jump(join, &[BlockArg::Value(called)]);
+
+    builder.switch_to_block(join);
+    Some(builder.block_params(join)[0])
 }
 
 /// Abstract relational comparison: returns `-1`, `0`, `1`, or `i32::MIN` when
@@ -345,7 +435,35 @@ pub fn compare(
     rhs: Value,
     strings: Option<&StringOps>,
 ) -> Option<Value> {
-    strings.map(|ops| call2(builder, ops.compare, lhs, rhs))
+    let ops = strings?;
+    let lhs_tagged = is_tagged(builder, lhs);
+    let rhs_tagged = is_tagged(builder, rhs);
+    let any_tagged = builder.ins().bor(lhs_tagged, rhs_tagged);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let join = builder.create_block();
+    builder.append_block_param(join, types::I32);
+    builder.ins().brif(any_tagged, slow, &[], fast, &[]);
+
+    builder.switch_to_block(fast);
+    let unordered = builder.ins().fcmp(FloatCC::Unordered, lhs, rhs);
+    let less = builder.ins().fcmp(FloatCC::LessThan, lhs, rhs);
+    let greater = builder.ins().fcmp(FloatCC::GreaterThan, lhs, rhs);
+    let minus_one = builder.ins().iconst(types::I32, -1);
+    let zero = builder.ins().iconst(types::I32, 0);
+    let one = builder.ins().iconst(types::I32, 1);
+    let ordered = builder.ins().select(less, minus_one, zero);
+    let ordered = builder.ins().select(greater, one, ordered);
+    let nan = builder.ins().iconst(types::I32, i64::from(i32::MIN));
+    let result = builder.ins().select(unordered, nan, ordered);
+    builder.ins().jump(join, &[BlockArg::Value(result)]);
+
+    builder.switch_to_block(slow);
+    let called = call2(builder, ops.compare, lhs, rhs);
+    builder.ins().jump(join, &[BlockArg::Value(called)]);
+
+    builder.switch_to_block(join);
+    Some(builder.block_params(join)[0])
 }
 
 /// ECMAScript `ToInt32`: `x` modulo `2**32`, truncated toward zero, reinterpreted

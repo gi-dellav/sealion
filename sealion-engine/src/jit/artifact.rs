@@ -288,6 +288,31 @@ pub(super) fn build(
     source_checksum: u64,
 ) -> Result<Vec<u8>, Error> {
     let page = Linux::page_size();
+    let (linked, metadata, info) = link_module(object, options, target, source_checksum)?;
+    encode_artifact(&linked, &metadata, &info, page)
+}
+
+/// Build and publish a module in one step, without serializing and reparsing
+/// the ELF artifact container used by the on-disk format.
+pub(super) fn build_module(
+    object: &[u8],
+    options: &CompileOptions,
+    target: &Triple,
+    source_checksum: u64,
+) -> Result<Module, Error> {
+    let page = Linux::page_size();
+    let (linked, metadata, info) = link_module(object, options, target, source_checksum)?;
+    let artifact = encode_artifact(&linked, &metadata, &info, page)?;
+    publish(linked, info, metadata, artifact)
+}
+
+fn link_module(
+    object: &[u8],
+    options: &CompileOptions,
+    target: &Triple,
+    source_checksum: u64,
+) -> Result<(loader::LinkedImage, EngineMetadata, ModuleInfo), Error> {
+    let page = Linux::page_size();
     let linked = loader::link::<X86_64>(object, page)?;
 
     let metadata = EngineMetadata {
@@ -373,9 +398,18 @@ pub(super) fn build(
         base_fixups,
     };
 
-    let meta_section = encode_engine_metadata(&metadata)?;
+    Ok((linked, metadata, info))
+}
+
+fn encode_artifact(
+    linked: &loader::LinkedImage,
+    metadata: &EngineMetadata,
+    info: &ModuleInfo,
+    page: usize,
+) -> Result<Vec<u8>, Error> {
+    let meta_section = encode_engine_metadata(metadata)?;
     let info_section =
-        postcard::to_allocvec(&info).map_err(|e| Error::Loader(format!("metadata encode: {e}")))?;
+        postcard::to_allocvec(info).map_err(|e| Error::Loader(format!("metadata encode: {e}")))?;
 
     let mut obj = write::Object::new(
         BinaryFormat::Elf,
@@ -410,6 +444,41 @@ pub(super) fn build(
 
     obj.write()
         .map_err(|e| Error::Loader(format!("failed to write artifact: {e}")))
+}
+
+fn publish(
+    linked: loader::LinkedImage,
+    info: ModuleInfo,
+    metadata: EngineMetadata,
+    artifact: Vec<u8>,
+) -> Result<Module, Error> {
+    let text_len = linked.text_len;
+    let image_len = linked.image.len();
+    let mut memory = Linux::allocate(image_len)?;
+    if memory.len() != image_len {
+        return Err(error(
+            "artifact memory allocation returned an unexpected size",
+        ));
+    }
+    let base = memory.base();
+    unsafe {
+        ptr::copy_nonoverlapping(linked.image.as_ptr(), base, image_len);
+    }
+
+    apply_imports(&info, base, text_len)?;
+    apply_base_fixups(&info, base)?;
+
+    unsafe {
+        memory.publish(text_len)?;
+    }
+    X86_64::flush_icache(base, text_len);
+
+    Ok(Module {
+        memory,
+        info,
+        metadata,
+        artifact,
+    })
 }
 
 fn encode_engine_metadata(metadata: &EngineMetadata) -> Result<Vec<u8>, Error> {
