@@ -6,7 +6,9 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [-s] [-h]
 
-Build sealionjs, then compile & run every test in testerjs.
+Build sealionjs, then run every test in this directory with the
+dynamic (JIT) runtime -- no executables are written to disk.
+sicp.js is the shared library, not a test, and is skipped.
 At the end, report how many passed, how many compiled but failed
 while running, and how many did not compile.
 
@@ -35,7 +37,7 @@ if [ "$skip_install" -eq 1 ]; then
     echo "Skipping install (-s), using $BIN..."
 else
     echo "Installing sealionjs..."
-    if ! cargo install --path "$ROOT/sealionjs" --force >"$TMP/install.log" 2>&1; then
+    if ! cargo install --path "$ROOT/../../sealionjs" --force >"$TMP/install.log" 2>&1; then
         cat "$TMP/install.log" >&2
         echo "cargo install failed" >&2
         exit 1
@@ -47,24 +49,32 @@ passed=0
 run_failed=0
 compile_failed=0
 
-for src in "$ROOT"/baseline/*.js; do
+for src in "$ROOT"/*.js; do
     name=$(basename "$src")
-    out="$TMP/$name.bin"
+    [ "$name" = sicp.js ] && continue
 
-    if ! "$BIN" "$src" -o "$out" >"$TMP/$name.compile" 2>&1; then
+    # Run through the JIT: sealionjs itself exits with the program's value
+    # (truncated to 8 bits, exactly like a native binary's exit status).
+    "$BIN" "$src" >"$TMP/$name.run" 2>"$TMP/$name.err"
+    status=$?
+
+    # Compile errors are reported as "sealionjs: ..." on stderr, before any
+    # program output and with exit code 1; a program value of 1 looks the same
+    # otherwise, so use the message to tell them apart.
+    if grep -q '^sealionjs: ' "$TMP/$name.err"; then
         ((compile_failed++))
         echo "MISS $name"
+        sed 's/^/     | /' "$TMP/$name.err" >&2
         continue
     fi
 
-    "$out" >"$TMP/$name.run" 2>&1
-    status=$?
     # Exit code -1 (255 for the shell) is the only real failure; any other
     # code is the test's own computed result.
     if [ "$status" -eq 255 ]; then
         ((run_failed++))
         echo "FAIL $name (exit -1)"
         sed 's/^/     | /' "$TMP/$name.run" >&2
+        sed 's/^/     | /' "$TMP/$name.err" >&2
     else
         ((passed++))
         echo "OK   $name (exit $status)"
