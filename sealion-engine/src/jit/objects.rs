@@ -43,6 +43,9 @@ pub(super) struct JsObject {
     /// `Some(..)` when this object is a `Map`: insertion-ordered key/value
     /// pairs compared with SameValueZero.
     pub(super) entries: Option<Vec<(f64, f64)>>,
+    /// `Some(..)` when this object is a `Date`: the instant in milliseconds
+    /// since the epoch, `NaN` when invalid (a "time value" in the spec).
+    pub(super) date: Option<f64>,
     /// The object consulted when an own property is absent, or `None` to end
     /// the chain (`Object.create(null)`).
     pub(super) prototype: Option<*mut JsObject>,
@@ -53,12 +56,20 @@ fn alloc_object(prototype: Option<*mut JsObject>) -> *mut JsObject {
         properties: Vec::new(),
         elements: None,
         entries: None,
+        date: None,
         prototype,
     }))
 }
 
+/// Allocates a `Date` holding `time`.
+pub(super) fn new_date(time: f64) -> *mut JsObject {
+    let pointer = alloc_object(Some(super::dates::date_prototype()));
+    unsafe { (*pointer).date = Some(time) };
+    pointer
+}
+
 /// The shared root prototype (`Object.prototype`), created on first use.
-fn object_prototype() -> *mut JsObject {
+pub(super) fn object_prototype() -> *mut JsObject {
     static PROTOTYPE: OnceLock<usize> = OnceLock::new();
     *PROTOTYPE.get_or_init(|| alloc_object(None) as usize) as *mut JsObject
 }
@@ -78,6 +89,7 @@ pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
         properties: Vec::new(),
         elements: Some(elements),
         entries: None,
+        date: None,
         prototype: Some(array_prototype()),
     }))
 }
@@ -87,8 +99,26 @@ pub(super) fn new_map() -> *mut JsObject {
         properties: Vec::new(),
         elements: None,
         entries: Some(Vec::new()),
+        date: None,
         prototype: Some(object_prototype()),
     }))
+}
+
+/// A native method bound to `env`, as the two-word record the four method
+/// tables build: `[entry point, receiver]`.
+pub(super) fn native_function(method: Method, env: u64) -> f64 {
+    let record = Box::into_raw(Box::new([method as usize as u64, env]));
+    f64::from_bits((TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK))
+}
+
+/// Defines (or overwrites) the own data property `key` of `object`.
+pub(super) fn define_property(object: *mut JsObject, key: &str, value: f64) {
+    let key = JsString::from(key);
+    let object = object_at(object);
+    match object.properties.iter_mut().find(|(name, _)| *name == key) {
+        Some(entry) => entry.1 = value,
+        None => object.properties.push((key, value)),
+    }
 }
 
 pub(super) fn tagged_object(pointer: *mut JsObject) -> f64 {
@@ -247,6 +277,7 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     }
     maps::method_property(object, &key)
         .or_else(|| arrays::method_property(object, &key))
+        .or_else(|| super::dates::method_property(object, &key))
         .or_else(|| object_method_property(object, &key))
         .or_else(|| method_property(object, &key))
         .unwrap_or_else(tagged_undefined)
@@ -281,6 +312,7 @@ extern "C" fn sealion_object_has(object: f64, key: f64) -> f64 {
     let has = chain_get(object, &key).is_some()
         || arrays::has_element(object, &key)
         || maps::method_property(object, &key).is_some()
+        || super::dates::method_property(object, &key).is_some()
         || object_method_property(object, &key).is_some()
         || (key == "__proto__" && is_object(object));
     tagged_bool(has)

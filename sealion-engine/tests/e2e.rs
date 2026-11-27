@@ -594,8 +594,28 @@ fn builtins_shadowing_and_errors() {
     assert!(Engine::new().compile("Math.abs;").is_err());
     assert!(Engine::new().compile("Math.nope(1);").is_err());
     assert!(Engine::new().compile("Number.PI;").is_err());
-    assert!(Engine::new().compile("var m = Math;").is_err());
     assert!(Engine::new().compile("Math['abs'](1);").is_err());
+}
+
+#[test]
+fn namespace_values_require_the_dynamic_runtime() {
+    // `Math`, `String` and `Date` are objects and constructors of the dynamic
+    // runtime only: the AOT backend has no JIT loader to resolve them.
+    for program in [
+        "var m = Math;",
+        "Math.abs;",
+        "String.fromCharCode(65);",
+        "String.fromCodePoint(65);",
+        "Date.parse(\"2020-01-01\");",
+        "new Date(0);",
+        "Date();",
+        "Date.prototype;",
+    ] {
+        assert!(Engine::new().compile(program).is_err(), "{program}");
+    }
+    // The compile-time namespaces keep working.
+    assert_eq!(run("Math.max(1, 2);"), 2);
+    assert_eq!(run("Date.now() > 0 ? 1 : 0;"), 1);
 }
 
 #[test]

@@ -6,12 +6,12 @@
 //! is normally linked into a test or application binary whose symbols are not
 //! exported.
 
-use std::{cmp::Ordering, io::Write, mem::ManuallyDrop, ptr::NonNull, str};
+use std::{cmp::Ordering, io::Write, mem::ManuallyDrop, ptr::NonNull, str, sync::OnceLock};
 
-use sealion_string::{JsString, RawJsString};
+use sealion_string::{CodePoint, JsString, RawJsString};
 
 use super::arrays::{arg, arg_count, call};
-use super::objects::{new_array, tagged_object};
+use super::objects::{define_property, native_function, new_array, new_object, tagged_object};
 use crate::value::{
     PAYLOAD_MASK, TAG_BOOLEAN, TAG_FUNCTION, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_UNDEFINED,
     TAG_UNINITIALIZED,
@@ -54,7 +54,7 @@ fn tag(value: f64) -> u64 {
     value.to_bits() >> 48
 }
 
-fn is_string(value: f64) -> bool {
+pub(super) fn is_string(value: f64) -> bool {
     tag(value) == TAG_STRING
 }
 
@@ -121,7 +121,8 @@ pub(super) fn to_js_string(value: f64) -> JsString {
         TAG_UNDEFINED => JsString::from("undefined"),
         TAG_NULL => JsString::from("null"),
         TAG_FUNCTION => JsString::from("function"),
-        TAG_OBJECT => super::arrays::array_to_js_string(value)
+        TAG_OBJECT => super::dates::date_to_js_string(value)
+            .or_else(|| super::arrays::array_to_js_string(value))
             .unwrap_or_else(|| JsString::from("[object Object]")),
         TAG_BOOLEAN => JsString::from(if value.to_bits() & 1 != 0 {
             "true"
@@ -289,7 +290,7 @@ extern "C" fn sealion_console_log(values: *const f64, len: u64) {
     let _ = stdout.flush();
 }
 
-type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
+pub(super) type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
 
 /// The tagged string a method record captured as its `env`.
 fn receiver_value(env: i64) -> f64 {
@@ -775,9 +776,92 @@ extern "C" fn to_string(env: i64, _args: *const u8, _callee: f64, _this: f64) ->
     tagged_string(receiver(env))
 }
 
+/// `ToUint16`: `ToNumber`, then modulo `2**16` as an unsigned value.
+fn to_uint16(value: f64) -> u16 {
+    let number = to_number_value(value).trunc();
+    if !number.is_finite() {
+        return 0;
+    }
+    number.rem_euclid(65_536.0) as u16
+}
+
+/// `ToCodePoint`: an integral value in `0..=0x10FFFF`, lone surrogates
+/// included, or `None` when the value is out of range.
+///
+/// TODO(error-handling): the specification throws a `RangeError` for a
+/// non-integral or out-of-range code point; the host ABI has no exception
+/// channel yet, so the code point is skipped instead.
+fn to_code_point(value: f64) -> Option<CodePoint> {
+    let number = to_number_value(value);
+    if !number.is_finite() || number.fract() != 0.0 || !(0.0..=0x10_FFFF as f64).contains(&number) {
+        return None;
+    }
+    let number = number as u32;
+    Some(match char::from_u32(number) {
+        Some(character) => CodePoint::from(character),
+        None => CodePoint::UnpairedSurrogate(number as u16),
+    })
+}
+
+fn from_char_code_units(args: *const u8) -> JsString {
+    let units: Vec<u16> = (0..arg_count(args))
+        .map(|index| to_uint16(arg(args, index)))
+        .collect();
+    js(&units)
+}
+
+fn from_code_points(args: *const u8) -> JsString {
+    let mut units = Vec::new();
+    let mut buffer = [0u16; 2];
+    for index in 0..arg_count(args) {
+        if let Some(code_point) = to_code_point(arg(args, index)) {
+            units.extend_from_slice(code_point.encode_utf16(&mut buffer));
+        }
+    }
+    js(&units)
+}
+
+extern "C" fn sealion_string_from_char_codes(args: *const u8) -> u64 {
+    tagged_string(from_char_code_units(args)).to_bits() & PAYLOAD_MASK
+}
+
+extern "C" fn sealion_string_from_code_points(args: *const u8) -> u64 {
+    tagged_string(from_code_points(args)).to_bits() & PAYLOAD_MASK
+}
+
+extern "C" fn from_char_codes(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let _ = env;
+    tagged_string(from_char_code_units(args))
+}
+
+extern "C" fn code_points(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let _ = env;
+    tagged_string(from_code_points(args))
+}
+
+/// The `String` namespace object of the dynamic runtime: `fromCharCode` and
+/// `fromCodePoint` as callable values. The engine has no `String.prototype`
+/// object, so the object carries no `prototype` property.
+extern "C" fn sealion_string_object() -> u64 {
+    static OBJECT: OnceLock<usize> = OnceLock::new();
+    *OBJECT.get_or_init(|| {
+        let pointer = new_object();
+        for (name, method) in [
+            ("fromCharCode", from_char_codes as Method),
+            ("fromCodePoint", code_points as Method),
+        ] {
+            define_property(pointer, name, native_function(method, 0));
+        }
+        pointer as usize
+    }) as u64
+}
+
 pub(super) fn lookup(name: &str) -> Option<usize> {
     Some(match name {
         "sealion_string_from_utf8" => sealion_string_from_utf8 as *const () as usize,
+        "sealion_string_from_char_codes" => sealion_string_from_char_codes as *const () as usize,
+        "sealion_string_from_code_points" => sealion_string_from_code_points as *const () as usize,
+        "sealion_string_object" => sealion_string_object as *const () as usize,
         "sealion_string_to_number" => sealion_string_to_number as *const () as usize,
         "sealion_string_to_string" => sealion_string_to_string as *const () as usize,
 

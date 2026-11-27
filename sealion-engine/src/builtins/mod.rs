@@ -1,13 +1,15 @@
-//! The `Math`, `Number`, `Object` and `Date` namespaces.
+//! The `Math`, `Number`, `Object`, `Array`, `String`, `Date` and `console`
+//! namespaces.
 //!
-//! They are not objects: they are compile-time namespaces whose members are
-//! either constants (folded to an `f64` literal) or builtin functions (compiled
-//! to a libm call or a short instruction sequence). The global `isNaN`,
-//! `isFinite`, `Boolean` and `Number` functions are compiled the same way, as
-//! are the global `NaN` and `Infinity` constants.
+//! They are compile-time namespaces whose members are either constants (folded
+//! to an `f64` literal) or builtin functions (compiled to a libm call or a
+//! short instruction sequence). The global `isNaN`, `isFinite`, `Boolean`,
+//! `Number`, `String`, `Array`, `Map` and `Date` functions are compiled the
+//! same way, as are the global `NaN` and `Infinity` constants.
 //!
-//! The namespaces are not first-class values: only `Math.member`,
-//! `Number.member`, `Object.member` and `Date.member` are accepted.
+//! `Math`, `String` and `Date` are also real objects of the dynamic (JIT)
+//! runtime, so a member can be read as a value; the static backend keeps them
+//! compile-time only, and every namespace member call is dispatched here.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +36,7 @@ pub enum Namespace {
     Number,
     Object,
     Array,
+    String,
     Date,
     Console,
 }
@@ -72,13 +75,16 @@ const OBJECT_INLINE: &[&str] = &[
 /// `Array` static functions implemented by the dynamic runtime.
 const ARRAY_INLINE: &[&str] = &["isArray", "of", "from", "prototype"];
 
-/// `Date` functions implemented inline.
-const DATE_INLINE: &[&str] = &["now"];
+/// `String` static functions implemented by the dynamic runtime.
+const STRING_INLINE: &[&str] = &["fromCharCode", "fromCodePoint"];
+
+/// `Date` functions implemented inline or by the dynamic runtime.
+const DATE_INLINE: &[&str] = &["now", "parse", "UTC", "prototype"];
 
 /// `console` functions implemented by the dynamic runtime.
 const CONSOLE_INLINE: &[&str] = &["log"];
 
-const MATH_CONSTANTS: &[(&str, f64)] = &[
+pub(crate) const MATH_CONSTANTS: &[(&str, f64)] = &[
     ("PI", std::f64::consts::PI),
     ("E", std::f64::consts::E),
     ("LN2", std::f64::consts::LN_2),
@@ -226,6 +232,35 @@ impl Builtins {
                 let id = module.declare_function(name, Linkage::Import, &pointer_sig)?;
                 funcs.insert(name, id);
             }
+
+            for name in [
+                "sealion_math_object",
+                "sealion_string_object",
+                "sealion_date_object",
+                "sealion_date_prototype",
+            ] {
+                let id = module.declare_function(name, Linkage::Import, &pointer_sig)?;
+                funcs.insert(name, id);
+            }
+            for name in [
+                "sealion_string_from_char_codes",
+                "sealion_string_from_code_points",
+            ] {
+                let id = module.declare_function(name, Linkage::Import, &length_sig)?;
+                funcs.insert(name, id);
+            }
+            let i64_to_f64_sig = make_i64_to_f64_signature(module);
+            for name in ["sealion_date_construct", "sealion_date_utc"] {
+                let id = module.declare_function(name, Linkage::Import, &i64_to_f64_sig)?;
+                funcs.insert(name, id);
+            }
+            for name in ["sealion_date_now", "sealion_date_call"] {
+                let id = module.declare_function(name, Linkage::Import, &nullary_sig)?;
+                funcs.insert(name, id);
+            }
+            let parse_id =
+                module.declare_function("sealion_date_parse", Linkage::Import, &unary_sig)?;
+            funcs.insert("sealion_date_parse", parse_id);
         }
 
         let names = MATH_CONSTANTS
@@ -238,6 +273,7 @@ impl Builtins {
             .chain(NUMBER_INLINE.iter().copied())
             .chain(OBJECT_INLINE.iter().copied())
             .chain(ARRAY_INLINE.iter().copied())
+            .chain(STRING_INLINE.iter().copied())
             .chain(DATE_INLINE.iter().copied())
             .chain(CONSOLE_INLINE.iter().copied())
             .collect();
@@ -252,6 +288,7 @@ impl Builtins {
             "Number" => Some(Namespace::Number),
             "Object" => Some(Namespace::Object),
             "Array" => Some(Namespace::Array),
+            "String" => Some(Namespace::String),
             "Date" => Some(Namespace::Date),
             "console" => Some(Namespace::Console),
             _ => None,
@@ -268,6 +305,7 @@ impl Builtins {
             "String" => Some("String"),
             "Array" => Some("Array"),
             "Map" => Some("Map"),
+            "Date" => Some("Date"),
             _ => None,
         }
     }
@@ -332,6 +370,7 @@ impl Builtins {
             Namespace::Number => NUMBER_INLINE.contains(&name),
             Namespace::Object => OBJECT_INLINE.contains(&name),
             Namespace::Array => ARRAY_INLINE.contains(&name),
+            Namespace::String => STRING_INLINE.contains(&name),
             Namespace::Date => DATE_INLINE.contains(&name),
             Namespace::Console => CONSOLE_INLINE.contains(&name),
         }
@@ -342,7 +381,11 @@ impl Builtins {
         let table = match namespace {
             Namespace::Math => MATH_CONSTANTS,
             Namespace::Number => NUMBER_CONSTANTS,
-            Namespace::Object | Namespace::Array | Namespace::Date | Namespace::Console => {
+            Namespace::Object
+            | Namespace::Array
+            | Namespace::String
+            | Namespace::Date
+            | Namespace::Console => {
                 return None;
             }
         };
@@ -366,6 +409,13 @@ impl Builtins {
 fn make_nullary_i64_signature(module: &mut ObjectModule) -> Signature {
     let mut sig = module.make_signature();
     sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+fn make_i64_to_f64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::F64));
     sig
 }
 

@@ -91,13 +91,16 @@
 //! - `function` declarations hoist to the enclosing function even when written
 //!   in a block, so they cannot see that block's `let`/`const` bindings.
 //!
-//! `Math`, `Number`, `Object` and `Date` are namespaces, not objects: every
-//! member is either a compile-time constant or a builtin function, so
+//! `Math`, `Number`, `Object`, `Array`, `String` and `Date` are namespaces:
+//! every member is either a compile-time constant or a builtin function, so
 //! `Math.PI` folds to a literal, `Math.sqrt` becomes a libm call and
 //! `Math.clz32` a few instructions. Consequences:
 //!
-//! - The namespaces cannot be used as values (`var m = Math` is rejected), and
-//!   only the dot notation reaches them.
+//! - In the dynamic runtime `Math`, `String` and `Date` are also objects, so
+//!   `var m = Math`, `var floor = Math.floor` and `Object.keys(Math)` work, and
+//!   `Date.prototype`, `new Date(...)`, `Date.parse` and `Date.UTC` are
+//!   available. The static backend rejects them, because it links no host
+//!   runtime. `Number`, `Object` and `console` are still values of neither.
 //! - A local binding named after a namespace or builtin shadows it for reads,
 //!   but `Math.abs(x)` still resolves to the builtin.
 //! - `isNaN`/`isFinite` coerce their argument; `Number.isNaN`/`Number.isFinite`
@@ -106,7 +109,13 @@
 //!   `-0`/`NaN` semantics, `Math.fround` rounds through an `f32`, and
 //!   `Math.f16round` rounds to half precision. `Math.hypot` scales its
 //!   operands, and `Math.random` uses `drand48`.
-//! - `Date.now()` returns the current epoch time in milliseconds.
+//! - `Date.now()` returns the current epoch time in milliseconds. `Date`
+//!   instances read the local timezone from the system clock, and
+//!   `String.fromCharCode`/`String.fromCodePoint` build strings from UTF-16
+//!   code units and code points.
+//! - The host helpers cannot raise, so `String.fromCodePoint` skips an
+//!   out-of-range code point and `toISOString` yields `"Invalid Date"` instead
+//!   of throwing `RangeError`; `Date.parse` yields `NaN`.
 //!
 //! Optional chains short-circuit to `undefined` for nullish values. Without
 //! objects, non-builtin property reads inside a chain evaluate to `undefined`;

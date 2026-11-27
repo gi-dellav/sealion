@@ -83,6 +83,7 @@ pub fn call(
     args: &[Value],
     known: &[bool],
     strings: Option<&value::StringOps>,
+    construct: bool,
 ) -> Result<Value, Error> {
     if namespace == Some(Namespace::Console) {
         if strings.is_none() {
@@ -135,14 +136,65 @@ pub fn call(
             call_libm(builder, func_ref, &[])
         }
         "now" => {
-            let func_ref = *funcs
-                .get("now")
-                .ok_or_else(|| Error::Unsupported("Date.now is not available".to_string()))?;
-            let null = builder.ins().iconst(types::I64, 0);
-            let call = builder.ins().call(func_ref, &[null]);
-            let seconds = builder.inst_results(call)[0];
-            let millis = builder.ins().imul_imm(seconds, 1000);
-            builder.ins().fcvt_from_sint(types::F64, millis)
+            // The dynamic runtime reads the clock in milliseconds through its
+            // host helper; the static backend keeps the libc `time` seconds.
+            if let Some(&func_ref) = funcs.get("sealion_date_now") {
+                call_libm(builder, func_ref, &[])
+            } else {
+                let func_ref = *funcs
+                    .get("now")
+                    .ok_or_else(|| Error::Unsupported("Date.now is not available".to_string()))?;
+                let null = builder.ins().iconst(types::I64, 0);
+                let call = builder.ins().call(func_ref, &[null]);
+                let seconds = builder.inst_results(call)[0];
+                let millis = builder.ins().imul_imm(seconds, 1000);
+                builder.ins().fcvt_from_sint(types::F64, millis)
+            }
+        }
+        "parse" => {
+            let func_ref = *funcs.get("sealion_date_parse").ok_or_else(|| {
+                Error::Unsupported("Date.parse requires the dynamic runtime".to_string())
+            })?;
+            let argument = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[argument])
+        }
+        "UTC" => {
+            let func_ref = *funcs.get("sealion_date_utc").ok_or_else(|| {
+                Error::Unsupported("Date.UTC requires the dynamic runtime".to_string())
+            })?;
+            let values = write_args(builder, args);
+            let call = builder.ins().call(func_ref, &[values]);
+            builder.inst_results(call)[0]
+        }
+        "fromCharCode" | "fromCodePoint" => {
+            let symbol = if name == "fromCharCode" {
+                "sealion_string_from_char_codes"
+            } else {
+                "sealion_string_from_code_points"
+            };
+            let func_ref = *funcs.get(symbol).ok_or_else(|| {
+                Error::Unsupported(format!("String.{name} requires the dynamic runtime"))
+            })?;
+            let values = write_args(builder, args);
+            let call = builder.ins().call(func_ref, &[values]);
+            let raw = builder.inst_results(call)[0];
+            value::string(builder, raw)
+        }
+        "Date" => {
+            if construct {
+                let func_ref = *funcs.get("sealion_date_construct").ok_or_else(|| {
+                    Error::Unsupported("new Date requires the dynamic runtime".to_string())
+                })?;
+                let values = write_args(builder, args);
+                let call = builder.ins().call(func_ref, &[values]);
+                builder.inst_results(call)[0]
+            } else {
+                let func_ref = *funcs.get("sealion_date_call").ok_or_else(|| {
+                    Error::Unsupported("Date() requires the dynamic runtime".to_string())
+                })?;
+                let call = builder.ins().call(func_ref, &[]);
+                builder.inst_results(call)[0]
+            }
         }
         "sign" => {
             let x = number_argument(builder, args, 0, known, strings);
@@ -245,6 +297,7 @@ pub fn call(
         "prototype" => {
             let symbol = match namespace {
                 Some(Namespace::Array) => "sealion_array_prototype",
+                Some(Namespace::Date) => "sealion_date_prototype",
                 _ => "sealion_object_prototype",
             };
             let func_ref = *funcs.get(symbol).ok_or_else(|| {

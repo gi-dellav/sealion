@@ -1463,3 +1463,240 @@ fn typeof_composes_with_operators_and_control_flow() {
     );
     assert_eq!(run(r#"typeof [1, 2].length === "number" ? 1 : 0;"#), 1);
 }
+
+#[test]
+fn string_from_char_code_and_code_point() {
+    assert_eq!(run(r#"String.fromCharCode(72, 105) === "Hi" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"String.fromCharCode() === "" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"String.fromCharCode(65).charCodeAt(0) === 65 ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"String.fromCharCode(0x1F600).charCodeAt(0) === 0xF600 ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"String.fromCharCode("65") === "A" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"String.fromCodePoint(65, 66) === "AB" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"String.fromCodePoint().toString() === "" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"String.fromCodePoint(0x1F600).length === 2 ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"String.fromCodePoint(0x1F600).codePointAt(0) === 0x1F600 ? 1 : 0;"#),
+        1
+    );
+    // A lone surrogate is a legal code point; an out-of-range or non-integral
+    // one is skipped instead of raising `RangeError`.
+    assert_eq!(
+        run(r#"String.fromCodePoint(0xD800).length === 1 ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"String.fromCodePoint(0x110000) === "" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"String.fromCodePoint(1.5) === "" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var f = String.fromCharCode; f(65) === "A" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var f = String.fromCodePoint; f(65) === "A" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn math_namespace_object() {
+    assert_eq!(run(r#"typeof Math === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var m = Math; m.floor(2.7) === 2 ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var m = Math; m["abs"](-3) === 3 ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var f = Math.max; f(1, 2) === 2 ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var r = Math.random; r() >= 0 ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"Math.PI > 3.14 && Math.PI < 3.15 ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var m = Math; m.E > 2.7 ? 1 : 0;"#), 1);
+    assert_eq!(run("Object.keys(Math).length;"), 44);
+    // The sign of zero survives the object path, as it does the inline path.
+    assert_eq!(
+        run(r#"var m = Math; 1 / m.round(-0.4) === -Infinity ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = Math; 1 / m.min(-0, 0) === -Infinity ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = Math; Number.isNaN(m.max(1, NaN)) ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn math_namespace_matches_inline_calls() {
+    for call in [
+        "abs(-3)",
+        "ceil(1.2)",
+        "floor(-1.2)",
+        "round(2.5)",
+        "round(-0.4)",
+        "trunc(-1.7)",
+        "sqrt(16)",
+        "cbrt(27)",
+        "exp(1)",
+        "log(1)",
+        "log10(100)",
+        "log2(8)",
+        "sin(0)",
+        "cos(0)",
+        "atan2(1, 1)",
+        "pow(2, 8)",
+        "hypot(3, 4)",
+        "sign(-3)",
+        "clz32(1)",
+        "imul(3, 4)",
+        "fround(1.337)",
+        "f16round(1.1)",
+        "min(3, 1)",
+        "max(3, 1)",
+    ] {
+        // `f64::cbrt` and friends may differ from the libm call the inline path
+        // emits by one unit in the last place, so the two paths are compared
+        // with a tolerance rather than bit for bit.
+        let js = format!("var m = Math; Math.abs(m.{call} - Math.{call}) < 1e-9 ? 1 : 0;");
+        assert_eq!(run(&js), 1, "{call}");
+    }
+}
+
+#[test]
+fn date_constructor_and_getters() {
+    assert_eq!(run("new Date(0).getTime() === 0 ? 1 : 0;"), 1);
+    assert_eq!(run("new Date(86400000).getUTCDate() === 2 ? 1 : 0;"), 1);
+    assert_eq!(
+        run(
+            "var d = new Date(1500); d.getUTCSeconds() === 1 && d.getUTCMilliseconds() === 500 ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(run("new Date(0).getUTCDay() === 4 ? 1 : 0;"), 1);
+    assert_eq!(run("new Date(2020, 0, 2).getDay() === 4 ? 1 : 0;"), 1);
+    assert_eq!(run("Date.UTC(2020, 0, 1) === 1577836800000 ? 1 : 0;"), 1);
+    assert_eq!(run("Date.UTC(2020, 0) === 1577836800000 ? 1 : 0;"), 1);
+    // Year normalisation, month overflow and the 1900 offset for two digits.
+    assert_eq!(
+        run("new Date(2020, 13, 1).getFullYear() === 2021 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("new Date(99, 0, 1).getFullYear() === 1999 ? 1 : 0;"), 1);
+    assert_eq!(
+        run("new Date(2020, 5, 15, 12, 30).getHours() === 12 ? 1 : 0;"),
+        1
+    );
+    // Local time is the system's: the offset the engine reports must reconcile
+    // the local and UTC fields of the same instant.
+    assert_eq!(
+        run(
+            "var d = new Date(0); d.getHours() === (24 + d.getUTCHours() - d.getTimezoneOffset() / 60) % 24 ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("typeof new Date(0).getTimezoneOffset() === \"number\" ? 1 : 0;"),
+        1
+    );
+    // An invalid time value stays invalid: every getter is `NaN`.
+    assert_eq!(
+        run("new Date(NaN).getTime() !== new Date(NaN).getTime() ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("new Date(\"nope\").getTime() !== new Date(\"nope\").getTime() ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("Date.UTC(1e20) !== Date.UTC(1e20) ? 1 : 0;"), 1);
+    // `Math.abs(Date.now() - new Date().getTime()) < 5000 ? 1 : 0;`
+    assert_eq!(
+        run("Math.abs(Date.now() - new Date().getTime()) < 5000 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("typeof Date.now() === \"number\" ? 1 : 0;"), 1);
+}
+
+#[test]
+fn date_parse_and_validation() {
+    assert_eq!(
+        run("Date.parse(\"2020-01-01T00:00:00Z\") === 1577836800000 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("Date.parse(\"2020-01-01\") === 1577836800000 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("Number.isNaN(Date.parse(\"nope\")) ? 1 : 0;"), 1);
+    assert_eq!(
+        run("new Date(\"2020-01-01T00:00:00Z\").getTime() === 1577836800000 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("Number.isNaN(Date.parse(\"\")) ? 1 : 0;"), 1);
+}
+
+#[test]
+fn date_prototype_methods() {
+    assert_eq!(run("typeof Date.prototype === \"object\" ? 1 : 0;"), 1);
+    assert_eq!(run("Date.prototype.getTime ? 1 : 0;"), 1);
+    assert_eq!(run("Object.keys(new Date(0)).length === 0 ? 1 : 0;"), 1);
+    assert_eq!(
+        run("var d = new Date(0); d.setTime(1000); d.getTime() === 1000 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var d = new Date(0); d.setTime(\"x\"); d.getTime() !== d.getTime() ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var f = new Date(0).getTime; f() === 0 ? 1 : 0;"), 1);
+    assert_eq!(run("var d = new Date(0); d.valueOf() === 0 ? 1 : 0;"), 1);
+    assert_eq!(
+        run("new Date(0).toISOString() === \"1970-01-01T00:00:00.000Z\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("new Date(0).toJSON() === \"1970-01-01T00:00:00.000Z\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("new Date(NaN).toJSON() === null ? 1 : 0;"), 1);
+    // Degrades instead of raising `RangeError`; see the TODO in `jit::dates`.
+    assert_eq!(
+        run("new Date(NaN).toISOString() === \"Invalid Date\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("new Date(NaN).toString() === \"Invalid Date\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("new Date(0).toUTCString() === \"Thu, 01 Jan 1970 00:00:00 GMT\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("new Date(0).toDateString().length > 4 ? 1 : 0;"), 1);
+    assert_eq!(run("new Date(0).toTimeString().length > 4 ? 1 : 0;"), 1);
+    assert_eq!(
+        run("typeof new Date(0).toLocaleString() === \"string\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("typeof Date() === \"string\" ? 1 : 0;"), 1);
+    assert_eq!(run("String(new Date(0)).length > 10 ? 1 : 0;"), 1);
+    assert_eq!(
+        run("var d = new Date(0); d.getTime = 1; d.getTime === 1 ? 1 : 0;"),
+        1
+    );
+}
+
+#[test]
+fn unknown_namespace_members_are_compile_errors() {
+    assert!(Engine::new().compile_jit("Math.is(1, 1);").is_err());
+    assert!(Engine::new().compile_jit("Math.nope;").is_err());
+    assert!(Engine::new().compile_jit("String.nope;").is_err());
+    assert!(Engine::new().compile_jit("Date.nope();").is_err());
+    assert!(Engine::new().compile_jit("new Number(1);").is_err());
+}

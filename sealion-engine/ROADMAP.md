@@ -12,7 +12,6 @@
 
 - [x] `undefined` type
 - [x] `null` type
-- [ ] `typeof` (moved to Later)
 - [x] `void`
 - [x] `break` statement
 - [x] `continue` statement
@@ -66,11 +65,13 @@
 - [x] `String.prototype` — `charAt`, `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`, `substring`, `substr`, `split`, `trim`, `trimStart`, `trimEnd`, `toUpperCase`, `toLowerCase`, `repeat`, `padStart`, `padEnd`, `replace`, `replaceAll`, `concat`, `toString` and `valueOf` (dynamic runtime only; `replace` takes strings or a function, no regular expressions)
 
 
+## 0.8.0
+
+- [x] `String.fromCharCode` and `String.fromCodePoint` (dynamic runtime only; an out-of-range or non-integral code point is skipped instead of raising `RangeError`)
+- [x] `Math` module — `Math` as an object of the dynamic runtime, so `var m = Math`, `var floor = Math.floor`, `Math['abs'](-1)` and `Object.keys(Math)` work; member calls keep using the inline/libm paths
+- [x] `Date` module — `new Date(...)` (no argument, a time value, a string or the year/month fields), `Date()`, `Date.now`, `Date.parse`, `Date.UTC`, `Date.prototype` and the `get*`/`getUTC*`/`setTime`/`to*String` methods (dynamic runtime only; local time comes from the system clock, and an invalid date degrades to `"Invalid Date"`/`NaN` instead of raising `RangeError`)
+
+
 ### Later
-
-- [ ] `String.fromCharCode` and `String.fromCodePoint`
-
-- [ ] `Math` module
-- [ ] `Date` module
 
 - [ ] Error handling

@@ -216,7 +216,31 @@ Adding an object helper takes four edits:
    `builtin_member` recognises `Object.name`.
 4. Add a match arm to `builtins::dispatch::call` that calls the `FuncRef`.
 
-## 10. Known gaps
+## 10. Namespace objects
+
+`Math`, `String` and `Date` are compile-time namespaces in `builtins`, but the
+dynamic runtime also materialises them as singleton objects (`jit::math`,
+`jit::strings::sealion_string_object`, `jit::dates`) so that a member has a value:
+
+* `Math` owns its eight constants and one native closure per function; the
+  closure's `env` is the index into `math::OPS`, and the entry point coerces and
+  computes exactly like `builtins::dispatch` does through the inline paths.
+* `String` owns `fromCharCode` and `fromCodePoint`; there is no
+  `String.prototype` object.
+* `Date` owns `now`, `parse`, `UTC` and `prototype`. `Date.prototype` is a
+  second singleton, and a date instance is a `JsObject` whose `date` field holds
+  the time value, which no own-key enumeration sees.
+
+A namespace member *call* is still dispatched at compile time, so `Math.floor(x)`
+emits the inline sequence rather than an indirect call through the object.
+`builtin_member` recognises a member only when `Builtins::has` knows the name, so
+`Math.nope` stays a compile error instead of reading `undefined` and calling it.
+
+Date methods take their receiver from the closure's `env` like every other
+virtual method, except that the record holds a second word (the method index)
+for the pair to fit in one `env` word: `[ entry point , Box<(receiver, index)> ]`.
+
+## 11. Known gaps
 
 * No property descriptors, writable/enumerable/configurable flags, accessors,
   getters or setters (except the built-in `__proto__` shorthand).
@@ -230,3 +254,10 @@ Adding an object helper takes four edits:
   argument instead of throwing a `TypeError`; prototype cycles are refused
   silently for the same reason — the runtime has no exception path out of a host
   helper yet.
+* `Date` has no setters besides `setTime`, no `setFullYear`-style methods and no
+  string parsing beyond the ISO 8601 forms; `toLocaleString` and friends return
+  the same text as their non-locale counterparts, because there is no locale
+  data.
+* A `Math`/`String`/`Date` namespace object is mutable user-visible state
+  (`Math.PI = 3` sticks), and there is no way to call `String(...)` through the
+  object, only through the compile-time builtin.

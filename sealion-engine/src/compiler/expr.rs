@@ -9,7 +9,7 @@ use oxc_ast::ast::{
 use super::array::compile_array_literal;
 use super::call::{
     BuiltinCallee, compile_builtin_call, compile_call, compile_closure, compile_computed_access,
-    compile_property_access, is_free_global,
+    compile_namespace_value, compile_property_access, is_free_global,
 };
 use super::chain::compile_chain;
 use super::numeric::{binding_is_number, expr_is_number, number_value};
@@ -147,6 +147,18 @@ pub(super) fn compile_expr<'a>(
                 if let Some(constant) = ctx.builtins.global_constant(name) {
                     return Ok(builder.ins().f64const(constant));
                 }
+                if let Some(namespace) = ctx.builtins.namespace(name)
+                    && matches!(
+                        namespace,
+                        crate::builtins::Namespace::Math
+                            | crate::builtins::Namespace::String
+                            | crate::builtins::Namespace::Date
+                    )
+                {
+                    return compile_namespace_value(builder, ctx, namespace)?.ok_or_else(|| {
+                        Error::Unsupported(format!("{name} requires the dynamic runtime"))
+                    });
+                }
             }
             load_var(builder, ctx, name)
         }
@@ -192,8 +204,9 @@ pub(super) fn compile_expr<'a>(
     }
 }
 
-/// Only `new Array(...)` and `new Map()` are supported: the constructors of the
-/// engine have no first-class identity, so every other `new` is rejected.
+/// Only `new Array(...)`, `new Map()` and `new Date(...)` are supported: the
+/// remaining constructors of the engine have no first-class identity, so every
+/// other `new` is rejected.
 fn compile_new<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -202,18 +215,33 @@ fn compile_new<'a>(
 ) -> Result<Value, Error> {
     if let Expression::Identifier(id) = &new.callee
         && is_free_global(ctx, id.name.as_str())
-        && let Some(name @ ("Array" | "Map")) = ctx.builtins.global_function(id.name.as_str())
     {
-        return compile_builtin_call(
-            builder,
-            ctx,
-            flow,
-            BuiltinCallee::Global(name),
-            new.arguments.as_slice(),
-        );
+        match ctx.builtins.global_function(id.name.as_str()) {
+            Some(name @ ("Array" | "Map")) => {
+                return compile_builtin_call(
+                    builder,
+                    ctx,
+                    flow,
+                    BuiltinCallee::Global(name),
+                    new.arguments.as_slice(),
+                    false,
+                );
+            }
+            Some("Date") => {
+                return compile_builtin_call(
+                    builder,
+                    ctx,
+                    flow,
+                    BuiltinCallee::Global("Date"),
+                    new.arguments.as_slice(),
+                    true,
+                );
+            }
+            _ => {}
+        }
     }
     Err(Error::Unsupported(
-        "only `new Array` and `new Map` are supported".to_string(),
+        "only `new Array`, `new Map` and `new Date` are supported".to_string(),
     ))
 }
 

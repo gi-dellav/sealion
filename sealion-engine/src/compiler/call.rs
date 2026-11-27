@@ -48,14 +48,40 @@ pub(super) enum BuiltinCallee {
     Member(builtins::Namespace, &'static str),
 }
 
+/// The namespace object a bare `Math`, `String` or `Date` names, or `None` for
+/// a namespace that has no object and outside the dynamic runtime.
+pub(super) fn compile_namespace_value(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    namespace: builtins::Namespace,
+) -> Result<Option<Value>, Error> {
+    if ctx.objects.is_none() {
+        return Ok(None);
+    }
+    let symbol = match namespace {
+        builtins::Namespace::Math => "sealion_math_object",
+        builtins::Namespace::String => "sealion_string_object",
+        builtins::Namespace::Date => "sealion_date_object",
+        _ => return Ok(None),
+    };
+    let Some(&func_ref) = ctx.builtin_refs.get(symbol) else {
+        return Ok(None);
+    };
+    let call = builder.ins().call(func_ref, &[]);
+    let pointer = builder.inst_results(call)[0];
+    Ok(Some(value::object(builder, pointer)))
+}
+
 /// Compiles `Math.foo(...)`, `Number.foo(...)`, `Object.foo(...)`, `Date.now()`
-/// and the global conversion/predicate functions.
+/// and the global conversion/predicate functions. `construct` is true for the
+/// callee of a `new` expression.
 pub(super) fn compile_builtin_call<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     flow: &mut Flow<'a>,
     callee: BuiltinCallee,
     args: &'a [Argument<'a>],
+    construct: bool,
 ) -> Result<Value, Error> {
     let (namespace, name) = match callee {
         BuiltinCallee::Global(name) => (None, name),
@@ -87,6 +113,7 @@ pub(super) fn compile_builtin_call<'a>(
         &values,
         &known_numbers,
         ctx.strings.as_ref(),
+        construct,
     )
 }
 
@@ -121,12 +148,15 @@ pub(super) fn compile_property_access<'a>(
         && is_free_global(ctx, id.name.as_str())
         && let Some(namespace) = ctx.builtins.namespace(id.name.as_str())
     {
-        // `Object.prototype` and `Array.prototype` are the only namespace
-        // members that are values rather than constants or functions.
+        // `Object.prototype`, `Array.prototype` and `Date.prototype` are
+        // namespace members that are objects rather than constants or native
+        // functions.
         if access.property.name.as_str() == "prototype"
             && matches!(
                 namespace,
-                builtins::Namespace::Object | builtins::Namespace::Array
+                builtins::Namespace::Object
+                    | builtins::Namespace::Array
+                    | builtins::Namespace::Date
             )
         {
             return builtins::call(
@@ -138,7 +168,27 @@ pub(super) fn compile_property_access<'a>(
                 &[],
                 &[],
                 ctx.strings.as_ref(),
+                false,
             );
+        }
+        // `Math`, `String` and `Date` are objects of the dynamic runtime, so a
+        // member reads through the ordinary property path there. An unknown
+        // member stays a compile error in both modes.
+        if let Some(member) = ctx.builtins.property(access.property.name.as_str())
+            && ctx.builtins.has(namespace, member)
+            && matches!(
+                namespace,
+                builtins::Namespace::Math | builtins::Namespace::String | builtins::Namespace::Date
+            )
+        {
+            let object = compile_namespace_value(builder, ctx, namespace)?.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{}.{member} requires the dynamic runtime",
+                    id.name.as_str()
+                ))
+            })?;
+            let key = object::static_key(builder, ctx, member)?;
+            return object::get(builder, ctx, object, key);
         }
         return Err(Error::Unsupported(format!(
             "unsupported builtin member: {}.{}",
@@ -174,7 +224,29 @@ pub(super) fn compile_call<'a>(
     call: &'a CallExpression<'a>,
 ) -> Result<Value, Error> {
     if let Some(builtin) = builtin_callee(ctx, &call.callee) {
-        return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
+        return compile_builtin_call(
+            builder,
+            ctx,
+            flow,
+            builtin,
+            call.arguments.as_slice(),
+            false,
+        );
+    }
+
+    // A namespace object member the engine does not know stays a compile error,
+    // so a typo cannot reach an indirect call through `undefined`.
+    if let Expression::StaticMemberExpression(access) = &call.callee
+        && let Expression::Identifier(id) = &access.object
+        && is_free_global(ctx, id.name.as_str())
+        && let Some(namespace) = ctx.builtins.namespace(id.name.as_str())
+        && !ctx.builtins.has(namespace, access.property.name.as_str())
+    {
+        return Err(Error::Unsupported(format!(
+            "unsupported builtin member: {}.{}",
+            id.name.as_str(),
+            access.property.name.as_str()
+        )));
     }
 
     if let Expression::Identifier(id) = &call.callee

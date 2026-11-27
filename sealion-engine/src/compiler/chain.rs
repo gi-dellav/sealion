@@ -191,7 +191,14 @@ pub(super) fn compile_chain_call<'a>(
     result: Variable,
 ) -> Result<Value, Error> {
     if let Some(builtin) = builtin_callee(ctx, &call.callee) {
-        return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
+        return compile_builtin_call(
+            builder,
+            ctx,
+            flow,
+            builtin,
+            call.arguments.as_slice(),
+            false,
+        );
     }
 
     let (callee, this) = compile_chain_callee(builder, ctx, flow, &call.callee, short, result)?;

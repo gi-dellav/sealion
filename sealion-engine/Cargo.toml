@@ -6,7 +6,7 @@ rust-version = "1.98"
 
 [features]
 default = []
-jit = ["dep:object", "dep:libc", "dep:postcard", "dep:serde", "dep:sealion-string"]
+jit = ["dep:object", "dep:libc", "dep:postcard", "dep:serde", "dep:sealion-string", "dep:chrono"]
 
 [dependencies]
 cranelift-codegen = { version = "0.132.3", features = ["x86", "arm64"] }
@@ -25,6 +25,7 @@ libc = { version = "0.2", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 postcard = { version = "1.1", optional = true }
 sealion-string = { path = "../sealion-string", optional = true }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"], optional = true }
 
 [profile.release]
 opt-level = 3
