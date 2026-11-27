@@ -57,6 +57,7 @@
 
 - [x] Optional in-process JIT on Linux x86-64 (`jit` Cargo feature)
 - [x] Precompiled artifacts: `Engine::precompile_module`, `IrModule::serialize`, `Engine::deserialize*`, and the `--artifact` / `--run-artifact` CLI flags
+- [x] `Object`: own-property bags in the dynamic (JIT) runtime only — object literals, static and computed reads/writes, compound assignment, `++`/`--`, `delete`, `in`, optional chaining and `Object.is`; no prototypes, `this`, accessors or spread
 - [ ] `StaticArray(n)`, sealion-exclusive object for static arrays (like C's arrays; `a = Slice(10)` == `void *a[10]`); inside the engine, it's a static container of `number` values
 - [ ] `Array`, JS's `array` type, based on sealion's StaticArray; the compiler offers a `--array-length` to define the static length, by default 1024
 - [ ] `string`, which are based on sealion's StaticArray; the compiler offers a `--string-length` to define the static length, by default 1024
@@ -67,12 +68,11 @@
 ### Later
 
 - [ ] `typeof`
-- [ ] `Object` type
 - [ ] `array` type
-- [ ] `string` type
+- [ ] `string` type as a static container (`0.7.0` has dynamic-only `string` values)
 
 - [ ] `this` implementation
-- [ ] `__proto__` implementation
+- [ ] `__proto__` and prototypes
 
 - [ ] `Math` module
 - [ ] `Date` module

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, ChainElement, Expression, ForStatementInit,
-    SimpleAssignmentTarget, Statement, VariableDeclaration,
+    ObjectPropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
 
 use super::{FunctionBodyPlan, Program, ScopeId, node_key, resolve_binding};
@@ -335,6 +335,13 @@ impl<'a> Walker<'a, '_> {
                         self.escape(scope, id.name.as_str());
                         self.write(scope, id.name.as_str());
                     }
+                    AssignmentTarget::StaticMemberExpression(access) => {
+                        self.expression(scope, &access.object);
+                    }
+                    AssignmentTarget::ComputedMemberExpression(member) => {
+                        self.expression(scope, &member.object);
+                        self.expression(scope, &member.expression);
+                    }
                     _ => self.conservative = true,
                 }
                 self.expression(scope, &assign.right);
@@ -344,8 +351,27 @@ impl<'a> Walker<'a, '_> {
                     self.escape(scope, id.name.as_str());
                     self.write(scope, id.name.as_str());
                 }
+                SimpleAssignmentTarget::StaticMemberExpression(access) => {
+                    self.expression(scope, &access.object);
+                }
+                SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                    self.expression(scope, &member.object);
+                    self.expression(scope, &member.expression);
+                }
                 _ => self.conservative = true,
             },
+            Expression::ObjectExpression(object) => {
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        self.conservative = true;
+                        continue;
+                    };
+                    if let Some(expression) = property.key.as_expression() {
+                        self.expression(scope, expression);
+                    }
+                    self.expression(scope, &property.value);
+                }
+            }
             Expression::BinaryExpression(binary) => {
                 self.expression(scope, &binary.left);
                 self.expression(scope, &binary.right);

@@ -22,7 +22,7 @@ An `f64` is split into a 16-bit tag and a 48-bit payload:
 ```
 
 Numbers use the normal IEEE-754 encoding, including both signs of zero, both
-infinities and NaNs. The non-numeric values use tags `0x7FF9` through `0x7FFD`:
+infinities and NaNs. The non-numeric values use tags `0x7FF9` through `0x7FFF`:
 
 | Tag | Value | Payload |
 | --- | --- | --- |
@@ -31,6 +31,8 @@ infinities and NaNs. The non-numeric values use tags `0x7FF9` through `0x7FFD`:
 | `0x7FFB` | boolean | `0` or `1` in bit 0 |
 | `0x7FFC` | uninitialized (TDZ) | ignored |
 | `0x7FFD` | function/closure | 48-bit pointer to the closure record |
+| `0x7FFE` | string | 48-bit pointer to a `JsString` |
+| `0x7FFF` | object | 48-bit pointer to a `JsObject` |
 
 ```rust
 // value.rs:24
@@ -39,11 +41,16 @@ pub const TAG_NULL: u64 = 0x7FFA;
 pub const TAG_BOOLEAN: u64 = 0x7FFB;
 pub const TAG_UNINITIALIZED: u64 = 0x7FFC;
 pub const TAG_FUNCTION: u64 = 0x7FFD;
+pub const TAG_STRING: u64 = 0x7FFE;
+pub const TAG_OBJECT: u64 = 0x7FFF;
 
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 ```
 
-All five tags are quiet NaNs: their mantissa has the quiet bit set. This means
+Strings and objects exist only in the dynamic (JIT) backend, which is also the
+only backend that has host helpers for them; the AOT backend rejects both.
+
+All seven tags are quiet NaNs: their mantissa has the quiet bit set. This means
 the tagged values remain valid `f64`s and can be stored, copied and passed
 around as raw bits without special handling. The two NaNs the FPU actually
 produces, `0x7FF8_...` and `0xFFF8_...`, are left outside the tag range and are
@@ -58,19 +65,21 @@ false           0x7FFB_0000_0000_0000
 true            0x7FFB_0000_0000_0001
 uninitialized   0x7FFC_0000_0000_0000
 function        0x7FFD_0000_0000_0000 | closure_ptr
+string          0x7FFE_0000_0000_0000 | JsString_ptr
+object          0x7FFF_0000_0000_0000 | JsObject_ptr
 ```
 
 ### Tag classification
 
 A value is tagged when its top 16 bits lie in the unsigned interval
-`[0x7FF9, 0x7FFD]`:
+`[0x7FF9, 0x7FFF]`:
 
 ```rust
 // value.rs:82
 pub fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
     let tag = tag_of(builder, value);
     let low = builder.ins().iconst(types::I64, TAG_UNDEFINED as i64);
-    let high = builder.ins().iconst(types::I64, TAG_FUNCTION as i64);
+    let high = builder.ins().iconst(types::I64, TAG_OBJECT as i64);
     let ge = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, tag, low);
@@ -82,12 +91,12 @@ pub fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
 ```
 
 `tag_of` bitcasts the `f64` to `i64`, shifts right by 48 and compares. A
-negative NaN such as `0xFFF8_...` has a tag above `0x7FFD` and is therefore
+negative NaN such as `0xFFF8_...` has a tag above `0x7FFF` and is therefore
 correctly classified as a number.
 
-Tags `0x7FFE` and `0x7FFF` are unused. Adding a new heap value type (an object
-or a string, for example) would need a new tag and an update to this range
-check.
+Every tag in the interval is now in use. Adding another heap value type would
+need a tag outside the range (the two NaNs the FPU produces rule out `0x7FF8`
+and `0xFFF8`) or a second level of tagging inside the payload.
 
 ### The 48-bit payload assumption
 
@@ -400,7 +409,7 @@ representations:
   as does `Math.sign(-0)`, `Math.min(+0, -0)` and `Math.max(+0, -0)`.
 
 The encoding assumes that arithmetic and libm never return a NaN whose payload
-lands in `0x7FF9..0x7FFD`. The supported FPUs canonicalise generated NaNs to
+lands in `0x7FF9..0x7FFF`. The supported FPUs canonicalise generated NaNs to
 `0x7FF8`/`0xFFF8`; this is an invariant of the backends rather than something
 checked at runtime.
 
@@ -589,11 +598,13 @@ booleans, `null` or `undefined`. The only engine-managed allocations are:
 
 - closure records (16 bytes),
 - environment records (`8 + 8 * slots` bytes),
-- argument blocks (264 bytes).
+- argument blocks (264 bytes),
+- string values (the reference-counted `sealion_string` heap, dynamic backend),
+- objects (a boxed, insertion-ordered own-property table, dynamic backend).
 
-All three are allocated with `calloc` and are never freed. There is no garbage
-collector, no reference counting and no ownership tracking. This has two
-consequences:
+The first three are allocated with `calloc`; strings and objects come from the
+Rust heap. None of them are ever freed. There is no garbage collector, no
+reference counting and no ownership tracking. This has two consequences:
 
 - A closure can safely outlive the activation that created it; the environment
   record remains valid for the lifetime of the process.
@@ -611,11 +622,16 @@ deliberate copy is the `for` loop's per-iteration environment
 
 The value domain is deliberately narrow:
 
-- No strings, objects, arrays, symbols, BigInts or regular expressions. String
-  and BigInt literals are rejected at compile time, as are template literals.
-- No `typeof`, `instanceof`, `in`, property objects or prototypes. Property
-  access is limited to the compile-time `Math`, `Number`, `Object` and `Date`
-  namespaces.
+- No arrays, symbols, BigInts or regular expressions. In the AOT backend,
+  string and object literals and property access are rejected at compile time;
+  the dynamic backend supports strings and plain objects.
+- Objects are own-property bags: no prototypes, `__proto__`, `this`, getters,
+  setters, spread or property descriptors, and `delete` always succeeds. There
+  are no arrays, so `Object.keys`/`values`/`entries` are absent; only `Object.is`
+  is implemented.
+- No `typeof` or `instanceof`. `in` works on objects in the dynamic backend.
+  There are no wrapper objects, so a property read on a primitive yields
+  `undefined` (strings answer `length`).
 - No function objects as property containers: `f.name`, `f.length` and similar
   are not implemented.
 - No callable check. Calling a non-function value strips the tag and treats the
@@ -626,10 +642,10 @@ The value domain is deliberately narrow:
   is preserved.
 - The 48-bit pointer, fixed tag range and FPU NaN canonicalisation assumptions
   are not checked at runtime.
-- `ToNumber`, `ToString`, `ToPrimitive` and the equality algorithms only cover
-  the current primitive domain. Adding strings and objects will require extending
-  them, adding tags or an object header, and introducing a real heap and garbage
-  collector.
+- `ToNumber`, `ToString` and the equality algorithms cover the primitives plus
+  strings and objects, but `ToPrimitive` does not call user-defined
+  `valueOf`/`toString`. Growing the value domain further needs a real heap and a
+  garbage collector: nothing is collected today.
 
 ## 11. Source map and verification
 
@@ -642,6 +658,8 @@ The value domain is deliberately narrow:
 | Argument block and closure calls | `sealion-engine/src/compiler/call.rs:128` |
 | Exception state | `sealion-engine/src/engine.rs:265`, `sealion-engine/src/compiler/flow.rs:56` |
 | Closure and environment layout | [CLOSURE.md](CLOSURE.md) |
+| Object model (dynamic backend) | `sealion-engine/src/jit/objects.rs`, `sealion-engine/src/compiler/object.rs` |
+| String model (dynamic backend) | `sealion-engine/src/jit/strings.rs` |
 
 Inspect the lowered representation with:
 
@@ -660,6 +678,9 @@ Relevant end-to-end tests in `sealion-engine/tests/e2e.rs`:
 - `global_is_nan_and_is_finite_coerce`
 - `math_signed_zero`
 - `numeric_analysis_with_new_constructs`
+- `objects_require_the_dynamic_runtime`
+- `object_literals_and_property_reads`, `object_property_writes_updates_and_delete`,
+  `object_identity_truthiness_and_chaining` (in `tests/jit.rs`)
 
 Run the suite with:
 

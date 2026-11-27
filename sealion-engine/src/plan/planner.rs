@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    BindingPattern, CatchClause, ChainElement, Expression, ForStatement, ForStatementInit,
-    FormalParameters, Function, Statement, VariableDeclaration, VariableDeclarationKind,
+    AssignmentTarget, BindingPattern, CatchClause, ChainElement, Expression, ForStatement,
+    ForStatementInit, FormalParameters, Function, ObjectPropertyKind, PropertyKey,
+    SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
 };
 
 use crate::Error;
@@ -392,6 +393,7 @@ impl<'a> Planner<'a> {
                 self.scan_expression(plan_id, scope, &member.expression)?;
             }
             ChainElement::StaticMemberExpression(member) => {
+                self.add_string(member.property.name.as_str().to_string());
                 self.scan_expression(plan_id, scope, &member.object)?;
             }
             ChainElement::PrivateFieldExpression(member) => {
@@ -514,13 +516,46 @@ impl<'a> Planner<'a> {
             Expression::UnaryExpression(unary) => {
                 self.scan_expression(plan_id, scope, &unary.argument)?;
             }
-            Expression::UpdateExpression(_) => {}
+            Expression::UpdateExpression(update) => {
+                self.scan_target(plan_id, scope, &update.argument)?;
+            }
+            Expression::ObjectExpression(object) => {
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        continue;
+                    };
+                    match &property.key {
+                        PropertyKey::StaticIdentifier(id) => {
+                            self.add_string(id.name.as_str().to_string());
+                        }
+                        key => {
+                            if let Some(name) = key.static_name() {
+                                self.add_string(name.display().to_string());
+                            } else if let Some(expression) = key.as_expression() {
+                                self.scan_expression(plan_id, scope, expression)?;
+                            }
+                        }
+                    }
+                    self.scan_expression(plan_id, scope, &property.value)?;
+                }
+            }
             Expression::ConditionalExpression(conditional) => {
                 self.scan_expression(plan_id, scope, &conditional.test)?;
                 self.scan_expression(plan_id, scope, &conditional.consequent)?;
                 self.scan_expression(plan_id, scope, &conditional.alternate)?;
             }
             Expression::AssignmentExpression(assign) => {
+                match &assign.left {
+                    AssignmentTarget::StaticMemberExpression(access) => {
+                        self.add_string(access.property.name.as_str().to_string());
+                        self.scan_expression(plan_id, scope, &access.object)?;
+                    }
+                    AssignmentTarget::ComputedMemberExpression(member) => {
+                        self.scan_expression(plan_id, scope, &member.object)?;
+                        self.scan_expression(plan_id, scope, &member.expression)?;
+                    }
+                    _ => {}
+                }
                 self.scan_expression(plan_id, scope, &assign.right)?;
             }
             Expression::SequenceExpression(sequence) => {
@@ -540,11 +575,34 @@ impl<'a> Planner<'a> {
                 self.scan_chain_element(plan_id, scope, &chain.expression)?;
             }
             Expression::StaticMemberExpression(simple) => {
+                self.add_string(simple.property.name.as_str().to_string());
                 self.scan_expression(plan_id, scope, &simple.object)?;
             }
             Expression::ComputedMemberExpression(computed) => {
                 self.scan_expression(plan_id, scope, &computed.object)?;
                 self.scan_expression(plan_id, scope, &computed.expression)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Walks an assignment target's object and computed key, which may contain
+    /// function expressions or string literals of their own.
+    fn scan_target(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        target: &'a SimpleAssignmentTarget<'a>,
+    ) -> Result<(), Error> {
+        match target {
+            SimpleAssignmentTarget::StaticMemberExpression(access) => {
+                self.add_string(access.property.name.as_str().to_string());
+                self.scan_expression(plan_id, scope, &access.object)?;
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                self.scan_expression(plan_id, scope, &member.object)?;
+                self.scan_expression(plan_id, scope, &member.expression)?;
             }
             _ => {}
         }

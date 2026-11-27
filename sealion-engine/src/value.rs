@@ -13,6 +13,7 @@
 //! | `0x7FFC` | uninitialized  | —                    |
 //! | `0x7FFD` | function       | closure pointer      |
 //! | `0x7FFE` | string         | `JsString` pointer   |
+//! | `0x7FFF` | object         | `JsObject` pointer   |
 //!
 //! The uninitialized tag implements the temporal dead zone for `let`, `const`
 //! and parameters: loading such a slot traps until the declaration has run.
@@ -28,6 +29,7 @@ pub const TAG_BOOLEAN: u64 = 0x7FFB;
 pub const TAG_UNINITIALIZED: u64 = 0x7FFC;
 pub const TAG_FUNCTION: u64 = 0x7FFD;
 pub const TAG_STRING: u64 = 0x7FFE;
+pub const TAG_OBJECT: u64 = 0x7FFF;
 
 /// `2**32`, the modulus used by `ToInt32`/`ToUint32`.
 const TWO_POW_32: f64 = 4_294_967_296.0;
@@ -49,7 +51,20 @@ pub struct StringOps {
     pub to_number: FuncRef,
     pub to_string: FuncRef,
     pub compare: FuncRef,
-    pub length: FuncRef,
+}
+
+/// Runtime entry points that implement object semantics.
+///
+/// Like [`StringOps`], the AOT backend leaves this unset and rejects objects;
+/// the dynamic (JIT) backend fills it in from the engine's host helpers.
+#[derive(Clone, Copy)]
+pub struct ObjectOps {
+    /// Allocates an empty object and returns its raw pointer bits.
+    pub new: FuncRef,
+    pub get: FuncRef,
+    pub set: FuncRef,
+    pub has: FuncRef,
+    pub delete: FuncRef,
 }
 
 pub fn undefined(builder: &mut FunctionBuilder) -> Value {
@@ -90,6 +105,12 @@ pub fn string(builder: &mut FunctionBuilder, ptr: Value) -> Value {
     builder.ins().bitcast(types::F64, MemFlags::new(), bits)
 }
 
+pub fn object(builder: &mut FunctionBuilder, ptr: Value) -> Value {
+    let tag = builder.ins().iconst(types::I64, (TAG_OBJECT << 48) as i64);
+    let bits = builder.ins().bor(tag, ptr);
+    builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+}
+
 /// Strips the tag, yielding the raw pointer bits of a closure or string value.
 pub fn payload(builder: &mut FunctionBuilder, value: Value) -> Value {
     let bits = builder.ins().bitcast(types::I64, MemFlags::new(), value);
@@ -108,7 +129,7 @@ fn tag_of(builder: &mut FunctionBuilder, value: Value) -> Value {
 pub fn is_tagged(builder: &mut FunctionBuilder, value: Value) -> Value {
     let tag = tag_of(builder, value);
     let low = builder.ins().iconst(types::I64, TAG_UNDEFINED as i64);
-    let high = builder.ins().iconst(types::I64, TAG_STRING as i64);
+    let high = builder.ins().iconst(types::I64, TAG_OBJECT as i64);
     let ge = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, tag, low);
@@ -177,20 +198,23 @@ pub fn from_bool(builder: &mut FunctionBuilder, value: Value) -> Value {
     builder.ins().bitcast(types::F64, MemFlags::new(), bits)
 }
 
-/// Truthiness: functions, non-empty strings and tagged `true` are truthy, the
-/// other tagged values are not, and numbers keep the plain `!= 0` test (which
-/// is already false for NaNs).
+/// Truthiness: functions, objects, non-empty strings and tagged `true` are
+/// truthy, the other tagged values are not, and numbers keep the plain `!= 0`
+/// test (which is already false for NaNs).
 pub fn truthy(builder: &mut FunctionBuilder, value: Value, strings: Option<&StringOps>) -> Value {
     let tagged = is_tagged(builder, value);
     let tag = tag_of(builder, value);
     let fn_tag = builder.ins().iconst(types::I64, TAG_FUNCTION as i64);
     let is_fn = builder.ins().icmp(IntCC::Equal, tag, fn_tag);
+    let object_tag = builder.ins().iconst(types::I64, TAG_OBJECT as i64);
+    let is_object = builder.ins().icmp(IntCC::Equal, tag, object_tag);
     let is_bool = is_boolean(builder, value);
     let bits = bits_of(builder, value);
     let low = builder.ins().band_imm(bits, 1);
     let bool_true = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
     let bool_truthy = builder.ins().band(is_bool, bool_true);
     let tagged_truthy = builder.ins().bor(is_fn, bool_truthy);
+    let tagged_truthy = builder.ins().bor(tagged_truthy, is_object);
     let zero = builder.ins().f64const(0.0);
     let num = builder.ins().fcmp(FloatCC::OrderedNotEqual, value, zero);
     let inline = builder.ins().select(tagged, tagged_truthy, num);

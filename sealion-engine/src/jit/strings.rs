@@ -10,7 +10,9 @@ use std::{cmp::Ordering, io::Write, mem::ManuallyDrop, ptr::NonNull, str};
 
 use sealion_string::{JsString, RawJsString};
 
-use crate::value::{PAYLOAD_MASK, TAG_BOOLEAN, TAG_FUNCTION, TAG_NULL, TAG_STRING, TAG_UNDEFINED};
+use crate::value::{
+    PAYLOAD_MASK, TAG_BOOLEAN, TAG_FUNCTION, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_UNDEFINED,
+};
 
 fn string_pointer(value: f64) -> Option<NonNull<RawJsString>> {
     let bits = value.to_bits();
@@ -20,7 +22,7 @@ fn string_pointer(value: f64) -> Option<NonNull<RawJsString>> {
     NonNull::new((bits & PAYLOAD_MASK) as *mut RawJsString)
 }
 
-fn with_string<R>(value: f64, f: impl FnOnce(&JsString) -> R) -> Option<R> {
+pub(super) fn with_string<R>(value: f64, f: impl FnOnce(&JsString) -> R) -> Option<R> {
     let ptr = string_pointer(value)?;
     // The compiled program never drops string values, so a temporary borrow
     // must not run the vtable destructor.
@@ -33,11 +35,11 @@ fn tagged_string(string: JsString) -> f64 {
     f64::from_bits((TAG_STRING << 48) | ptr)
 }
 
-fn tagged_bool(value: bool) -> f64 {
+pub(super) fn tagged_bool(value: bool) -> f64 {
     f64::from_bits((TAG_BOOLEAN << 48) | u64::from(value))
 }
 
-fn tagged_undefined() -> f64 {
+pub(super) fn tagged_undefined() -> f64 {
     f64::from_bits(TAG_UNDEFINED << 48)
 }
 
@@ -49,8 +51,12 @@ fn is_string(value: f64) -> bool {
     tag(value) == TAG_STRING
 }
 
-fn is_tagged(value: f64) -> bool {
-    (TAG_UNDEFINED..=TAG_STRING).contains(&tag(value))
+pub(super) fn is_object(value: f64) -> bool {
+    tag(value) == TAG_OBJECT
+}
+
+pub(super) fn is_tagged(value: f64) -> bool {
+    (TAG_UNDEFINED..=TAG_OBJECT).contains(&tag(value))
 }
 
 fn number_string(value: f64) -> JsString {
@@ -60,12 +66,13 @@ fn number_string(value: f64) -> JsString {
     JsString::from(value)
 }
 
-fn to_js_string(value: f64) -> JsString {
+pub(super) fn to_js_string(value: f64) -> JsString {
     match tag(value) {
         TAG_STRING => with_string(value, JsString::clone).unwrap_or_default(),
         TAG_UNDEFINED => JsString::from("undefined"),
         TAG_NULL => JsString::from("null"),
         TAG_FUNCTION => JsString::from("function"),
+        TAG_OBJECT => JsString::from("[object Object]"),
         TAG_BOOLEAN => JsString::from(if value.to_bits() & 1 != 0 {
             "true"
         } else {
@@ -75,7 +82,7 @@ fn to_js_string(value: f64) -> JsString {
     }
 }
 
-fn to_number_value(value: f64) -> f64 {
+pub(super) fn to_number_value(value: f64) -> f64 {
     match tag(value) {
         TAG_STRING => with_string(value, JsString::to_number).unwrap_or(f64::NAN),
         TAG_NULL => 0.0,
@@ -86,7 +93,7 @@ fn to_number_value(value: f64) -> f64 {
                 0.0
             }
         }
-        TAG_UNDEFINED | TAG_FUNCTION => f64::NAN,
+        TAG_UNDEFINED | TAG_FUNCTION | TAG_OBJECT => f64::NAN,
         _ => value,
     }
 }
@@ -111,17 +118,13 @@ extern "C" fn sealion_string_to_string(value: f64) -> f64 {
     tagged_string(to_js_string(value))
 }
 
-extern "C" fn sealion_string_length(value: f64) -> f64 {
-    with_string(value, |string| string.len() as f64).unwrap_or_else(tagged_undefined)
-}
-
 extern "C" fn sealion_string_truthy(value: f64) -> i8 {
     let truthy = with_string(value, |string| !string.is_empty()).unwrap_or(false);
     i8::from(truthy)
 }
 
 extern "C" fn sealion_string_add(lhs: f64, rhs: f64) -> f64 {
-    if is_string(lhs) || is_string(rhs) {
+    if is_string(lhs) || is_string(rhs) || is_object(lhs) || is_object(rhs) {
         let lhs = to_js_string(lhs);
         let rhs = to_js_string(rhs);
         tagged_string(JsString::concat(lhs.as_str(), rhs.as_str()))
@@ -253,7 +256,7 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         "sealion_string_from_utf8" => sealion_string_from_utf8 as *const () as usize,
         "sealion_string_to_number" => sealion_string_to_number as *const () as usize,
         "sealion_string_to_string" => sealion_string_to_string as *const () as usize,
-        "sealion_string_length" => sealion_string_length as *const () as usize,
+
         "sealion_string_truthy" => sealion_string_truthy as *const () as usize,
         "sealion_string_add" => sealion_string_add as *const () as usize,
         "sealion_string_strict_equal" => sealion_string_strict_equal as *const () as usize,

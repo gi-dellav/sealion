@@ -2,11 +2,14 @@ use cranelift_codegen::ir::{
     FuncRef, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value, types,
 };
 use cranelift_frontend::FunctionBuilder;
-use oxc_ast::ast::{Argument, CallExpression, Expression, StaticMemberExpression};
+use oxc_ast::ast::{
+    Argument, CallExpression, ComputedMemberExpression, Expression, StaticMemberExpression,
+};
 
 use super::expr::compile_expr;
 use super::flow::emit_exception_check;
 use super::numeric::expr_is_number;
+use super::object;
 use super::support::new_closure;
 use super::{CodegenCtx, Flow};
 use crate::{
@@ -114,16 +117,35 @@ pub(super) fn compile_property_access<'a>(
     if let Some(value) = constant {
         return Ok(builder.ins().f64const(value));
     }
-    if access.property.name.as_str() == "length"
-        && let Some(ops) = ctx.strings.as_ref()
+    if let Expression::Identifier(id) = &access.object
+        && is_free_global(ctx, id.name.as_str())
+        && ctx.builtins.namespace(id.name.as_str()).is_some()
     {
-        let object = compile_expr(builder, ctx, flow, &access.object)?;
-        let call = builder.ins().call(ops.length, &[object]);
-        return Ok(builder.inst_results(call)[0]);
+        return Err(Error::Unsupported(format!(
+            "unsupported builtin member: {}.{}",
+            id.name.as_str(),
+            access.property.name.as_str()
+        )));
     }
-    Err(Error::Unsupported(
-        "only builtin constants and string length can be read as properties".to_string(),
-    ))
+    let object = compile_expr(builder, ctx, flow, &access.object)?;
+    if ctx.objects.is_none() {
+        // Without objects a property read is always `undefined`.
+        return Ok(value::undefined(builder));
+    }
+    let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+    object::get(builder, ctx, object, key)
+}
+
+/// `object[key]`, where both sides are arbitrary expressions.
+pub(super) fn compile_computed_access<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    member: &'a ComputedMemberExpression<'a>,
+) -> Result<Value, Error> {
+    let object = compile_expr(builder, ctx, flow, &member.object)?;
+    let key = compile_expr(builder, ctx, flow, &member.expression)?;
+    object::get(builder, ctx, object, key)
 }
 
 pub(super) fn compile_call<'a>(

@@ -35,6 +35,11 @@
 //! `NaN`/`Infinity` values, optional chaining (`?.` and `?.()`), `delete` on
 //! identifiers and non-references, and the following operators:
 //!
+//! The dynamic (JIT) runtime additionally supports string values and objects:
+//! object literals, static and computed property access, property assignment,
+//! `delete`, `in` and `Object.is` over own properties. Objects have no
+//! prototypes, `this`, accessors or spread, and nothing is garbage collected.
+//!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
 //! - logical `&& || ?? !` and the ternary `? :`,

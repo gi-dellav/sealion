@@ -6,9 +6,12 @@ use oxc_ast::ast::{
     UnaryOperator, UpdateExpression, UpdateOperator,
 };
 
-use super::call::{compile_call, compile_closure, compile_property_access, is_free_global};
+use super::call::{
+    compile_call, compile_closure, compile_computed_access, compile_property_access, is_free_global,
+};
 use super::chain::compile_chain;
 use super::numeric::{binding_is_number, expr_is_number, number_value};
+use super::object::{self, compile_object_literal};
 use super::stmt::compile_condition;
 use super::support::{
     call_fmod, call_pow, check_tdz, load_place, load_var, place, store_place, store_var,
@@ -47,7 +50,7 @@ pub(super) fn compile_default<'a>(
     Ok(builder.use_var(result_var))
 }
 
-fn compile_string_data(
+pub(super) fn compile_string_data(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'_>,
     text: &str,
@@ -157,7 +160,7 @@ pub(super) fn compile_expr<'a>(
         }
         Expression::UnaryExpression(unary) => compile_unary(builder, ctx, flow, unary),
         Expression::AssignmentExpression(assign) => compile_assign(builder, ctx, flow, assign),
-        Expression::UpdateExpression(update) => compile_update(builder, ctx, update),
+        Expression::UpdateExpression(update) => compile_update(builder, ctx, flow, update),
         Expression::SequenceExpression(sequence) => {
             let mut result = value::undefined(builder);
             for expr in &sequence.expressions {
@@ -174,6 +177,10 @@ pub(super) fn compile_expr<'a>(
         Expression::StaticMemberExpression(access) => {
             compile_property_access(builder, ctx, flow, access)
         }
+        Expression::ComputedMemberExpression(member) => {
+            compile_computed_access(builder, ctx, flow, member)
+        }
+        Expression::ObjectExpression(object) => compile_object_literal(builder, ctx, flow, object),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
@@ -189,6 +196,9 @@ pub(super) fn compile_binary<'a>(
     let lhs = compile_expr(builder, ctx, flow, &binary.left)?;
     let rhs = compile_expr(builder, ctx, flow, &binary.right)?;
     let op = binary.operator;
+    if op == BinaryOperator::In {
+        return object::has(builder, ctx, rhs, lhs);
+    }
     if op.is_arithmetic() {
         compile_arithmetic(
             builder,
@@ -528,10 +538,18 @@ pub(super) fn compile_delete<'a>(
                 && !ctx.builtins.is_global(name);
             Ok(value::boolean(builder, deletable))
         }
-        Expression::StaticMemberExpression(_)
-        | Expression::ComputedMemberExpression(_)
-        | Expression::PrivateFieldExpression(_) => Err(Error::Unsupported(
-            "delete of a property requires objects".to_string(),
+        Expression::StaticMemberExpression(access) => {
+            let object = compile_expr(builder, ctx, flow, &access.object)?;
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            object::delete(builder, ctx, object, key)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let object = compile_expr(builder, ctx, flow, &member.object)?;
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
+            object::delete(builder, ctx, object, key)
+        }
+        Expression::PrivateFieldExpression(_) => Err(Error::Unsupported(
+            "private members are not supported".to_string(),
         )),
         other => {
             compile_expr(builder, ctx, flow, other)?;
@@ -541,6 +559,99 @@ pub(super) fn compile_delete<'a>(
 }
 
 pub(super) fn compile_assign<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    assign: &'a AssignmentExpression<'a>,
+) -> Result<Value, Error> {
+    let (object, key) = match &assign.left {
+        AssignmentTarget::StaticMemberExpression(access) => {
+            let object = compile_expr(builder, ctx, flow, &access.object)?;
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            (object, key)
+        }
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            let object = compile_expr(builder, ctx, flow, &member.object)?;
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
+            (object, key)
+        }
+        _ => return compile_variable_assign(builder, ctx, flow, assign),
+    };
+    compile_member_assign(builder, ctx, flow, assign, object, key)
+}
+
+/// Assigns to `object[key]`, honouring the compound and logical forms.
+fn compile_member_assign<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    assign: &'a AssignmentExpression<'a>,
+    object: Value,
+    key: Value,
+) -> Result<Value, Error> {
+    let op = assign.operator;
+    if op == AssignmentOperator::Assign {
+        let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
+        return object::set(builder, ctx, object, key, rhs);
+    }
+
+    let short_circuit = match op {
+        AssignmentOperator::LogicalAnd => Some((true, true)),
+        AssignmentOperator::LogicalOr => Some((false, true)),
+        AssignmentOperator::LogicalNullish => Some((true, false)),
+        _ => None,
+    };
+    if let Some((rhs_when_truthy, use_truthy)) = short_circuit {
+        let old = object::get(builder, ctx, object, key)?;
+        let cond = if use_truthy {
+            value::truthy(builder, old, ctx.strings.as_ref())
+        } else {
+            value::is_nullish(builder, old)
+        };
+
+        let result_var = builder.declare_var(types::F64);
+        let rhs_block = builder.create_block();
+        let join_block = builder.create_block();
+        builder.def_var(result_var, old);
+        if rhs_when_truthy {
+            builder.ins().brif(cond, rhs_block, &[], join_block, &[]);
+        } else {
+            builder.ins().brif(cond, join_block, &[], rhs_block, &[]);
+        }
+
+        builder.switch_to_block(rhs_block);
+        let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
+        object::set(builder, ctx, object, key, rhs)?;
+        builder.def_var(result_var, rhs);
+        builder.ins().jump(join_block, &[]);
+
+        builder.switch_to_block(join_block);
+        return Ok(builder.use_var(result_var));
+    }
+
+    // The old value is read before the right-hand side is evaluated.
+    let old = object::get(builder, ctx, object, key)?;
+    let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
+    let binary = op
+        .to_binary_operator()
+        .ok_or_else(|| Error::Unsupported(format!("assignment operator not supported: {op:?}")))?;
+    let value = if binary.is_arithmetic() {
+        compile_arithmetic(
+            builder,
+            ctx,
+            binary,
+            old,
+            rhs,
+            false,
+            expr_is_number(ctx, &assign.right),
+        )?
+    } else {
+        compile_bitwise(builder, ctx, binary, old, rhs)
+    };
+    object::set(builder, ctx, object, key, value)
+}
+
+fn compile_variable_assign<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     flow: &mut Flow<'a>,
@@ -640,6 +751,36 @@ pub(super) fn compile_assign<'a>(
 }
 
 pub(super) fn compile_update<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    update: &'a UpdateExpression<'a>,
+) -> Result<Value, Error> {
+    let (object, key) = match &update.argument {
+        SimpleAssignmentTarget::StaticMemberExpression(access) => {
+            let object = compile_expr(builder, ctx, flow, &access.object)?;
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            (object, key)
+        }
+        SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+            let object = compile_expr(builder, ctx, flow, &member.object)?;
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
+            (object, key)
+        }
+        _ => return compile_variable_update(builder, ctx, update),
+    };
+    let old = object::get(builder, ctx, object, key)?;
+    let old = number_value(builder, old, false, ctx.strings.as_ref());
+    let one = builder.ins().f64const(1.0);
+    let new_value = match update.operator {
+        UpdateOperator::Increment => builder.ins().fadd(old, one),
+        UpdateOperator::Decrement => builder.ins().fsub(old, one),
+    };
+    object::set(builder, ctx, object, key, new_value)?;
+    Ok(if update.prefix { new_value } else { old })
+}
+
+fn compile_variable_update<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
     update: &'a UpdateExpression<'a>,

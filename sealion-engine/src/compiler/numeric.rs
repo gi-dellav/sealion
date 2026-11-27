@@ -4,8 +4,8 @@ use cranelift_codegen::ir::Value;
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, CallExpression,
-    ChainElement, Expression, ForStatementInit, Statement, StaticMemberExpression, UnaryOperator,
-    VariableDeclaration, VariableDeclarationKind,
+    ChainElement, Expression, ForStatementInit, ObjectPropertyKind, SimpleAssignmentTarget,
+    Statement, StaticMemberExpression, UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
 use super::CodegenCtx;
@@ -342,7 +342,38 @@ impl<'a> NumericWalker<'a> {
                 self.expr(scope, &conditional.consequent);
                 self.expr(scope, &conditional.alternate);
             }
+            Expression::ObjectExpression(object) => {
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        continue;
+                    };
+                    if let Some(expression) = property.key.as_expression() {
+                        self.expr(scope, expression);
+                    }
+                    self.expr(scope, &property.value);
+                }
+            }
+            Expression::UpdateExpression(update) => match &update.argument {
+                SimpleAssignmentTarget::StaticMemberExpression(access) => {
+                    self.expr(scope, &access.object);
+                }
+                SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                    self.expr(scope, &member.object);
+                    self.expr(scope, &member.expression);
+                }
+                _ => {}
+            },
             Expression::AssignmentExpression(assign) => {
+                match &assign.left {
+                    AssignmentTarget::StaticMemberExpression(access) => {
+                        self.expr(scope, &access.object);
+                    }
+                    AssignmentTarget::ComputedMemberExpression(member) => {
+                        self.expr(scope, &member.object);
+                        self.expr(scope, &member.expression);
+                    }
+                    _ => {}
+                }
                 if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
                     && let Some(key) = resolve_binding(self.program, scope, id.name.as_str())
                     && self.numeric.contains(&key)

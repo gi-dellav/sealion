@@ -71,6 +71,15 @@ fn artifact_is_deterministic() {
 }
 
 #[test]
+fn objects_survive_precompilation() {
+    let engine = Engine::new();
+    let source = "var o = {a: 40, b: 2}; o.a + o.b;";
+    let artifact = engine.precompile_module(source).unwrap();
+    let module = engine.deserialize(&artifact).unwrap();
+    assert_eq!(module.run(), 42);
+}
+
+#[test]
 fn exposes_function_table() {
     let engine = Engine::new();
     let artifact = engine

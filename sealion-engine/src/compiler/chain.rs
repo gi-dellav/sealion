@@ -9,6 +9,7 @@ use super::call::{
     compile_property_access,
 };
 use super::expr::compile_expr;
+use super::object;
 use super::{CodegenCtx, Flow};
 use crate::{Error, value};
 
@@ -103,13 +104,11 @@ pub(super) fn compile_chain_static_member<'a>(
         builder.ins().brif(nullish, short, &[], ok, &[]);
         builder.switch_to_block(ok);
     }
-    if access.property.name.as_str() == "length"
-        && let Some(ops) = ctx.strings.as_ref()
-    {
-        let call = builder.ins().call(ops.length, &[object]);
-        return Ok(builder.inst_results(call)[0]);
+    if ctx.objects.is_none() {
+        return Ok(value::undefined(builder));
     }
-    Ok(value::undefined(builder))
+    let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+    object::get(builder, ctx, object, key)
 }
 
 pub(super) fn compile_chain_computed_member<'a>(
@@ -127,8 +126,11 @@ pub(super) fn compile_chain_computed_member<'a>(
         builder.ins().brif(nullish, short, &[], ok, &[]);
         builder.switch_to_block(ok);
     }
-    let _ = compile_expr(builder, ctx, flow, &member.expression)?;
-    Ok(value::undefined(builder))
+    let key = compile_expr(builder, ctx, flow, &member.expression)?;
+    if ctx.objects.is_none() {
+        return Ok(value::undefined(builder));
+    }
+    object::get(builder, ctx, object, key)
 }
 
 pub(super) fn compile_chain_call<'a>(

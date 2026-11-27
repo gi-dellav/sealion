@@ -25,6 +25,7 @@ mod expr;
 mod flow;
 mod loops;
 mod numeric;
+mod object;
 mod signature;
 mod stmt;
 mod support;
@@ -53,6 +54,7 @@ struct CodegenCtx<'a> {
     numeric: &'a HashSet<(ScopeId, usize)>,
     exception: Value,
     strings: Option<value::StringOps>,
+    objects: Option<value::ObjectOps>,
     string_literals: Rc<HashMap<String, (Value, i64)>>,
 }
 
@@ -75,6 +77,7 @@ impl<'a> CodegenCtx<'a> {
             numeric: self.numeric,
             exception: self.exception,
             strings: self.strings,
+            objects: self.objects,
             string_literals: Rc::clone(&self.string_literals),
         }
     }
@@ -91,7 +94,16 @@ fn string_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::StringOps>
         to_number: *refs.get("sealion_string_to_number")?,
         to_string: *refs.get("sealion_string_to_string")?,
         compare: *refs.get("sealion_string_compare")?,
-        length: *refs.get("sealion_string_length")?,
+    })
+}
+
+fn object_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::ObjectOps> {
+    Some(value::ObjectOps {
+        new: *refs.get("sealion_object_new")?,
+        get: *refs.get("sealion_object_get")?,
+        set: *refs.get("sealion_object_set")?,
+        has: *refs.get("sealion_object_has")?,
+        delete: *refs.get("sealion_object_delete")?,
     })
 }
 
@@ -221,6 +233,14 @@ pub fn compile_functions<'a>(
         } else {
             None
         };
+        let objects = if dynamic {
+            Some(
+                object_ops(&builtin_refs)
+                    .ok_or_else(|| Error::Codegen("missing object runtime".to_string()))?,
+            )
+        } else {
+            None
+        };
         let root_scope = program.scope(plan.root_scope);
         let vars = declare_vars(&mut builder, program, plan.id);
         let env = if root_scope.has_env() {
@@ -248,6 +268,7 @@ pub fn compile_functions<'a>(
             numeric: &numeric,
             exception,
             strings,
+            objects,
             string_literals,
         };
 

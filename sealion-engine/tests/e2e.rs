@@ -1561,6 +1561,24 @@ fn supports_cranelift_optimization_levels() {
 }
 
 #[test]
+fn objects_require_the_dynamic_runtime() {
+    let engine = Engine::new();
+    for source in [
+        "var o = {}; 0;",
+        "var o = {a: 1}; o.a;",
+        "var o = {a: 1}; o.a = 2;",
+        "var o = {a: 1}; o.a++;",
+        "var o = {a: 1}; delete o.a;",
+        "var o = {a: 1}; 'a' in o;",
+    ] {
+        assert!(
+            engine.compile(source).is_err(),
+            "expected the AOT backend to reject {source}"
+        );
+    }
+}
+
+#[test]
 fn supports_cranelift_codegen_toggles() {
     let options = CompileOptions {
         enable_alias_analysis: false,

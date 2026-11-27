@@ -154,6 +154,84 @@ fn console_log_accepts_strings_and_other_values() {
 }
 
 #[test]
+fn object_literals_and_property_reads() {
+    assert_eq!(run("var o = {a: 1}; o.a;"), 1);
+    assert_eq!(run("({a: 1, b: 2}).b;"), 2);
+    assert_eq!(run("var a = 3; var o = {a}; o.a;"), 3);
+    assert_eq!(run("var o = {n: 1, n: 2}; o.n;"), 2);
+    assert_eq!(run(r#"var o = {a: 7}; o["a"];"#), 7);
+    assert_eq!(run(r#"var k = "x"; var o = {[k]: 5}; o.x;"#), 5);
+    assert_eq!(run("var o = {1: 4}; o[1];"), 4);
+    assert_eq!(run(r#"var o = {1: 4}; o["1"];"#), 4);
+    assert_eq!(run("var o = {a: {b: 9}}; o.a.b;"), 9);
+    assert_eq!(run("var o = {}; o.none === undefined ? 1 : 2;"), 1);
+    assert_eq!(
+        run("var o = {f: function (x) { return x + 1; }}; o.f(4);"),
+        5
+    );
+}
+
+#[test]
+fn object_property_writes_updates_and_delete() {
+    assert_eq!(run("var o = {}; o.a = 1; o.a;"), 1);
+    assert_eq!(run("var o = {}; o.a = 1; o.a += 2; o.a;"), 3);
+    assert_eq!(run("var o = {n: 1}; o.n++; o.n;"), 2);
+    assert_eq!(run("var o = {n: 5}; o.n--;"), 5);
+    assert_eq!(run("var o = {n: 5}; ++o.n;"), 6);
+    assert_eq!(run("var o = {n: 5}; o.n *= 2; o.n;"), 10);
+    assert_eq!(run("var o = {a: 1}; 'a' in o ? 1 : 2;"), 1);
+    assert_eq!(run("var o = {a: 1}; delete o.a; 'a' in o ? 1 : 2;"), 2);
+    assert_eq!(
+        run("var o = {}; o.m = 1; delete o.m; o.m === undefined ? 1 : 2;"),
+        1
+    );
+}
+
+#[test]
+fn object_identity_truthiness_and_chaining() {
+    assert_eq!(run("var o = {}; o === o ? 1 : 2;"), 1);
+    assert_eq!(run("var o = {}; o === {} ? 1 : 2;"), 2);
+    assert_eq!(run("var o = {}; Object.is(o, o) ? 1 : 0;"), 1);
+    assert_eq!(run("var o = {}; Object.is(o, {}) ? 1 : 0;"), 0);
+    assert_eq!(run("var r = 0; if ({}) { r = 1; } else { r = 2; } r;"), 1);
+    assert_eq!(run("var o = null; o?.a === undefined ? 1 : 2;"), 1);
+    assert_eq!(run("var o = {a: 4}; o?.a;"), 4);
+    assert_eq!(run("var o = {a: 1}; o.a.x === undefined ? 1 : 2;"), 1);
+}
+
+#[test]
+fn objects_stringify_and_flow_through_functions() {
+    assert_eq!(
+        run(r#"var o = {a: 1}; String(o) === "[object Object]" ? 1 : 2;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var o = {}; o + "" === "[object Object]" ? 1 : 2;"#),
+        1
+    );
+    assert_eq!(run("function f(o) { return o.a; } f({a: 8});"), 8);
+    assert_eq!(
+        run("var o = {n: 1}; function g() { return o.n; } g(); o.n = 2; g();"),
+        2
+    );
+    assert_eq!(run("var o = {n: 1}; console.log(o, o.n); 0;"), 0);
+}
+
+#[test]
+fn unsupported_object_shapes_are_rejected() {
+    for source in [
+        "var o = {...{a: 1}}; 0;",
+        "var o = {get a() { return 1; }}; 0;",
+        "var o = {__proto__: null}; 0;",
+    ] {
+        assert!(
+            Engine::new().compile_jit(source).is_err(),
+            "expected a rejection for {source}"
+        );
+    }
+}
+
+#[test]
 fn direct_calls_respect_reassignment_and_escapes() {
     assert_eq!(
         run(

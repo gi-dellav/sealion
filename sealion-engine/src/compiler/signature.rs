@@ -46,6 +46,15 @@ pub fn make_f64_binary_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
+pub fn make_f64_ternary_signature<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::F64));
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
 pub fn make_main_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I32));

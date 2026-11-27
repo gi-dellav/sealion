@@ -886,6 +886,7 @@ fn resolve_external(name: &str, cache: &mut HashMap<String, usize>) -> Result<us
         return Ok(*address);
     }
     let address = super::strings::lookup(name)
+        .or_else(|| super::objects::lookup(name))
         .or_else(|| Linux::lookup(name))
         .ok_or_else(|| error(format!("unresolved external symbol {name:?}")))?;
     cache.insert(name.to_string(), address);

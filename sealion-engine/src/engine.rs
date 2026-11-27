@@ -292,7 +292,7 @@ impl Engine {
 
         let obj_builder = ObjectBuilder::new(isa, "sealion_module", default_libcall_names())?;
         let mut module = ObjectModule::new(obj_builder);
-        let builtins = builtins::Builtins::new(&mut module)?;
+        let builtins = builtins::Builtins::new(&mut module, dynamic)?;
 
         let mut string_ids = HashMap::new();
         if dynamic {

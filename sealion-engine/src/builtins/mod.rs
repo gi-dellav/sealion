@@ -6,9 +6,8 @@
 //! `isFinite`, `Boolean` and `Number` functions are compiled the same way, as
 //! are the global `NaN` and `Infinity` constants.
 //!
-//! Because there are no objects yet, the namespaces cannot be used as values:
-//! only `Math.member`, `Number.member`, `Object.member` and `Date.member` are
-//! accepted.
+//! The namespaces are not first-class values: only `Math.member`,
+//! `Number.member`, `Object.member` and `Date.member` are accepted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,8 +18,8 @@ use cranelift_object::ObjectModule;
 use crate::{
     Error,
     compiler::{
-        make_f64_binary_signature, make_f64_unary_signature, make_i64_unary_signature,
-        make_nullary_f64_signature,
+        make_f64_binary_signature, make_f64_ternary_signature, make_f64_unary_signature,
+        make_i64_unary_signature, make_nullary_f64_signature,
     },
 };
 
@@ -97,7 +96,9 @@ pub struct Builtins {
 }
 
 impl Builtins {
-    pub fn new(module: &mut ObjectModule) -> Result<Self, Error> {
+    /// `dynamic` declares the host helpers of the dynamic runtime; the AOT
+    /// backend leaves them out so that no unresolved symbol is emitted.
+    pub fn new(module: &mut ObjectModule, dynamic: bool) -> Result<Self, Error> {
         let unary_sig = make_f64_unary_signature(module);
         let binary_sig = make_f64_binary_signature(module);
         let mut funcs = HashMap::new();
@@ -141,9 +142,6 @@ impl Builtins {
         let console_log_id =
             module.declare_function("sealion_console_log", Linkage::Import, &void_sig)?;
         funcs.insert("sealion_console_log", console_log_id);
-        let length_id =
-            module.declare_function("sealion_string_length", Linkage::Import, &unary_sig)?;
-        funcs.insert("sealion_string_length", length_id);
         for name in ["sealion_string_to_number", "sealion_string_to_string"] {
             let id = module.declare_function(name, Linkage::Import, &unary_sig)?;
             funcs.insert(name, id);
@@ -156,6 +154,25 @@ impl Builtins {
         ] {
             let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
             funcs.insert(name, id);
+        }
+
+        if dynamic {
+            let pointer_sig = make_nullary_i64_signature(module);
+            let new_id =
+                module.declare_function("sealion_object_new", Linkage::Import, &pointer_sig)?;
+            funcs.insert("sealion_object_new", new_id);
+            for name in [
+                "sealion_object_get",
+                "sealion_object_has",
+                "sealion_object_delete",
+            ] {
+                let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
+                funcs.insert(name, id);
+            }
+            let ternary_sig = make_f64_ternary_signature(module);
+            let set_id =
+                module.declare_function("sealion_object_set", Linkage::Import, &ternary_sig)?;
+            funcs.insert("sealion_object_set", set_id);
         }
 
         let names = MATH_CONSTANTS
@@ -263,6 +280,12 @@ impl Builtins {
             .map(|(name, id)| (*name, module.declare_func_in_func(*id, func)))
             .collect()
     }
+}
+
+fn make_nullary_i64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
 }
 
 fn make_i64_pair_to_i64_signature(module: &mut ObjectModule) -> Signature {
