@@ -1579,6 +1579,22 @@ fn objects_require_the_dynamic_runtime() {
 }
 
 #[test]
+fn strings_require_the_dynamic_runtime() {
+    let engine = Engine::new();
+    for source in [
+        r#"var s = "abc"; s.length;"#,
+        r#"var s = "abc"; s.charAt(0);"#,
+        r#"var s = "abc"; s.split("b");"#,
+        r#""a" + "b";"#,
+    ] {
+        assert!(
+            engine.compile(source).is_err(),
+            "expected the AOT backend to reject {source}"
+        );
+    }
+}
+
+#[test]
 fn arrays_require_the_dynamic_runtime() {
     let engine = Engine::new();
     for source in [

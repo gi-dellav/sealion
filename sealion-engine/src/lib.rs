@@ -62,8 +62,14 @@
 //! - Bitwise results are signed 32-bit values except for `>>>`, as per the spec.
 //! - The dynamic (JIT) runtime stores strings as tagged pointers to
 //!   `sealion-string` values, so literals, concatenation, comparison, `.length`,
-//!   `String(value)` and `console.log` work there. The AOT emitter still rejects
-//!   string values because it cannot link the host string runtime.
+//!   `String(value)`, `console.log` and the `String.prototype` methods (`charAt`,
+//!   `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`,
+//!   `startsWith`, `endsWith`, `slice`, `substring`, `substr`, `split`, `trim`,
+//!   `trimStart`, `trimEnd`, `toUpperCase`, `toLowerCase`, `repeat`, `padStart`,
+//!   `padEnd`, `replace`, `replaceAll`, `concat`, `toString`, `valueOf`) work
+//!   there. Methods are native closures over the receiver, so
+//!   `var f = s.toUpperCase` works. The AOT emitter still rejects string values
+//!   because it cannot link the host string runtime.
 //!
 //! Blocks are real lexical scopes: `let`/`const` shadow their enclosing scope
 //! and disappear at the closing brace, while `var` and function declarations

@@ -144,6 +144,85 @@ fn strings_capture_and_cross_calls() {
 }
 
 #[test]
+fn string_inspection_methods() {
+    assert_eq!(run(r#""abc".charAt(1) === "b" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".charAt() === "a" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".charAt(9) === "" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".charAt(-1) === "" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".charCodeAt(2);"#), 99);
+    assert_eq!(run(r#"Number.isNaN("abc".charCodeAt(7)) ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""A".codePointAt(0);"#), 65);
+    assert_eq!(run(r#""abc".at(-1) === "c" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".at(9) === undefined ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcabc".indexOf("bc");"#), 1);
+    assert_eq!(run(r#""abcabc".indexOf("bc", 2);"#), 4);
+    assert_eq!(run(r#""abc".indexOf("z");"#), -1);
+    assert_eq!(run(r#""abcabc".lastIndexOf("bc");"#), 4);
+    assert_eq!(run(r#""abcabc".lastIndexOf("bc", 3);"#), 1);
+    assert_eq!(run(r#""abc".includes("b") ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".includes("z") ? 1 : 0;"#), 0);
+    assert_eq!(run(r#""abc".startsWith("ab") ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".startsWith("ab", 1) ? 1 : 0;"#), 0);
+    assert_eq!(run(r#""abc".endsWith("bc") ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".endsWith("ab", 2) ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn string_trimming_and_case_methods() {
+    assert_eq!(run(r#""  x  ".trim() === "x" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""  x  ".trimStart() === "x  " ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""  x  ".trimEnd() === "  x" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".toUpperCase() === "ABC" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""ABC".toLowerCase() === "abc" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var up = "abc".toUpperCase; up() === "ABC" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var s = "  Ab  "; s.trim().toLowerCase() === "ab" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#""abc".repeat(3) === "abcabcabc" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".repeat(0) === "" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""5".padStart(3, "0") === "005" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""5".padEnd(3) === "5  " ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".padStart(3, "0") === "abcdef" ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn string_slicing_and_joining_methods() {
+    assert_eq!(run(r#""abcdef".slice(1, 3) === "bc" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".slice(-2) === "ef" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".slice(3, 1) === "" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".substring(3, 1) === "bc" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".substring(-2, 2) === "ab" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abcdef".substr(1, 2) === "bc" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""a-b-c".split("-").length;"#), 3);
+    assert_eq!(run(r#""a-b-c".split("-")[1] === "b" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".split("").length;"#), 3);
+    assert_eq!(run(r#""abc".split().length;"#), 1);
+    assert_eq!(run(r#""a-b-c".split("-", 2).length;"#), 2);
+    assert_eq!(run(r#""a".concat("b", 1) === "ab1" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".toString() === "abc" ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn string_replace_methods() {
+    assert_eq!(run(r#""a-b".replace("-", "+") === "a+b" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""a-b-c".replace("-", "+") === "a+b-c" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#""a-b-c".replaceAll("-", "+") === "a+b+c" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#""abc".replace("b", "[$&]") === "a[b]c" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#""abc".replace("z", "+") === "abc" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#""abc".replace("b", function (m) { return m.toUpperCase(); }) === "aBc" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
 fn console_log_accepts_strings_and_other_values() {
     assert_eq!(
         run(

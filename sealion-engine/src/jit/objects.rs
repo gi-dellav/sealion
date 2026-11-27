@@ -16,7 +16,9 @@ use sealion_string::JsString;
 
 use super::arrays;
 use super::maps;
-use super::strings::{is_object, tagged_bool, tagged_undefined, to_js_string, with_string};
+use super::strings::{
+    is_object, method_property, tagged_bool, tagged_undefined, to_js_string, with_string,
+};
 use crate::value::{PAYLOAD_MASK, TAG_OBJECT, TAG_STRING};
 
 pub(super) struct JsObject {
@@ -114,6 +116,7 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     }
     maps::method_property(object, &key)
         .or_else(|| arrays::method_property(object, &key))
+        .or_else(|| method_property(object, &key))
         .unwrap_or_else(tagged_undefined)
 }
 

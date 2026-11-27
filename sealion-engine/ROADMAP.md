@@ -59,14 +59,14 @@
 - [x] Precompiled artifacts: `Engine::precompile_module`, `IrModule::serialize`, `Engine::deserialize*`, and the `--artifact` / `--run-artifact` CLI flags
 - [x] `Object`: own-property bags in the dynamic (JIT) runtime only — object literals, static and computed reads/writes, compound assignment, `++`/`--`, `delete`, `in`, optional chaining and `Object.is`; no prototypes, `this`, accessors or spread
 - [x] `Map` — `new Map()` with `size`, `get`, `set`, `has`, `delete`, `clear` and `forEach` (dynamic runtime only; no `keys`/`values`/`entries` iterators, no iterable argument)
-- [ ] `typeof` operand
+- [x] `typeof` operand
+- [x] `this` implementation
+- [x] `String.prototype` — `charAt`, `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`, `substring`, `substr`, `split`, `trim`, `trimStart`, `trimEnd`, `toUpperCase`, `toLowerCase`, `repeat`, `padStart`, `padEnd`, `replace`, `replaceAll`, `concat`, `toString` and `valueOf` (dynamic runtime only; `replace` takes strings or a function, no regular expressions)
 
 
 ### Later
 
-- [ ] `typeof`
-
-- [ ] `this` implementation
+- [ ] `String.fromCharCode` and `String.fromCodePoint`
 - [ ] `__proto__` and prototypes
 
 - [ ] `Math` module
