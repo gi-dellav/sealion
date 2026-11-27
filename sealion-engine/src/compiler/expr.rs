@@ -2,12 +2,14 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::FloatCC, condcodes::I
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
-    ConditionalExpression, Expression, LogicalOperator, SimpleAssignmentTarget, UnaryExpression,
-    UnaryOperator, UpdateExpression, UpdateOperator,
+    ConditionalExpression, Expression, LogicalOperator, NewExpression, SimpleAssignmentTarget,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
 };
 
+use super::array::compile_array_literal;
 use super::call::{
-    compile_call, compile_closure, compile_computed_access, compile_property_access, is_free_global,
+    BuiltinCallee, compile_builtin_call, compile_call, compile_closure, compile_computed_access,
+    compile_property_access, is_free_global,
 };
 use super::chain::compile_chain;
 use super::numeric::{binding_is_number, expr_is_number, number_value};
@@ -181,10 +183,37 @@ pub(super) fn compile_expr<'a>(
             compile_computed_access(builder, ctx, flow, member)
         }
         Expression::ObjectExpression(object) => compile_object_literal(builder, ctx, flow, object),
+        Expression::ArrayExpression(array) => compile_array_literal(builder, ctx, flow, array),
+        Expression::NewExpression(new) => compile_new(builder, ctx, flow, new),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
     }
+}
+
+/// Only `new Array(...)` is supported: the constructors of the engine have no
+/// first-class identity, so every other `new` is rejected.
+fn compile_new<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    new: &'a NewExpression<'a>,
+) -> Result<Value, Error> {
+    if let Expression::Identifier(id) = &new.callee
+        && id.name.as_str() == "Array"
+        && is_free_global(ctx, id.name.as_str())
+    {
+        return compile_builtin_call(
+            builder,
+            ctx,
+            flow,
+            BuiltinCallee::Global("Array"),
+            new.arguments.as_slice(),
+        );
+    }
+    Err(Error::Unsupported(
+        "only `new Array` is supported".to_string(),
+    ))
 }
 
 pub(super) fn compile_binary<'a>(

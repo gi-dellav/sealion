@@ -11,6 +11,8 @@ use crate::{Error, IrFunction};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod arch;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod arrays;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod artifact;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod loader;

@@ -360,6 +360,21 @@ impl<'a> Walker<'a, '_> {
                 }
                 _ => self.conservative = true,
             },
+            Expression::ArrayExpression(array) => {
+                for element in &array.elements {
+                    if let Some(expression) = element.as_expression() {
+                        self.expression(scope, expression);
+                    }
+                }
+            }
+            Expression::NewExpression(new) => {
+                self.expression(scope, &new.callee);
+                for arg in &new.arguments {
+                    if let Some(expression) = arg.as_expression() {
+                        self.expression(scope, expression);
+                    }
+                }
+            }
             Expression::ObjectExpression(object) => {
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {

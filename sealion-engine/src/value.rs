@@ -53,6 +53,16 @@ pub struct StringOps {
     pub compare: FuncRef,
 }
 
+/// Runtime entry points that implement array semantics.
+///
+/// Like [`ObjectOps`], the AOT backend leaves this unset and rejects arrays.
+#[derive(Clone, Copy)]
+pub struct ArrayOps {
+    /// Allocates an array of `length` `undefined` elements and returns its raw
+    /// pointer bits.
+    pub new: FuncRef,
+}
+
 /// Runtime entry points that implement object semantics.
 ///
 /// Like [`StringOps`], the AOT backend leaves this unset and rejects objects;

@@ -1,7 +1,9 @@
 //! Host helpers for JavaScript object values.
 //!
 //! Compiled code stores an object as a NaN-boxed pointer to a [`JsObject`]: an
-//! insertion-ordered own-property table and nothing else. There are no
+//! insertion-ordered own-property table plus an optional dense element vector.
+//! A [`JsObject`] with elements is an array, answered by `jit::arrays`; the two
+//! share one allocation so the tag is enough to tell them apart. There are no
 //! prototypes, property descriptors or garbage collector, so objects leak for
 //! the lifetime of the process exactly like closure and environment records.
 //!
@@ -12,11 +14,31 @@
 
 use sealion_string::JsString;
 
+use super::arrays;
 use super::strings::{is_object, tagged_bool, tagged_undefined, to_js_string, with_string};
-use crate::value::{PAYLOAD_MASK, TAG_STRING};
+use crate::value::{PAYLOAD_MASK, TAG_OBJECT, TAG_STRING};
 
 pub(super) struct JsObject {
     properties: Vec<(JsString, f64)>,
+    pub(super) elements: Option<Vec<f64>>,
+}
+
+pub(super) fn new_object() -> *mut JsObject {
+    Box::into_raw(Box::new(JsObject {
+        properties: Vec::new(),
+        elements: None,
+    }))
+}
+
+pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
+    Box::into_raw(Box::new(JsObject {
+        properties: Vec::new(),
+        elements: Some(elements),
+    }))
+}
+
+pub(super) fn tagged_object(pointer: *mut JsObject) -> f64 {
+    f64::from_bits((TAG_OBJECT << 48) | pointer as u64)
 }
 
 fn object_pointer(value: f64) -> Option<*mut JsObject> {
@@ -29,7 +51,7 @@ fn object_pointer(value: f64) -> Option<*mut JsObject> {
 /// Runs `f` on the object behind `value`, or returns `None` for non-objects.
 ///
 /// The compiled program never frees an object, so the borrow is not tracked.
-fn with_object<R>(value: f64, f: impl FnOnce(&mut JsObject) -> R) -> Option<R> {
+pub(super) fn with_object<R>(value: f64, f: impl FnOnce(&mut JsObject) -> R) -> Option<R> {
     let pointer = object_pointer(value)?;
     Some(f(unsafe { &mut *pointer }))
 }
@@ -44,10 +66,19 @@ fn property_key(key: f64) -> JsString {
     }
 }
 
+fn own_property(object: f64, key: &JsString) -> Option<f64> {
+    with_object(object, |object| {
+        object
+            .properties
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| *value)
+    })
+    .flatten()
+}
+
 extern "C" fn sealion_object_new() -> u64 {
-    Box::into_raw(Box::new(JsObject {
-        properties: Vec::new(),
-    })) as u64
+    new_object() as u64
 }
 
 extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
@@ -58,18 +89,20 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     {
         return length;
     }
-    with_object(object, |object| {
-        object
-            .properties
-            .iter()
-            .find(|(name, _)| *name == key)
-            .map_or_else(tagged_undefined, |(_, value)| *value)
-    })
-    .unwrap_or_else(tagged_undefined)
+    if let Some(value) = arrays::element_property(object, &key) {
+        return value;
+    }
+    if let Some(value) = own_property(object, &key) {
+        return value;
+    }
+    arrays::method_property(object, &key).unwrap_or_else(tagged_undefined)
 }
 
 extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
     let key = property_key(key);
+    if arrays::set_element(object, &key, value) {
+        return value;
+    }
     with_object(object, |object| {
         match object.properties.iter_mut().find(|(name, _)| *name == key) {
             Some(entry) => entry.1 = value,
@@ -81,15 +114,17 @@ extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
 
 extern "C" fn sealion_object_has(object: f64, key: f64) -> f64 {
     let key = property_key(key);
-    let has = with_object(object, |object| {
-        object.properties.iter().any(|(name, _)| *name == key)
-    })
-    .unwrap_or(false);
+    let has = arrays::has_element(object, &key)
+        || with_object(object, |object| {
+            object.properties.iter().any(|(name, _)| *name == key)
+        })
+        .unwrap_or(false);
     tagged_bool(has)
 }
 
 extern "C" fn sealion_object_delete(object: f64, key: f64) -> f64 {
     let key = property_key(key);
+    arrays::delete_element(object, &key);
     with_object(object, |object| {
         object.properties.retain(|(name, _)| *name != key);
     });

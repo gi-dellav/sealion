@@ -33,6 +33,24 @@ fn number_argument(
     }
 }
 
+/// Materialises `args` in a stack block shaped like a call argument block, so
+/// host helpers can read them through the same layout.
+fn write_args(builder: &mut FunctionBuilder, args: &[Value]) -> Value {
+    let slots = args.len() + 1;
+    let size = u32::try_from(slots * 8).unwrap_or(u32::MAX);
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+    let base = builder.ins().stack_addr(types::I64, slot, 0);
+    let len = builder.ins().iconst(types::I64, args.len() as i64);
+    builder.ins().store(MemFlags::new(), len, base, 0i32);
+    for (index, &arg) in args.iter().enumerate() {
+        builder
+            .ins()
+            .store(MemFlags::new(), arg, base, (8 + index * 8) as i32);
+    }
+    base
+}
+
 fn console_log(
     builder: &mut FunctionBuilder,
     funcs: &HashMap<&'static str, FuncRef>,
@@ -41,18 +59,10 @@ fn console_log(
     let func_ref = *funcs
         .get("sealion_console_log")
         .ok_or_else(|| Error::Unsupported("console.log is not available".to_string()))?;
-    let slots = args.len().max(1);
-    let size = u32::try_from(slots * 8).unwrap_or(u32::MAX);
-    let slot =
-        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
-    let base = builder.ins().stack_addr(types::I64, slot, 0);
-    for (index, &arg) in args.iter().enumerate() {
-        builder
-            .ins()
-            .store(MemFlags::new(), arg, base, (index * 8) as i32);
-    }
+    let base = write_args(builder, args);
+    let values = builder.ins().iadd_imm(base, 8);
     let len = builder.ins().iconst(types::I64, args.len() as i64);
-    builder.ins().call(func_ref, &[base, len]);
+    builder.ins().call(func_ref, &[values, len]);
     Ok(value::undefined(builder))
 }
 
@@ -189,6 +199,22 @@ pub fn call(
             let lhs = argument(builder, args, 0);
             let rhs = argument(builder, args, 1);
             value::same_value(builder, lhs, rhs, strings)
+        }
+        "isArray" => {
+            let func_ref = *funcs.get("sealion_array_is_array").ok_or_else(|| {
+                Error::Unsupported("Array.isArray requires the dynamic runtime".to_string())
+            })?;
+            let array = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[array])
+        }
+        "Array" => {
+            let func_ref = *funcs.get("sealion_array_construct").ok_or_else(|| {
+                Error::Unsupported("Array requires the dynamic runtime".to_string())
+            })?;
+            let values = write_args(builder, args);
+            let call = builder.ins().call(func_ref, &[values]);
+            let pointer = builder.inst_results(call)[0];
+            value::object(builder, pointer)
         }
         "String" => {
             let ops = strings.ok_or_else(|| {

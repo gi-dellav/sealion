@@ -282,3 +282,117 @@ fn numeric_comparison_conditions_match_js_semantics() {
     assert_eq!(run("-0 === 0 ? 1 : 0;"), 1);
     assert_eq!(run("-0 < 0 ? 1 : 0;"), 0);
 }
+
+#[test]
+fn array_literals_length_and_indices() {
+    assert_eq!(run("[];0;"), 0);
+    assert_eq!(run("[1, 2, 3].length;"), 3);
+    assert_eq!(run("var a = [10, 20, 30]; a[1];"), 20);
+    assert_eq!(run(r#"var a = [10, 20]; a["1"];"#), 20);
+    assert_eq!(run("var a = [1]; a[3] = 4; a.length;"), 4);
+    assert_eq!(
+        run("var a = [1, 2, 3]; a.length = 1; a[2] === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var a = [1, 2, 3]; a.length = 5; a.length;"), 5);
+    assert_eq!(run("var a = [1, 2]; a[0]++; a[1] += 5; a[0] + a[1];"), 9);
+    assert_eq!(run("var a = [1, 2]; 1 in a ? 1 : 0;"), 1);
+    assert_eq!(run("var a = [1, 2]; 2 in a ? 1 : 0;"), 0);
+    assert_eq!(
+        run("var a = [1, 2]; delete a[0]; a[0] === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var a = [1, 2]; a === a ? 1 : 0;"), 1);
+    assert_eq!(run("var a = []; a === [] ? 0 : 1;"), 1);
+    assert_eq!(run("var r = 0; if ([]) { r = 1; } r;"), 1);
+    assert_eq!(run("[1, , 3].length;"), 3);
+    assert_eq!(run("var a = [[1, 2], [3]]; a[0][1] + a[1][0];"), 5);
+}
+
+#[test]
+fn array_mutation_methods() {
+    assert_eq!(run("var a = []; a.push(1, 2); a.length;"), 2);
+    assert_eq!(run("var a = [1]; a.push(2); a[1];"), 2);
+    assert_eq!(run("var a = [1, 2]; a.pop();"), 2);
+    assert_eq!(run("var a = [1, 2]; a.pop(); a.length;"), 1);
+    assert_eq!(run("var a = []; a.pop() === undefined ? 1 : 0;"), 1);
+    assert_eq!(run("var a = [1, 2]; a.shift();"), 1);
+    assert_eq!(run("var a = [1, 2]; a.shift(); a[0];"), 2);
+    assert_eq!(run("var a = [3]; a.unshift(1, 2); a[0] + a[2];"), 4);
+    assert_eq!(run("var a = [1, 2, 3]; a.reverse(); a[0];"), 3);
+    assert_eq!(run("var a = [1, 2]; a.reverse() === a ? 1 : 0;"), 1);
+}
+
+#[test]
+fn array_accessor_and_search_methods() {
+    assert_eq!(run(r#"[1, 2, 3].join() === "1,2,3" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"[1, 2].join("-") === "1-2" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"[1, null, 3].join("-") === "1--3" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"String([1, 2]) === "1,2" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"[1, 2] + "" === "1,2" ? 1 : 0;"#), 1);
+    assert_eq!(run("var a = [1, 2, 3, 4]; a.slice(1, 3).length;"), 2);
+    assert_eq!(run("var a = [1, 2, 3, 4]; a.slice(-2)[0];"), 3);
+    assert_eq!(run("var a = [1, 2]; a.concat([3, 4]).length;"), 4);
+    assert_eq!(run("var a = [1, 2]; a.concat(3)[2];"), 3);
+    assert_eq!(run("var a = [1, 2, 3]; a.indexOf(2);"), 1);
+    assert_eq!(run("var a = [1, 2, 3]; a.indexOf(9);"), -1);
+    assert_eq!(run("var a = [1, 2, 3]; a.indexOf(3, 0);"), 2);
+    assert_eq!(run("var a = [1, 2, 3]; a.includes(2) ? 1 : 0;"), 1);
+    assert_eq!(run("var a = [1, 2, 3]; a.includes(9) ? 0 : 1;"), 1);
+    assert_eq!(run("var a = [NaN]; a.includes(NaN) ? 1 : 0;"), 1);
+    assert_eq!(run(r#"var a = ["a", "b"]; a.indexOf("b");"#), 1);
+}
+
+#[test]
+fn array_iteration_methods_call_closures() {
+    assert_eq!(
+        run("var s = 0; [1, 2, 3].forEach(function (x) { s = s + x; }); s;"),
+        6
+    );
+    assert_eq!(
+        run("var a = [1, 2, 3].map(function (x) { return x * 2; }); a[2];"),
+        6
+    );
+    assert_eq!(
+        run("var a = [1, 2, 3, 4].filter(function (x) { return x > 2; }); a.length;"),
+        2
+    );
+    assert_eq!(
+        run("[1, 2, 3].reduce(function (acc, x) { return acc + x; });"),
+        6
+    );
+    assert_eq!(
+        run("[1, 2].reduce(function (acc, x) { return acc + x; }, 10);"),
+        13
+    );
+    assert_eq!(
+        run("[1, 2, 3].some(function (x) { return x > 2; }) ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("[1, 2, 3].every(function (x) { return x > 0; }) ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("[1, 2, 3].find(function (x) { return x > 1; });"), 2);
+    assert_eq!(
+        run("[1, 2, 3].findIndex(function (x) { return x > 1; });"),
+        1
+    );
+    assert_eq!(
+        run("var plus = [1, 2].map(function (x) { return x + 1; }); plus[0] + plus[1];"),
+        5
+    );
+}
+
+#[test]
+fn array_constructor_and_method_references() {
+    assert_eq!(run("Array.isArray([]) ? 1 : 0;"), 1);
+    assert_eq!(run("Array.isArray({}) ? 0 : 1;"), 1);
+    assert_eq!(run("Array.isArray(1) ? 0 : 1;"), 1);
+    assert_eq!(run("Array().length;"), 0);
+    assert_eq!(run("Array(1, 2, 3).length;"), 3);
+    assert_eq!(run("Array(3).length;"), 3);
+    assert_eq!(run("new Array(2).length;"), 2);
+    assert_eq!(run("new Array(7, 8)[1];"), 8);
+    assert_eq!(run("var a = []; var push = a.push; push(4); a[0];"), 4);
+}

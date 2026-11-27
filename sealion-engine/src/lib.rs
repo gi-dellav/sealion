@@ -35,9 +35,12 @@
 //! `NaN`/`Infinity` values, optional chaining (`?.` and `?.()`), `delete` on
 //! identifiers and non-references, and the following operators:
 //!
-//! The dynamic (JIT) runtime additionally supports string values and objects:
-//! object literals, static and computed property access, property assignment,
-//! `delete`, `in` and `Object.is` over own properties. Objects have no
+//! The dynamic (JIT) runtime additionally supports string values, objects and
+//! arrays: object and array literals, static and computed property access,
+//! property assignment, `delete`, `in`, `Object.is`, `Array.isArray`, `Array(n)`
+//! and the common `Array.prototype` methods (`push`, `pop`, `shift`, `unshift`,
+//! `join`, `slice`, `concat`, `indexOf`, `includes`, `reverse`, `forEach`, `map`,
+//! `filter`, `some`, `every`, `find`, `findIndex` and `reduce`). Objects have no
 //! prototypes, `this`, accessors or spread, and nothing is garbage collected.
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
@@ -119,8 +122,8 @@
 //! outer loops or labelled blocks.
 //!
 //! `undefined` is a non-writable global and `debugger` is accepted as a no-op.
-//! Objects, arrays and `for..in`/`for..of` loops are intentionally deferred to
-//! later roadmap versions.
+//! `for..of`, `for..in` and prototype-based inheritance are intentionally
+//! deferred to later roadmap versions.
 
 mod builtins;
 mod compiler;

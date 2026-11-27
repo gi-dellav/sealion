@@ -622,13 +622,15 @@ deliberate copy is the `for` loop's per-iteration environment
 
 The value domain is deliberately narrow:
 
-- No arrays, symbols, BigInts or regular expressions. In the AOT backend,
-  string and object literals and property access are rejected at compile time;
-  the dynamic backend supports strings and plain objects.
+- No symbols, BigInts or regular expressions. In the AOT backend, string,
+  object and array values are rejected at compile time; the dynamic backend
+  supports strings, plain objects and dense arrays.
 - Objects are own-property bags: no prototypes, `__proto__`, `this`, getters,
-  setters, spread or property descriptors, and `delete` always succeeds. There
-  are no arrays, so `Object.keys`/`values`/`entries` are absent; only `Object.is`
-  is implemented.
+  setters, spread or property descriptors, and `delete` always succeeds. An
+  array is a `JsObject` with a dense `Vec<f64>` of elements; it answers
+  `length`, indices and a handful of methods but has no prototype, no iterator
+  protocol and no sparse representation (deleting an index leaves `undefined`).
+  `Object.keys`/`values`/`entries` are absent; only `Object.is` is implemented.
 - No `typeof` or `instanceof`. `in` works on objects in the dynamic backend.
   There are no wrapper objects, so a property read on a primitive yields
   `undefined` (strings answer `length`).
@@ -659,6 +661,7 @@ The value domain is deliberately narrow:
 | Exception state | `sealion-engine/src/engine.rs:265`, `sealion-engine/src/compiler/flow.rs:56` |
 | Closure and environment layout | [CLOSURE.md](CLOSURE.md) |
 | Object model (dynamic backend) | `sealion-engine/src/jit/objects.rs`, `sealion-engine/src/compiler/object.rs` |
+| Array model (dynamic backend) | `sealion-engine/src/jit/arrays.rs`, `sealion-engine/src/compiler/array.rs` |
 | String model (dynamic backend) | `sealion-engine/src/jit/strings.rs` |
 
 Inspect the lowered representation with:

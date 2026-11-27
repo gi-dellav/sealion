@@ -80,6 +80,15 @@ fn objects_survive_precompilation() {
 }
 
 #[test]
+fn arrays_survive_precompilation() {
+    let engine = Engine::new();
+    let source = "var a = [40, 2]; a[0] + a[1];";
+    let artifact = engine.precompile_module(source).unwrap();
+    let module = engine.deserialize(&artifact).unwrap();
+    assert_eq!(module.run(), 42);
+}
+
+#[test]
 fn exposes_function_table() {
     let engine = Engine::new();
     let artifact = engine

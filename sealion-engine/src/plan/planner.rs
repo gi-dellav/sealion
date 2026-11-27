@@ -519,6 +519,21 @@ impl<'a> Planner<'a> {
             Expression::UpdateExpression(update) => {
                 self.scan_target(plan_id, scope, &update.argument)?;
             }
+            Expression::ArrayExpression(array) => {
+                for element in &array.elements {
+                    if let Some(expression) = element.as_expression() {
+                        self.scan_expression(plan_id, scope, expression)?;
+                    }
+                }
+            }
+            Expression::NewExpression(new) => {
+                self.scan_expression(plan_id, scope, &new.callee)?;
+                for arg in &new.arguments {
+                    if let Some(expression) = arg.as_expression() {
+                        self.scan_expression(plan_id, scope, expression)?;
+                    }
+                }
+            }
             Expression::ObjectExpression(object) => {
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {

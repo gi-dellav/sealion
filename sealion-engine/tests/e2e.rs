@@ -1579,6 +1579,24 @@ fn objects_require_the_dynamic_runtime() {
 }
 
 #[test]
+fn arrays_require_the_dynamic_runtime() {
+    let engine = Engine::new();
+    for source in [
+        "var a = [1, 2]; 0;",
+        "var a = [1]; a[0];",
+        "var a = []; a.push(1);",
+        "var a = [1]; a[0] = 2;",
+        "Array(1, 2);",
+        "new Array(1);",
+    ] {
+        assert!(
+            engine.compile(source).is_err(),
+            "expected the AOT backend to reject {source}"
+        );
+    }
+}
+
+#[test]
 fn supports_cranelift_codegen_toggles() {
     let options = CompileOptions {
         enable_alias_analysis: false,

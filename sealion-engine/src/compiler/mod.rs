@@ -19,6 +19,7 @@ use crate::{
     value,
 };
 
+mod array;
 mod call;
 mod chain;
 mod expr;
@@ -55,6 +56,7 @@ struct CodegenCtx<'a> {
     exception: Value,
     strings: Option<value::StringOps>,
     objects: Option<value::ObjectOps>,
+    arrays: Option<value::ArrayOps>,
     string_literals: Rc<HashMap<String, (Value, i64)>>,
 }
 
@@ -78,6 +80,7 @@ impl<'a> CodegenCtx<'a> {
             exception: self.exception,
             strings: self.strings,
             objects: self.objects,
+            arrays: self.arrays,
             string_literals: Rc::clone(&self.string_literals),
         }
     }
@@ -94,6 +97,12 @@ fn string_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::StringOps>
         to_number: *refs.get("sealion_string_to_number")?,
         to_string: *refs.get("sealion_string_to_string")?,
         compare: *refs.get("sealion_string_compare")?,
+    })
+}
+
+fn array_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::ArrayOps> {
+    Some(value::ArrayOps {
+        new: *refs.get("sealion_array_new")?,
     })
 }
 
@@ -241,6 +250,14 @@ pub fn compile_functions<'a>(
         } else {
             None
         };
+        let arrays = if dynamic {
+            Some(
+                array_ops(&builtin_refs)
+                    .ok_or_else(|| Error::Codegen("missing array runtime".to_string()))?,
+            )
+        } else {
+            None
+        };
         let root_scope = program.scope(plan.root_scope);
         let vars = declare_vars(&mut builder, program, plan.id);
         let env = if root_scope.has_env() {
@@ -269,6 +286,7 @@ pub fn compile_functions<'a>(
             exception,
             strings,
             objects,
+            arrays,
             string_literals,
         };
 

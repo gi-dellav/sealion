@@ -33,6 +33,7 @@ pub enum Namespace {
     Math,
     Number,
     Object,
+    Array,
     Date,
     Console,
 }
@@ -57,6 +58,9 @@ const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeIntege
 
 /// `Object` functions implemented inline.
 const OBJECT_INLINE: &[&str] = &["is"];
+
+/// `Array` static functions implemented by the dynamic runtime.
+const ARRAY_INLINE: &[&str] = &["isArray"];
 
 /// `Date` functions implemented inline.
 const DATE_INLINE: &[&str] = &["now"];
@@ -173,6 +177,15 @@ impl Builtins {
             let set_id =
                 module.declare_function("sealion_object_set", Linkage::Import, &ternary_sig)?;
             funcs.insert("sealion_object_set", set_id);
+
+            let length_sig = make_i64_unary_signature(module);
+            for name in ["sealion_array_new", "sealion_array_construct"] {
+                let id = module.declare_function(name, Linkage::Import, &length_sig)?;
+                funcs.insert(name, id);
+            }
+            let is_array_id =
+                module.declare_function("sealion_array_is_array", Linkage::Import, &unary_sig)?;
+            funcs.insert("sealion_array_is_array", is_array_id);
         }
 
         let names = MATH_CONSTANTS
@@ -184,6 +197,7 @@ impl Builtins {
             .chain(MATH_INLINE.iter().copied())
             .chain(NUMBER_INLINE.iter().copied())
             .chain(OBJECT_INLINE.iter().copied())
+            .chain(ARRAY_INLINE.iter().copied())
             .chain(DATE_INLINE.iter().copied())
             .chain(CONSOLE_INLINE.iter().copied())
             .collect();
@@ -197,6 +211,7 @@ impl Builtins {
             "Math" => Some(Namespace::Math),
             "Number" => Some(Namespace::Number),
             "Object" => Some(Namespace::Object),
+            "Array" => Some(Namespace::Array),
             "Date" => Some(Namespace::Date),
             "console" => Some(Namespace::Console),
             _ => None,
@@ -211,6 +226,7 @@ impl Builtins {
             "Boolean" => Some("Boolean"),
             "Number" => Some("Number"),
             "String" => Some("String"),
+            "Array" => Some("Array"),
             _ => None,
         }
     }
@@ -253,6 +269,7 @@ impl Builtins {
             }
             Namespace::Number => NUMBER_INLINE.contains(&name),
             Namespace::Object => OBJECT_INLINE.contains(&name),
+            Namespace::Array => ARRAY_INLINE.contains(&name),
             Namespace::Date => DATE_INLINE.contains(&name),
             Namespace::Console => CONSOLE_INLINE.contains(&name),
         }
@@ -263,7 +280,9 @@ impl Builtins {
         let table = match namespace {
             Namespace::Math => MATH_CONSTANTS,
             Namespace::Number => NUMBER_CONSTANTS,
-            Namespace::Object | Namespace::Date | Namespace::Console => return None,
+            Namespace::Object | Namespace::Array | Namespace::Date | Namespace::Console => {
+                return None;
+            }
         };
         table
             .iter()

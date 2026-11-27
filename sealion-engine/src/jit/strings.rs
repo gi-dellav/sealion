@@ -12,6 +12,7 @@ use sealion_string::{JsString, RawJsString};
 
 use crate::value::{
     PAYLOAD_MASK, TAG_BOOLEAN, TAG_FUNCTION, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_UNDEFINED,
+    TAG_UNINITIALIZED,
 };
 
 fn string_pointer(value: f64) -> Option<NonNull<RawJsString>> {
@@ -30,7 +31,7 @@ pub(super) fn with_string<R>(value: f64, f: impl FnOnce(&JsString) -> R) -> Opti
     Some(f(&string))
 }
 
-fn tagged_string(string: JsString) -> f64 {
+pub(super) fn tagged_string(string: JsString) -> f64 {
     let ptr = string.into_raw().as_ptr() as u64;
     f64::from_bits((TAG_STRING << 48) | ptr)
 }
@@ -59,6 +60,48 @@ pub(super) fn is_tagged(value: f64) -> bool {
     (TAG_UNDEFINED..=TAG_OBJECT).contains(&tag(value))
 }
 
+pub(super) fn is_nullish(value: f64) -> bool {
+    matches!(tag(value), TAG_UNDEFINED | TAG_NULL)
+}
+
+/// Host-side truthiness, mirroring `value::truthy`.
+pub(super) fn value_truthy(value: f64) -> bool {
+    match tag(value) {
+        TAG_UNDEFINED | TAG_NULL | TAG_UNINITIALIZED => false,
+        TAG_BOOLEAN => value.to_bits() & 1 != 0,
+        TAG_FUNCTION | TAG_OBJECT => true,
+        TAG_STRING => with_string(value, |string| !string.is_empty()).unwrap_or(false),
+        _ => !value.is_nan() && value != 0.0,
+    }
+}
+
+/// Host-side `===`, mirroring `value::strict_equal`.
+pub(super) fn values_strict_equal(lhs: f64, rhs: f64) -> bool {
+    if is_string(lhs) || is_string(rhs) {
+        is_string(lhs)
+            && is_string(rhs)
+            && with_string(lhs, |lhs| {
+                with_string(rhs, |rhs| lhs == rhs).unwrap_or(false)
+            })
+            .unwrap_or(false)
+    } else if is_tagged(lhs) || is_tagged(rhs) {
+        lhs.to_bits() == rhs.to_bits()
+    } else {
+        lhs == rhs
+    }
+}
+
+/// Host-side `SameValueZero`, the comparison used by `Array.prototype.includes`.
+pub(super) fn same_value_zero(lhs: f64, rhs: f64) -> bool {
+    if is_string(lhs) || is_string(rhs) {
+        values_strict_equal(lhs, rhs)
+    } else if is_tagged(lhs) || is_tagged(rhs) {
+        lhs.to_bits() == rhs.to_bits()
+    } else {
+        lhs == rhs || (lhs.is_nan() && rhs.is_nan())
+    }
+}
+
 fn number_string(value: f64) -> JsString {
     if value == 0.0 {
         return JsString::from("0");
@@ -72,7 +115,8 @@ pub(super) fn to_js_string(value: f64) -> JsString {
         TAG_UNDEFINED => JsString::from("undefined"),
         TAG_NULL => JsString::from("null"),
         TAG_FUNCTION => JsString::from("function"),
-        TAG_OBJECT => JsString::from("[object Object]"),
+        TAG_OBJECT => super::arrays::array_to_js_string(value)
+            .unwrap_or_else(|| JsString::from("[object Object]")),
         TAG_BOOLEAN => JsString::from(if value.to_bits() & 1 != 0 {
             "true"
         } else {
@@ -134,19 +178,7 @@ extern "C" fn sealion_string_add(lhs: f64, rhs: f64) -> f64 {
 }
 
 extern "C" fn sealion_string_strict_equal(lhs: f64, rhs: f64) -> f64 {
-    let equal = if is_string(lhs) || is_string(rhs) {
-        is_string(lhs)
-            && is_string(rhs)
-            && with_string(lhs, |lhs| {
-                with_string(rhs, |rhs| lhs == rhs).unwrap_or(false)
-            })
-            .unwrap_or(false)
-    } else if is_tagged(lhs) || is_tagged(rhs) {
-        lhs.to_bits() == rhs.to_bits()
-    } else {
-        lhs == rhs
-    };
-    tagged_bool(equal)
+    tagged_bool(values_strict_equal(lhs, rhs))
 }
 
 extern "C" fn sealion_string_loose_equal(lhs: f64, rhs: f64) -> f64 {
