@@ -46,6 +46,10 @@ pub(super) fn tagged_undefined() -> f64 {
     f64::from_bits(TAG_UNDEFINED << 48)
 }
 
+pub(super) fn tagged_null() -> f64 {
+    f64::from_bits(TAG_NULL << 48)
+}
+
 fn tag(value: f64) -> u64 {
     value.to_bits() >> 48
 }

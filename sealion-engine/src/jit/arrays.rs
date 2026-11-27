@@ -66,7 +66,7 @@ fn element(env: i64, index: usize) -> f64 {
 }
 
 /// A canonical array index key: `"0"` yes, `"01"` and `"-1"` no.
-fn index_of_key(key: &JsString) -> Option<usize> {
+pub(super) fn index_of_key(key: &JsString) -> Option<usize> {
     let text = key.to_std_string_lossy();
     let bytes = text.as_bytes();
     if bytes.is_empty() || bytes.len() > 10 || (bytes.len() > 1 && bytes[0] == b'0') {
@@ -77,25 +77,6 @@ fn index_of_key(key: &JsString) -> Option<usize> {
     }
     let index: usize = text.parse().ok()?;
     (index < u32::MAX as usize).then_some(index)
-}
-
-/// `array.length` and `array[index]`, or `None` when `value` is not an array or
-/// the key names neither.
-pub(super) fn element_property(value: f64, key: &JsString) -> Option<f64> {
-    with_object(value, |object| {
-        let elements = object.elements.as_ref()?;
-        if key == "length" {
-            return Some(elements.len() as f64);
-        }
-        let index = index_of_key(key)?;
-        Some(
-            elements
-                .get(index)
-                .copied()
-                .unwrap_or_else(tagged_undefined),
-        )
-    })
-    .flatten()
 }
 
 /// Writes `array.length` or `array[index]`; returns `false` for other keys.

@@ -1,26 +1,41 @@
 //! Host helpers for JavaScript object values.
 //!
 //! Compiled code stores an object as a NaN-boxed pointer to a [`JsObject`]: an
-//! insertion-ordered own-property table plus an optional dense element vector.
-//! A [`JsObject`] with elements is an array, answered by `jit::arrays`; the two
-//! share one allocation so the tag is enough to tell them apart. There are no
-//! prototypes, property descriptors or garbage collector, so objects leak for
-//! the lifetime of the process exactly like closure and environment records.
+//! insertion-ordered own-property table, an optional dense element vector and a
+//! `prototype` link to the object consulted when an own property is absent. A
+//! [`JsObject`] with elements is an array, answered by `jit::arrays`; one with
+//! entries is a `Map`. The kinds share one allocation so the tag is enough to
+//! tell them apart. There are no property descriptors or garbage collector, so
+//! objects leak for the lifetime of the process exactly like closure and
+//! environment records.
 //!
 //! Property keys are canonicalised through `ToPropertyKey`, so `o[1]` and
 //! `o["1"]` name the same property, and every accessor is total: a receiver
 //! that is not an object yields `undefined` on read, `false` for `has` and
-//! `delete`, and the written value on write. Nothing here throws.
+//! `delete`, and the written value on write. Nothing here throws, and a
+//! prototype cycle is refused instead of raising a `TypeError`.
+//!
+//! Reads walk the prototype chain (`chain_get`); writes, `delete` and
+//! `Object.hasOwn` stay on the receiver, as the specification requires. Arrays,
+//! maps and strings answer their methods from native tables rather than from
+//! real prototype objects, so `Array.prototype` is an ordinary object that users
+//! can still extend. See `docs/internals/OBJECTS.md`.
+
+use std::sync::OnceLock;
 
 use sealion_string::JsString;
 
 use super::arrays;
 use super::maps;
 use super::strings::{
-    is_object, method_property, tagged_bool, tagged_string, tagged_undefined, to_js_string,
-    with_string,
+    is_object, method_property, tagged_bool, tagged_null, tagged_string, tagged_undefined,
+    to_js_string, with_string,
 };
-use crate::value::{PAYLOAD_MASK, TAG_OBJECT, TAG_STRING};
+use crate::value::{PAYLOAD_MASK, TAG_FUNCTION, TAG_NULL, TAG_OBJECT, TAG_STRING};
+
+/// How far a property lookup may walk a prototype chain. Cycles are refused by
+/// `Object.setPrototypeOf`/`__proto__`, so this only bounds a corrupt chain.
+const MAX_PROTOTYPE_DEPTH: usize = 1000;
 
 pub(super) struct JsObject {
     properties: Vec<(JsString, f64)>,
@@ -28,14 +43,34 @@ pub(super) struct JsObject {
     /// `Some(..)` when this object is a `Map`: insertion-ordered key/value
     /// pairs compared with SameValueZero.
     pub(super) entries: Option<Vec<(f64, f64)>>,
+    /// The object consulted when an own property is absent, or `None` to end
+    /// the chain (`Object.create(null)`).
+    pub(super) prototype: Option<*mut JsObject>,
 }
 
-pub(super) fn new_object() -> *mut JsObject {
+fn alloc_object(prototype: Option<*mut JsObject>) -> *mut JsObject {
     Box::into_raw(Box::new(JsObject {
         properties: Vec::new(),
         elements: None,
         entries: None,
+        prototype,
     }))
+}
+
+/// The shared root prototype (`Object.prototype`), created on first use.
+fn object_prototype() -> *mut JsObject {
+    static PROTOTYPE: OnceLock<usize> = OnceLock::new();
+    *PROTOTYPE.get_or_init(|| alloc_object(None) as usize) as *mut JsObject
+}
+
+/// The shared `Array.prototype`, whose own prototype is `Object.prototype`.
+fn array_prototype() -> *mut JsObject {
+    static PROTOTYPE: OnceLock<usize> = OnceLock::new();
+    *PROTOTYPE.get_or_init(|| alloc_object(Some(object_prototype())) as usize) as *mut JsObject
+}
+
+pub(super) fn new_object() -> *mut JsObject {
+    alloc_object(Some(object_prototype()))
 }
 
 pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
@@ -43,6 +78,7 @@ pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
         properties: Vec::new(),
         elements: Some(elements),
         entries: None,
+        prototype: Some(array_prototype()),
     }))
 }
 
@@ -51,6 +87,7 @@ pub(super) fn new_map() -> *mut JsObject {
         properties: Vec::new(),
         elements: None,
         entries: Some(Vec::new()),
+        prototype: Some(object_prototype()),
     }))
 }
 
@@ -83,15 +120,108 @@ fn property_key(key: f64) -> JsString {
     }
 }
 
-fn own_property(object: f64, key: &JsString) -> Option<f64> {
-    with_object(object, |object| {
-        object
-            .properties
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| *value)
+/// The value of an own data property: dense array elements, the `length` of an
+/// array, the `size` of a map, then the ordinary name/value table. An index at
+/// or past an array's length is absent, so the chain keeps looking.
+fn own_property(object: &JsObject, key: &JsString) -> Option<f64> {
+    if let Some(elements) = &object.elements {
+        if key == "length" {
+            return Some(elements.len() as f64);
+        }
+        if let Some(index) = arrays::index_of_key(key) {
+            return elements.get(index).copied();
+        }
+    }
+    if let Some(entries) = &object.entries
+        && key == "size"
+    {
+        return Some(entries.len() as f64);
+    }
+    object
+        .properties
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| *value)
+}
+
+fn object_at(pointer: *mut JsObject) -> &'static mut JsObject {
+    unsafe { &mut *pointer }
+}
+
+/// `[[Get]]`: walks the prototype chain looking for an own data property.
+fn chain_get(object: f64, key: &JsString) -> Option<f64> {
+    let mut current = object_pointer(object);
+    let mut depth = 0;
+    while let Some(pointer) = current {
+        if depth > MAX_PROTOTYPE_DEPTH {
+            break;
+        }
+        let object = unsafe { &*pointer };
+        if let Some(value) = own_property(object, key) {
+            return Some(value);
+        }
+        current = object.prototype;
+        depth += 1;
+    }
+    None
+}
+
+/// The object's prototype as a value: the prototype object, or `null`.
+fn prototype_value(object: f64) -> Option<f64> {
+    let pointer = object_pointer(object)?;
+    Some(match unsafe { (*pointer).prototype } {
+        Some(prototype) => tagged_object(prototype),
+        None => tagged_null(),
     })
-    .flatten()
+}
+
+/// `true` when following `start`'s chain reaches `target`, used to refuse a
+/// prototype cycle (a `TypeError` in the specification, a no-op here).
+fn reaches(start: *mut JsObject, target: *mut JsObject) -> bool {
+    let mut current = Some(start);
+    let mut depth = 0;
+    while let Some(pointer) = current {
+        if pointer == target {
+            return true;
+        }
+        if depth > MAX_PROTOTYPE_DEPTH {
+            return true;
+        }
+        current = unsafe { (*pointer).prototype };
+        depth += 1;
+    }
+    false
+}
+
+/// `SetPrototypeOf`: an object or `null` replaces the prototype, anything else
+/// is ignored, and a cycle is refused.
+fn set_prototype(object: f64, value: f64) {
+    let Some(pointer) = object_pointer(object) else {
+        return;
+    };
+    if value.to_bits() >> 48 == TAG_NULL {
+        unsafe { (*pointer).prototype = None };
+        return;
+    }
+    if !is_object(value) {
+        return;
+    }
+    let prototype = (value.to_bits() & PAYLOAD_MASK) as *mut JsObject;
+    if prototype == pointer || reaches(prototype, pointer) {
+        return;
+    }
+    unsafe { (*pointer).prototype = Some(prototype) };
+}
+
+/// The own enumerable string keys of `object`: array indices in order, then the
+/// named properties in insertion order.
+fn own_keys(object: &JsObject) -> Vec<JsString> {
+    let mut keys = Vec::new();
+    if let Some(elements) = &object.elements {
+        keys.extend((0..elements.len()).map(|index| JsString::from(index.to_string())));
+    }
+    keys.extend(object.properties.iter().map(|(key, _)| key.clone()));
+    keys
 }
 
 extern "C" fn sealion_object_new() -> u64 {
@@ -106,17 +236,18 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     {
         return length;
     }
-    if let Some(value) = arrays::element_property(object, &key) {
+    if let Some(value) = chain_get(object, &key) {
         return value;
     }
-    if let Some(value) = own_property(object, &key) {
-        return value;
-    }
-    if let Some(value) = maps::property(object, &key) {
+    // `__proto__` behaves like the accessor on `Object.prototype`.
+    if key == "__proto__"
+        && let Some(value) = prototype_value(object)
+    {
         return value;
     }
     maps::method_property(object, &key)
         .or_else(|| arrays::method_property(object, &key))
+        .or_else(|| object_method_property(object, &key))
         .or_else(|| method_property(object, &key))
         .unwrap_or_else(tagged_undefined)
 }
@@ -129,6 +260,10 @@ pub(super) fn get_property(value: f64, key: &str) -> f64 {
 
 extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
     let key = property_key(key);
+    if key == "__proto__" {
+        set_prototype(object, value);
+        return value;
+    }
     if arrays::set_element(object, &key, value) {
         return value;
     }
@@ -143,11 +278,11 @@ extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
 
 extern "C" fn sealion_object_has(object: f64, key: f64) -> f64 {
     let key = property_key(key);
-    let has = arrays::has_element(object, &key)
-        || with_object(object, |object| {
-            object.properties.iter().any(|(name, _)| *name == key)
-        })
-        .unwrap_or(false);
+    let has = chain_get(object, &key).is_some()
+        || arrays::has_element(object, &key)
+        || maps::method_property(object, &key).is_some()
+        || object_method_property(object, &key).is_some()
+        || (key == "__proto__" && is_object(object));
     tagged_bool(has)
 }
 
@@ -160,6 +295,175 @@ extern "C" fn sealion_object_delete(object: f64, key: f64) -> f64 {
     tagged_bool(true)
 }
 
+type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
+
+/// The name of one of `Object.prototype`'s methods, if any.
+fn object_method(key: &JsString) -> Option<Method> {
+    Some(match key.to_std_string_lossy().as_str() {
+        "hasOwnProperty" => has_own_property,
+        "isPrototypeOf" => is_prototype_of,
+        "propertyIsEnumerable" => property_is_enumerable,
+        "toString" => to_string,
+        "valueOf" => value_of,
+        _ => return None,
+    })
+}
+
+/// `true` when the chain from `object` includes `Object.prototype`, i.e. the
+/// object inherits the methods of `Object.prototype`.
+fn inherits_object_prototype(object: f64) -> bool {
+    let target = object_prototype();
+    let mut current = object_pointer(object);
+    let mut depth = 0;
+    while let Some(pointer) = current {
+        if pointer == target {
+            return true;
+        }
+        if depth > MAX_PROTOTYPE_DEPTH {
+            return false;
+        }
+        current = unsafe { (*pointer).prototype };
+        depth += 1;
+    }
+    false
+}
+
+/// The native closure for `object.method`, bound to the receiver that named it.
+fn object_method_property(value: f64, key: &JsString) -> Option<f64> {
+    if !is_object(value) || !inherits_object_prototype(value) {
+        return None;
+    }
+    let method = object_method(key)?;
+    let record = Box::into_raw(Box::new([
+        method as usize as u64,
+        value.to_bits() & PAYLOAD_MASK,
+    ]));
+    Some(f64::from_bits(
+        (TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK),
+    ))
+}
+
+fn receiver(env: i64) -> f64 {
+    tagged_object(env as usize as *mut JsObject)
+}
+
+extern "C" fn has_own_property(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let key = property_key(arrays::arg(args, 0));
+    let own = own_property(object_at(env as usize as *mut JsObject), &key).is_some();
+    tagged_bool(own)
+}
+
+extern "C" fn is_prototype_of(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let target = arrays::arg(args, 0);
+    let Some(mut current) = object_pointer(target) else {
+        return tagged_bool(false);
+    };
+    let mut depth = 0;
+    while let Some(prototype) = unsafe { (*current).prototype } {
+        if prototype as usize == env as usize {
+            return tagged_bool(true);
+        }
+        if depth > MAX_PROTOTYPE_DEPTH {
+            break;
+        }
+        current = prototype;
+        depth += 1;
+    }
+    tagged_bool(false)
+}
+
+extern "C" fn property_is_enumerable(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let key = property_key(arrays::arg(args, 0));
+    let own = own_property(object_at(env as usize as *mut JsObject), &key).is_some();
+    tagged_bool(own)
+}
+
+extern "C" fn to_string(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    tagged_string(to_js_string(receiver(env)))
+}
+
+extern "C" fn value_of(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    receiver(env)
+}
+
+extern "C" fn sealion_object_create(proto: f64) -> f64 {
+    let prototype = if proto.to_bits() >> 48 == TAG_NULL {
+        None
+    } else if is_object(proto) {
+        Some((proto.to_bits() & PAYLOAD_MASK) as *mut JsObject)
+    } else {
+        return tagged_undefined();
+    };
+    tagged_object(alloc_object(prototype))
+}
+
+extern "C" fn sealion_object_get_prototype(object: f64) -> f64 {
+    prototype_value(object).unwrap_or_else(tagged_undefined)
+}
+
+extern "C" fn sealion_object_set_prototype(object: f64, proto: f64) -> f64 {
+    set_prototype(object, proto);
+    object
+}
+
+extern "C" fn sealion_object_has_own(object: f64, key: f64) -> f64 {
+    let key = property_key(key);
+    let own = object_pointer(object)
+        .map(|pointer| own_property(object_at(pointer), &key).is_some())
+        .unwrap_or(false);
+    tagged_bool(own)
+}
+
+extern "C" fn sealion_object_prototype() -> u64 {
+    object_prototype() as u64
+}
+
+extern "C" fn sealion_array_prototype() -> u64 {
+    array_prototype() as u64
+}
+
+/// `Object.keys`: the own enumerable string keys as an array.
+extern "C" fn sealion_object_keys(object: f64) -> f64 {
+    let keys = object_pointer(object)
+        .map(|pointer| own_keys(object_at(pointer)))
+        .unwrap_or_default();
+    tagged_object(new_array(keys.into_iter().map(tagged_string).collect()))
+}
+
+/// `Object.values`: the values of those keys.
+extern "C" fn sealion_object_values(object: f64) -> f64 {
+    let values = object_pointer(object)
+        .map(|pointer| {
+            let object = object_at(pointer);
+            own_keys(object)
+                .iter()
+                .filter_map(|key| own_property(object, key))
+                .collect()
+        })
+        .unwrap_or_default();
+    tagged_object(new_array(values))
+}
+
+/// `Object.entries`: `[key, value]` pairs.
+extern "C" fn sealion_object_entries(object: f64) -> f64 {
+    let entries = object_pointer(object)
+        .map(|pointer| {
+            let object = object_at(pointer);
+            own_keys(object)
+                .iter()
+                .filter_map(|key| {
+                    let value = own_property(object, key)?;
+                    Some(tagged_object(new_array(vec![
+                        tagged_string(key.clone()),
+                        value,
+                    ])))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    tagged_object(new_array(entries))
+}
+
 pub(super) fn lookup(name: &str) -> Option<usize> {
     Some(match name {
         "sealion_object_new" => sealion_object_new as *const () as usize,
@@ -167,6 +471,15 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         "sealion_object_set" => sealion_object_set as *const () as usize,
         "sealion_object_has" => sealion_object_has as *const () as usize,
         "sealion_object_delete" => sealion_object_delete as *const () as usize,
+        "sealion_object_create" => sealion_object_create as *const () as usize,
+        "sealion_object_get_prototype" => sealion_object_get_prototype as *const () as usize,
+        "sealion_object_set_prototype" => sealion_object_set_prototype as *const () as usize,
+        "sealion_object_has_own" => sealion_object_has_own as *const () as usize,
+        "sealion_object_prototype" => sealion_object_prototype as *const () as usize,
+        "sealion_array_prototype" => sealion_array_prototype as *const () as usize,
+        "sealion_object_keys" => sealion_object_keys as *const () as usize,
+        "sealion_object_values" => sealion_object_values as *const () as usize,
+        "sealion_object_entries" => sealion_object_entries as *const () as usize,
         _ => return None,
     })
 }

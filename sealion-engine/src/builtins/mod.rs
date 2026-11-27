@@ -56,11 +56,21 @@ const MATH_INLINE: &[&str] = &[
 /// `Number` functions implemented inline.
 const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeInteger"];
 
-/// `Object` functions implemented inline.
-const OBJECT_INLINE: &[&str] = &["is"];
+/// `Object` functions implemented by the dynamic runtime.
+const OBJECT_INLINE: &[&str] = &[
+    "is",
+    "create",
+    "getPrototypeOf",
+    "setPrototypeOf",
+    "hasOwn",
+    "keys",
+    "values",
+    "entries",
+    "prototype",
+];
 
 /// `Array` static functions implemented by the dynamic runtime.
-const ARRAY_INLINE: &[&str] = &["isArray", "of", "from"];
+const ARRAY_INLINE: &[&str] = &["isArray", "of", "from", "prototype"];
 
 /// `Date` functions implemented inline.
 const DATE_INLINE: &[&str] = &["now"];
@@ -197,6 +207,25 @@ impl Builtins {
             let new_map_id =
                 module.declare_function("sealion_map_new", Linkage::Import, &pointer_sig)?;
             funcs.insert("sealion_map_new", new_map_id);
+
+            for name in [
+                "sealion_object_create",
+                "sealion_object_get_prototype",
+                "sealion_object_keys",
+                "sealion_object_values",
+                "sealion_object_entries",
+            ] {
+                let id = module.declare_function(name, Linkage::Import, &unary_sig)?;
+                funcs.insert(name, id);
+            }
+            for name in ["sealion_object_set_prototype", "sealion_object_has_own"] {
+                let id = module.declare_function(name, Linkage::Import, &binary_sig)?;
+                funcs.insert(name, id);
+            }
+            for name in ["sealion_object_prototype", "sealion_array_prototype"] {
+                let id = module.declare_function(name, Linkage::Import, &pointer_sig)?;
+                funcs.insert(name, id);
+            }
         }
 
         let names = MATH_CONSTANTS

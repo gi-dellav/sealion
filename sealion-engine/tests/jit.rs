@@ -301,13 +301,135 @@ fn unsupported_object_shapes_are_rejected() {
     for source in [
         "var o = {...{a: 1}}; 0;",
         "var o = {get a() { return 1; }}; 0;",
-        "var o = {__proto__: null}; 0;",
     ] {
         assert!(
             Engine::new().compile_jit(source).is_err(),
             "expected a rejection for {source}"
         );
     }
+}
+
+#[test]
+fn object_prototype_chain() {
+    assert_eq!(
+        run("Object.getPrototypeOf({}) === Object.prototype ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("Object.getPrototypeOf([]) === Array.prototype ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("Object.getPrototypeOf(Array.prototype) === Object.prototype ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("Object.getPrototypeOf(Object.prototype) === null ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = Object.create(null); Object.getPrototypeOf(o) === null ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var p = {a: 1}; var o = Object.create(p); o.a;"), 1);
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); o.a = 2; p.a === 1 && o.a === 2 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); o.b = 2; p.b === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run(
+            "var p = {a: 1}; var o = Object.create(p); Array.prototype === Object.getPrototypeOf(o) ? 0 : 1;"
+        ),
+        1
+    );
+}
+
+#[test]
+fn object_prototype_membership_and_enumerability() {
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); Object.hasOwn(o, 'a') ? 0 : 1;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); Object.hasOwn(p, 'a') ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); 'a' in o ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); delete o.a; 'a' in o ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); o.hasOwnProperty('a') ? 0 : 1;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {}; var o = Object.create(p); p.isPrototypeOf(o) ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = {a: 1}; Object.keys(o).length === 1 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var p = {a: 1}; var o = Object.create(p); Object.keys(o).length === 0 ? 1 : 0;"),
+        1
+    );
+}
+
+#[test]
+fn object_proto_accessor_and_literals() {
+    assert_eq!(run("var p = {a: 1}; var o = {__proto__: p}; o.a;"), 1);
+    assert_eq!(
+        run("var p = {a: 1}; var o = {__proto__: p}; Object.getPrototypeOf(o) === p ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var p = {a: 1}; var o = {}; o.__proto__ = p; o.a;"), 1);
+    assert_eq!(
+        run("var o = {}; o.__proto__ = null; Object.getPrototypeOf(o) === null ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = {}; o.__proto__ === Object.prototype ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = Object.create(null); o.toString === undefined ? 1 : 0;"),
+        1
+    );
+}
+
+#[test]
+fn object_prototypes_are_mutable() {
+    assert_eq!(
+        run(
+            "Array.prototype.double = function () { return this.length * 2; }; var a = [1, 2]; a.double();"
+        ),
+        4
+    );
+    assert_eq!(run("Object.prototype.tag = 7; var o = {}; o.tag;"), 7);
+    assert_eq!(run("Object.setPrototypeOf({}, null) === null ? 0 : 1;"), 1);
+}
+
+#[test]
+fn object_prototype_cycles_are_refused() {
+    assert_eq!(
+        run(
+            "var a = {}; var b = {}; Object.setPrototypeOf(a, b); Object.setPrototypeOf(b, a); Object.getPrototypeOf(b) === a ? 0 : 1;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var a = {}; Object.setPrototypeOf(a, a); Object.getPrototypeOf(a) === null ? 0 : 1;"),
+        1
+    );
 }
 
 #[test]

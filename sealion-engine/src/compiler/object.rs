@@ -113,9 +113,6 @@ pub(super) fn compile_object_literal<'a>(
                 "getters and setters are not supported".to_string(),
             ));
         }
-        if property.key.is_specific_static_name("__proto__") {
-            return Err(Error::Unsupported("__proto__ is not supported".to_string()));
-        }
         let key = literal_key(builder, ctx, flow, &property.key)?;
         let value = compile_expr(builder, ctx, flow, &property.value)?;
         set(builder, ctx, result, key, value)?;

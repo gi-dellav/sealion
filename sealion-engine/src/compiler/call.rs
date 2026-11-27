@@ -119,8 +119,27 @@ pub(super) fn compile_property_access<'a>(
     }
     if let Expression::Identifier(id) = &access.object
         && is_free_global(ctx, id.name.as_str())
-        && ctx.builtins.namespace(id.name.as_str()).is_some()
+        && let Some(namespace) = ctx.builtins.namespace(id.name.as_str())
     {
+        // `Object.prototype` and `Array.prototype` are the only namespace
+        // members that are values rather than constants or functions.
+        if access.property.name.as_str() == "prototype"
+            && matches!(
+                namespace,
+                builtins::Namespace::Object | builtins::Namespace::Array
+            )
+        {
+            return builtins::call(
+                builder,
+                ctx.builtin_refs,
+                ctx.fmod_ref,
+                Some(namespace),
+                "prototype",
+                &[],
+                &[],
+                ctx.strings.as_ref(),
+            );
+        }
         return Err(Error::Unsupported(format!(
             "unsupported builtin member: {}.{}",
             id.name.as_str(),

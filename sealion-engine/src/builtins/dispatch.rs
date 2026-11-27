@@ -200,6 +200,60 @@ pub fn call(
             let rhs = argument(builder, args, 1);
             value::same_value(builder, lhs, rhs, strings)
         }
+        "create" => {
+            let func_ref = *funcs.get("sealion_object_create").ok_or_else(|| {
+                Error::Unsupported("Object.create requires the dynamic runtime".to_string())
+            })?;
+            let proto = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[proto])
+        }
+        "getPrototypeOf" => {
+            let func_ref = *funcs.get("sealion_object_get_prototype").ok_or_else(|| {
+                Error::Unsupported("Object.getPrototypeOf requires the dynamic runtime".to_string())
+            })?;
+            let object = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[object])
+        }
+        "setPrototypeOf" => {
+            let func_ref = *funcs.get("sealion_object_set_prototype").ok_or_else(|| {
+                Error::Unsupported("Object.setPrototypeOf requires the dynamic runtime".to_string())
+            })?;
+            let object = argument(builder, args, 0);
+            let proto = argument(builder, args, 1);
+            call_libm(builder, func_ref, &[object, proto])
+        }
+        "hasOwn" => {
+            let func_ref = *funcs.get("sealion_object_has_own").ok_or_else(|| {
+                Error::Unsupported("Object.hasOwn requires the dynamic runtime".to_string())
+            })?;
+            let object = argument(builder, args, 0);
+            let key = argument(builder, args, 1);
+            call_libm(builder, func_ref, &[object, key])
+        }
+        "keys" | "values" | "entries" => {
+            let symbol = match name {
+                "keys" => "sealion_object_keys",
+                "values" => "sealion_object_values",
+                _ => "sealion_object_entries",
+            };
+            let func_ref = *funcs.get(symbol).ok_or_else(|| {
+                Error::Unsupported("object enumeration requires the dynamic runtime".to_string())
+            })?;
+            let object = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[object])
+        }
+        "prototype" => {
+            let symbol = match namespace {
+                Some(Namespace::Array) => "sealion_array_prototype",
+                _ => "sealion_object_prototype",
+            };
+            let func_ref = *funcs.get(symbol).ok_or_else(|| {
+                Error::Unsupported("Object.prototype requires the dynamic runtime".to_string())
+            })?;
+            let call = builder.ins().call(func_ref, &[]);
+            let pointer = builder.inst_results(call)[0];
+            value::object(builder, pointer)
+        }
         "isArray" => {
             let func_ref = *funcs.get("sealion_array_is_array").ok_or_else(|| {
                 Error::Unsupported("Array.isArray requires the dynamic runtime".to_string())

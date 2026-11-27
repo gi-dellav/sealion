@@ -40,16 +40,6 @@ fn entry_index(entries: &[(f64, f64)], key: f64) -> Option<usize> {
         .position(|(name, _)| same_value_zero(*name, key))
 }
 
-/// `map.size`, or `None` when `value` is not a map or the key names something
-/// else.
-pub(super) fn property(value: f64, key: &JsString) -> Option<f64> {
-    with_object(value, |object| {
-        let entries = object.entries.as_ref()?;
-        (key == "size").then_some(entries.len() as f64)
-    })
-    .flatten()
-}
-
 /// The native closure for `map.method`, or `None` when the key names no method.
 pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
     if !is_map(value) {

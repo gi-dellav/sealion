@@ -40,8 +40,10 @@
 //! property assignment, `delete`, `in`, `Object.is`, `Array.isArray`, `Array(n)`
 //! and the common `Array.prototype` methods (`push`, `pop`, `shift`, `unshift`,
 //! `join`, `slice`, `concat`, `indexOf`, `includes`, `reverse`, `forEach`, `map`,
-//! `filter`, `some`, `every`, `find`, `findIndex` and `reduce`). Objects have no
-//! prototypes, `this`, accessors or spread, and nothing is garbage collected.
+//! `filter`, `some`, `every`, `find`, `findIndex` and `reduce`). Plain objects
+//! have a prototype chain (`Object.prototype`, `Object.create`, `__proto__`,
+//! `Object.getPrototypeOf`/`setPrototypeOf`, `Object.hasOwn`), but there are no
+//! property descriptors, accessors, spread or garbage collection.
 //!
 //! - arithmetic `+ - * / % **`, update `++ --`, and the comma operator,
 //! - bitwise `& | ^ ~ << >> >>>`,
@@ -128,8 +130,7 @@
 //! outer loops or labelled blocks.
 //!
 //! `undefined` is a non-writable global and `debugger` is accepted as a no-op.
-//! `for..of`, `for..in` and prototype-based inheritance are intentionally
-//! deferred to later roadmap versions.
+//! `for..of` and `for..in` are intentionally deferred to later roadmap versions.
 
 mod builtins;
 mod compiler;

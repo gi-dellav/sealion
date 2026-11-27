@@ -57,7 +57,8 @@
 
 - [x] Optional in-process JIT on Linux x86-64 (`jit` Cargo feature)
 - [x] Precompiled artifacts: `Engine::precompile_module`, `IrModule::serialize`, `Engine::deserialize*`, and the `--artifact` / `--run-artifact` CLI flags
-- [x] `Object`: own-property bags in the dynamic (JIT) runtime only — object literals, static and computed reads/writes, compound assignment, `++`/`--`, `delete`, `in`, optional chaining and `Object.is`; no prototypes, `this`, accessors or spread
+- [x] `Object`: own-property bags in the dynamic (JIT) runtime only — object literals, static and computed reads/writes, compound assignment, `++`/`--`, `delete`, `in`, optional chaining and `Object.is`
+- [x] Object prototypes in the dynamic (JIT) runtime: `Object.prototype` and `Array.prototype`, `Object.create`, `Object.getPrototypeOf`, `Object.setPrototypeOf`, `Object.hasOwn`, `__proto__`, `Object.keys`/`values`/`entries` and `Object.prototype.hasOwnProperty`/`isPrototypeOf`/`propertyIsEnumerable`/`toString`/`valueOf`; no property descriptors, accessors or spread
 - [x] `Array.prototype` — `at`, `concat`, `copyWithin`, `entries`, `every`, `fill`, `filter`, `find`, `findIndex`, `findLast`, `findLastIndex`, `flat`, `flatMap`, `forEach`, `includes`, `indexOf`, `join`, `keys`, `lastIndexOf`, `map`, `pop`, `push`, `reduce`, `reduceRight`, `reverse`, `shift`, `slice`, `some`, `sort`, `splice`, `toLocaleString`, `toReversed`, `toSorted`, `toSpliced`, `toString`, `unshift`, `values`, `valueOf` and `with`, plus `Array.isArray`, `Array.of` and `Array.from` (dynamic runtime only; `keys`/`values`/`entries` return arrays because there is no iterator protocol)
 - [x] `Map` — `new Map()` with `size`, `get`, `set`, `has`, `delete`, `clear`, `forEach`, `keys`, `values` and `entries` (dynamic runtime only; `keys`/`values`/`entries` return arrays, no iterable argument)
 - [x] `typeof` operand
@@ -68,7 +69,6 @@
 ### Later
 
 - [ ] `String.fromCharCode` and `String.fromCodePoint`
-- [ ] `__proto__` and prototypes
 
 - [ ] `Math` module
 - [ ] `Date` module
