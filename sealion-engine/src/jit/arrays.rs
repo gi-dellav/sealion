@@ -6,7 +6,7 @@
 //! `jit::objects`. Everything leaks for the lifetime of the process, like every
 //! other heap value in the runtime.
 //!
-//! Methods are exposed as native closures: a two-word record whose first word
+//! Methods are exposed as native closures: a function record whose first word
 //! is the address of one of the entry points below and whose second word is the
 //! array pointer. They therefore use the ordinary JavaScript calling convention
 //! (`env`, argument block, callee, this) and work through the same indirect call path
@@ -150,12 +150,9 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
         return None;
     }
     let method = method(key)?;
-    let record = Box::into_raw(Box::new([
-        method as usize as u64,
+    Some(super::objects::native_function(
+        method,
         value.to_bits() & PAYLOAD_MASK,
-    ]));
-    Some(f64::from_bits(
-        (TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK),
     ))
 }
 

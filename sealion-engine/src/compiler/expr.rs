@@ -1,4 +1,6 @@
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::FloatCC, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    BlockArg, InstBuilder, Value, condcodes::FloatCC, condcodes::IntCC, types,
+};
 use cranelift_frontend::FunctionBuilder;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
@@ -8,10 +10,11 @@ use oxc_ast::ast::{
 
 use super::array::compile_array_literal;
 use super::call::{
-    BuiltinCallee, compile_builtin_call, compile_call, compile_closure, compile_computed_access,
-    compile_namespace_value, compile_property_access, is_free_global,
+    BuiltinCallee, compile_builtin_call, compile_call, compile_call_value, compile_closure,
+    compile_computed_access, compile_namespace_value, compile_property_access, is_free_global,
 };
 use super::chain::compile_chain;
+use super::class::compile_class;
 use super::numeric::{binding_is_number, expr_is_number, number_value};
 use super::object::{self, compile_object_literal};
 use super::stmt::compile_condition;
@@ -198,6 +201,13 @@ pub(super) fn compile_expr<'a>(
         Expression::ObjectExpression(object) => compile_object_literal(builder, ctx, flow, object),
         Expression::ArrayExpression(array) => compile_array_literal(builder, ctx, flow, array),
         Expression::NewExpression(new) => compile_new(builder, ctx, flow, new),
+        Expression::ClassExpression(class) => compile_class(builder, ctx, flow, node_key(&**class)),
+        Expression::Super(_) => Err(Error::Unsupported(
+            "`super` is only valid as a call or a member access".to_string(),
+        )),
+        Expression::NewTarget(_) | Expression::ImportMeta(_) => Err(Error::Unsupported(
+            "`new.target` and `import.meta` are not supported".to_string(),
+        )),
         other => Err(Error::Unsupported(format!(
             "expression not supported: {other:?}"
         ))),
@@ -240,9 +250,37 @@ fn compile_new<'a>(
             _ => {}
         }
     }
-    Err(Error::Unsupported(
-        "only `new Array`, `new Map` and `new Date` are supported".to_string(),
-    ))
+    // Everything else is a user-defined constructor: allocate the receiver from
+    // `callee.prototype`, call the function with it as `this`, and keep the
+    // result only when the constructor returned an object of its own.
+    let ops = ctx.objects.ok_or_else(|| {
+        Error::Unsupported(
+            "`new` with a user-defined constructor requires the dynamic runtime".to_string(),
+        )
+    })?;
+    let callee = compile_expr(builder, ctx, flow, &new.callee)?;
+    let prototype_key = object::static_key(builder, ctx, "prototype")?;
+    let prototype = object::get(builder, ctx, callee, prototype_key)?;
+    let call = builder.ins().call(ops.new_instance, &[prototype]);
+    let pointer = builder.inst_results(call)[0];
+    let instance = value::object(builder, pointer);
+
+    let construct = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::F64);
+    let callable = value::is_function(builder, callee);
+    builder
+        .ins()
+        .brif(callable, construct, &[], done, &[BlockArg::Value(instance)]);
+
+    builder.switch_to_block(construct);
+    let result = compile_call_value(builder, ctx, flow, callee, instance, &new.arguments)?;
+    let returned_object = value::is_object_like(builder, result);
+    let chosen = builder.ins().select(returned_object, result, instance);
+    builder.ins().jump(done, &[BlockArg::Value(chosen)]);
+
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
 }
 
 pub(super) fn compile_binary<'a>(
@@ -256,6 +294,13 @@ pub(super) fn compile_binary<'a>(
     let op = binary.operator;
     if op == BinaryOperator::In {
         return object::has(builder, ctx, rhs, lhs);
+    }
+    if op == BinaryOperator::Instanceof {
+        let ops = ctx.objects.ok_or_else(|| {
+            Error::Unsupported("`instanceof` requires the dynamic runtime".to_string())
+        })?;
+        let call = builder.ins().call(ops.instance_of, &[lhs, rhs]);
+        return Ok(builder.inst_results(call)[0]);
     }
     if op.is_arithmetic() {
         compile_arithmetic(
@@ -666,9 +711,25 @@ pub(super) fn compile_assign<'a>(
     assign: &'a AssignmentExpression<'a>,
 ) -> Result<Value, Error> {
     let (object, key) = match &assign.left {
+        // `super.x = v` writes `x` on the receiver, as the specification's
+        // `Set` with the receiver as `this` does.
+        AssignmentTarget::StaticMemberExpression(access)
+            if super::class::is_super(&access.object) =>
+        {
+            let object = super::support::load_var(builder, ctx, "this")?;
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            (object, key)
+        }
         AssignmentTarget::StaticMemberExpression(access) => {
             let object = compile_expr(builder, ctx, flow, &access.object)?;
             let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            (object, key)
+        }
+        AssignmentTarget::ComputedMemberExpression(member)
+            if super::class::is_super(&member.object) =>
+        {
+            let object = super::support::load_var(builder, ctx, "this")?;
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
             (object, key)
         }
         AssignmentTarget::ComputedMemberExpression(member) => {

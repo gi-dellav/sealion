@@ -758,10 +758,11 @@ initialised before default parameter expressions, so defaults may reference it.
 
 ### Missing features
 
-The current closure model has no `arguments`, `new`, classes, generators,
-`async` functions, `eval`, `Function` constructor, `bind`, `call` or `apply`.
-A function is only callable through the uniform call path. `this` is bound for
-ordinary functions and the script; arrows capture it lexically.
+The closure model has no `arguments`, `generators`, `async` functions, `eval` or
+`Function` constructor. A function is only callable through the uniform call
+path. `this` is bound for ordinary functions and the script, arrows capture it
+lexically, and `class` bodies/`new`/`call`/`apply`/`bind` are layered on top of
+the same record by the dynamic runtime (`docs/internals/OBJECTS.md`, section 7).
 
 ## 7. Memory and lifetime
 
@@ -770,7 +771,7 @@ is no garbage collector, reference counting, destructor or arena.
 
 | Allocation | Size | Allocated when |
 | --- | --- | --- |
-| Closure record | 16 bytes | Each evaluation of a function/arrow expression; each hoisted declaration at enclosing entry. |
+| Closure record | 32 bytes | Each evaluation of a function/arrow expression; each hoisted declaration at enclosing entry. |
 | Environment record | `8 + 8 * slots` bytes | Entry to a captured scope: once per call for a captured function root, once per execution for a captured block, once per iteration for captured loop bodies and `for` copies. |
 | Argument block | 264 bytes | Every dynamically dispatched JavaScript call. |
 

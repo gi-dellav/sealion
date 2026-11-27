@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    AssignmentTarget, BindingPattern, CatchClause, ChainElement, Expression, ForStatement,
-    ForStatementInit, FormalParameters, Function, ObjectPropertyKind, PropertyKey,
-    SimpleAssignmentTarget, Statement, UnaryOperator, VariableDeclaration, VariableDeclarationKind,
+    AssignmentTarget, BindingPattern, CatchClause, ChainElement, Class, ClassElement, Expression,
+    ForStatement, ForStatementInit, ForStatementLeft, FormalParameters, Function,
+    MethodDefinitionKind, ObjectPropertyKind, PropertyKey, SimpleAssignmentTarget, Statement,
+    UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
 use crate::Error;
 
-use super::{FunctionBodyPlan, FunctionPlan, ParamPlan, Program, ScopeId, ScopePlan, node_key};
+use super::{
+    ClassMethodPlan, ClassPlan, FunctionBodyPlan, FunctionPlan, ParamPlan, Program, ScopeId,
+    ScopePlan, SuperHome, node_key,
+};
 
 pub fn build_program_plan<'a>(
     program: &'a oxc_ast::ast::Program<'a>,
@@ -16,6 +20,7 @@ pub fn build_program_plan<'a>(
     let mut planner = Planner {
         functions: Vec::new(),
         scopes: Vec::new(),
+        classes: HashMap::new(),
         strings: Vec::new(),
         seen_strings: HashSet::new(),
     };
@@ -35,6 +40,7 @@ pub fn build_program_plan<'a>(
         strings: planner.strings,
         direct_calls: Default::default(),
         no_tdz: HashSet::new(),
+        classes: planner.classes,
     };
     let (direct_calls, no_tdz) = super::calls::analyze(&program);
     program.direct_calls = direct_calls;
@@ -45,6 +51,7 @@ pub fn build_program_plan<'a>(
 struct Planner<'a> {
     functions: Vec<FunctionPlan<'a>>,
     scopes: Vec<ScopePlan<'a>>,
+    classes: HashMap<usize, ClassPlan<'a>>,
     strings: Vec<String>,
     seen_strings: HashSet<String>,
 }
@@ -65,6 +72,7 @@ impl<'a> Planner<'a> {
             consts: HashSet::new(),
             tdz: HashSet::new(),
             captured: false,
+            extra: 0,
         });
         id
     }
@@ -143,11 +151,16 @@ impl<'a> Planner<'a> {
             params: Vec::new(),
             body,
             children: Vec::new(),
+            members: Vec::new(),
             nested: HashMap::new(),
             blocks: HashMap::new(),
             is_script,
             binding_name: None,
             self_binding,
+            parent: parent_scope.map(|scope| self.scopes[scope.0].owner),
+            is_arrow,
+            super_home: None,
+            forwards_super: false,
         });
 
         for param in &params {
@@ -261,6 +274,37 @@ impl<'a> Planner<'a> {
                 self.scan_expression(plan_id, scope, &do_while.test)?;
             }
             Statement::ForStatement(for_stmt) => self.scan_for_loop(plan_id, scope, for_stmt)?,
+            Statement::ForInStatement(for_in) => self.scan_for_each(
+                plan_id,
+                scope,
+                &for_in.left,
+                &for_in.right,
+                &for_in.body,
+                node_key(&**for_in),
+            )?,
+            Statement::ForOfStatement(for_of) => {
+                if for_of.r#await {
+                    return Err(Error::Unsupported(
+                        "`for await` is not supported".to_string(),
+                    ));
+                }
+                self.scan_for_each(
+                    plan_id,
+                    scope,
+                    &for_of.left,
+                    &for_of.right,
+                    &for_of.body,
+                    node_key(&**for_of),
+                )?
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    let name = id.name.as_str();
+                    self.add_binding(scope, name);
+                    self.scopes[scope.0].consts.insert(name);
+                }
+                self.scan_class(plan_id, scope, class)?;
+            }
             Statement::SwitchStatement(switch_stmt) => {
                 let switch_scope = self.new_scope(plan_id, Some(scope));
                 self.functions[plan_id]
@@ -353,6 +397,196 @@ impl<'a> Planner<'a> {
         }
         self.scan_statement(plan_id, loop_scope, &for_stmt.body)?;
         Ok(())
+    }
+
+    /// A `for (head in source)` or `for (head of source)` loop. A lexical head
+    /// opens a scope of its own that the body sees once per iteration.
+    fn scan_for_each(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        left: &'a ForStatementLeft<'a>,
+        source: &'a Expression<'a>,
+        body: &'a Statement<'a>,
+        node: usize,
+    ) -> Result<(), Error> {
+        self.scan_expression(plan_id, scope, source)?;
+        let mut loop_scope = scope;
+        match left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    let root = self.root_scope(plan_id);
+                    self.add_variables(root, decl)?;
+                } else {
+                    let inner = self.new_scope(plan_id, Some(scope));
+                    self.functions[plan_id].blocks.insert(node, inner);
+                    self.add_variables(inner, decl)?;
+                    loop_scope = inner;
+                }
+            }
+            ForStatementLeft::AssignmentTargetIdentifier(_) => {}
+            ForStatementLeft::StaticMemberExpression(access) => {
+                self.add_string(access.property.name.as_str().to_string());
+                self.scan_expression(plan_id, scope, &access.object)?;
+            }
+            ForStatementLeft::ComputedMemberExpression(member) => {
+                self.scan_expression(plan_id, scope, &member.object)?;
+                self.scan_expression(plan_id, scope, &member.expression)?;
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "destructuring loop targets are not supported".to_string(),
+                ));
+            }
+        }
+        self.scan_statement(plan_id, loop_scope, body)
+    }
+
+    /// Lowers a `class` node: one function plan per method plus a constructor,
+    /// and a hidden scope holding the parent constructor and its prototype.
+    fn scan_class(
+        &mut self,
+        plan_id: usize,
+        scope: ScopeId,
+        class: &'a Class<'a>,
+    ) -> Result<(), Error> {
+        let key = node_key(class);
+        if self.classes.contains_key(&key) {
+            return Ok(());
+        }
+        let class_scope = self.new_scope(plan_id, Some(scope));
+        {
+            let plan = &mut self.scopes[class_scope.0];
+            plan.captured = true;
+            plan.extra = 2;
+        }
+        self.functions[plan_id].blocks.insert(key, class_scope);
+        self.add_string("prototype".to_string());
+        if let Some(id) = &class.id {
+            self.add_binding(class_scope, id.name.as_str());
+        }
+        let parent = class.heritage.as_ref().map(|h| &h.expression);
+        if let Some(expression) = parent {
+            self.scan_expression(plan_id, scope, expression)?;
+        }
+
+        // The two anonymous slots follow the named bindings of the class scope.
+        let ctor_slot = self.scopes[class_scope.0].bindings.len();
+        let proto_slot = ctor_slot + 1;
+        let mut ctor = None;
+        let mut methods = Vec::new();
+        for element in &class.body.body {
+            let ClassElement::MethodDefinition(method) = element else {
+                return Err(Error::Unsupported(
+                    "class fields and static blocks are not supported".to_string(),
+                ));
+            };
+            if !matches!(
+                method.kind,
+                MethodDefinitionKind::Constructor | MethodDefinitionKind::Method
+            ) {
+                return Err(Error::Unsupported(
+                    "class getters and setters are not supported".to_string(),
+                ));
+            }
+            let name = class_member_name(&method.key).ok_or_else(|| {
+                Error::Unsupported("computed class members are not supported".to_string())
+            })?;
+            let body = method
+                .value
+                .body
+                .as_ref()
+                .ok_or_else(|| Error::Unsupported("class method without a body".to_string()))?;
+            let plan = self.build_method_plan(plan_id, class_scope, name, &method.value, body)?;
+            let home = SuperHome {
+                scope: class_scope,
+                ctor_slot,
+                proto_slot,
+                is_static: method.r#static,
+            };
+            self.functions[plan].super_home = Some(home);
+            self.functions[plan_id].members.push(plan);
+            self.mark_captured(class_scope);
+            if method.kind == MethodDefinitionKind::Constructor {
+                if method.r#static {
+                    return Err(Error::Unsupported(
+                        "static constructors are not supported".to_string(),
+                    ));
+                }
+                ctor = Some(plan);
+            } else {
+                self.add_string(name.to_string());
+                methods.push(ClassMethodPlan {
+                    name,
+                    plan,
+                    is_static: method.r#static,
+                });
+            }
+        }
+
+        let ctor = match ctor {
+            Some(ctor) => ctor,
+            None => {
+                let name = format!("js_ctor_{}", self.functions.len());
+                let plan = self.build_function_plan(
+                    Some(class_scope),
+                    name,
+                    Vec::new(),
+                    FunctionBodyPlan::Statements(&[]),
+                    false,
+                    false,
+                    None,
+                )?;
+                if parent.is_some() {
+                    self.functions[plan].forwards_super = true;
+                }
+                self.functions[plan].super_home = Some(SuperHome {
+                    scope: class_scope,
+                    ctor_slot,
+                    proto_slot,
+                    is_static: false,
+                });
+                self.functions[plan_id].members.push(plan);
+                self.mark_captured(class_scope);
+                plan
+            }
+        };
+
+        self.classes.insert(
+            key,
+            ClassPlan {
+                scope: class_scope,
+                parent,
+                ctor,
+                methods,
+                name_binding: class.id.as_ref().map(|id| id.name.as_str()),
+                ctor_slot,
+                proto_slot,
+            },
+        );
+        Ok(())
+    }
+
+    /// Plans one class constructor or method body inside `class_scope`.
+    fn build_method_plan(
+        &mut self,
+        _plan_id: usize,
+        class_scope: ScopeId,
+        name: &str,
+        function: &'a Function<'a>,
+        body: &'a oxc_ast::ast::FunctionBody<'a>,
+    ) -> Result<usize, Error> {
+        let params = collect_params(&function.params)?;
+        let child_name = format!("js_member_{}_{}", self.functions.len(), name);
+        self.build_function_plan(
+            Some(class_scope),
+            child_name,
+            params,
+            FunctionBodyPlan::Statements(body.statements.as_slice()),
+            false,
+            false,
+            None,
+        )
     }
 
     fn scan_block(
@@ -559,6 +793,8 @@ impl<'a> Planner<'a> {
                 }
             }
             Expression::NewExpression(new) => {
+                // `new C(...)` reads `C.prototype`, so the key must be interned.
+                self.add_string("prototype".to_string());
                 self.scan_expression(plan_id, scope, &new.callee)?;
                 for arg in &new.arguments {
                     if let Some(expression) = arg.as_expression() {
@@ -566,6 +802,8 @@ impl<'a> Planner<'a> {
                     }
                 }
             }
+            Expression::ClassExpression(class) => self.scan_class(plan_id, scope, class)?,
+            Expression::Super(_) => {}
             Expression::ObjectExpression(object) => {
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {
@@ -654,6 +892,16 @@ impl<'a> Planner<'a> {
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// The static name of a class member, which must be a plain identifier or a
+/// string literal for the class to be lowered.
+fn class_member_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+        PropertyKey::StringLiteral(lit) => lit.value.as_str(),
+        _ => None,
     }
 }
 

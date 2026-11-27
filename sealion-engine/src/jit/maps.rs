@@ -8,7 +8,7 @@
 //! values leak for the lifetime of the process.
 //!
 //! Methods are exposed as native closures exactly like the array ones: a
-//! two-word record holding the entry point and the map pointer, so they use the
+//! function record holding the entry point and the map pointer, so they use the
 //! ordinary JavaScript calling convention and work through the same indirect
 //! call path as a user function.
 
@@ -17,7 +17,7 @@ use sealion_string::JsString;
 use super::arrays::{arg, call};
 use super::objects::{JsObject, new_array, new_map, tagged_object, with_object};
 use super::strings::{same_value_zero, tagged_bool, tagged_undefined};
-use crate::value::{PAYLOAD_MASK, TAG_FUNCTION};
+use crate::value::PAYLOAD_MASK;
 
 type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
 
@@ -46,12 +46,9 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
         return None;
     }
     let method = method(key)?;
-    let record = Box::into_raw(Box::new([
-        method as usize as u64,
+    Some(super::objects::native_function(
+        method,
         value.to_bits() & PAYLOAD_MASK,
-    ]));
-    Some(f64::from_bits(
-        (TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK),
     ))
 }
 

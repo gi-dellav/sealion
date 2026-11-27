@@ -598,7 +598,7 @@ values.
 Primitives are copied by value as `f64`s. There is no allocation for numbers,
 booleans, `null` or `undefined`. The only engine-managed allocations are:
 
-- closure records (16 bytes),
+- closure records (32 bytes: entry point, environment, properties, constructible),
 - environment records (`8 + 8 * slots` bytes),
 - argument blocks (264 bytes),
 - string values (the reference-counted `sealion_string` heap, dynamic backend),

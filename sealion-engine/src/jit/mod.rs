@@ -17,6 +17,10 @@ mod artifact;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod dates;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod functions;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod iter;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod loader;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod maps;

@@ -1700,3 +1700,422 @@ fn unknown_namespace_members_are_compile_errors() {
     assert!(Engine::new().compile_jit("Date.nope();").is_err());
     assert!(Engine::new().compile_jit("new Number(1);").is_err());
 }
+
+#[test]
+fn for_in_visits_enumerable_keys() {
+    assert_eq!(
+        run("var o = {a: 1, b: 2}; var s = 0; for (var k in o) { s = s + o[k]; } s;"),
+        3
+    );
+    assert_eq!(
+        run("var s = ''; for (var k in {a: 1, b: 2}) { s = s + k; } s === 'ab' ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var a = [10, 20, 30]; var s = 0; for (var k in a) { s = s + a[k]; } s;"),
+        60
+    );
+    assert_eq!(
+        run("var s = ''; for (var k in [7, 8]) { s = s + k; } s === '01' ? 1 : 0;"),
+        1
+    );
+    // Inherited properties are visited after the own ones.
+    assert_eq!(
+        run(
+            "function P() {} P.prototype.x = 1; var o = new P(); o.y = 2; var s = ''; for (var k in o) { s = s + k; } s === 'yx' ? 1 : 0;"
+        ),
+        1
+    );
+    // A shadowed name appears once.
+    assert_eq!(
+        run(
+            "function P() {} P.prototype.x = 1; var o = new P(); o.x = 2; var n = 0; for (var k in o) { n = n + 1; } n;"
+        ),
+        1
+    );
+    assert_eq!(run("var n = 0; for (var k in null) { n = n + 1; } n;"), 0);
+    assert_eq!(run("var n = 0; for (var k in {}) { n = n + 1; } n;"), 0);
+    // A `var` head is hoisted out of the loop.
+    assert_eq!(
+        run("var s = ''; for (var k in {a: 1}) { } k === 'a' ? 1 : 0;"),
+        1
+    );
+    // A lexical head does not leak.
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("for (let k in {a: 1}) { } k;")
+            .is_err()
+    );
+    // The key list is a snapshot: growing the object does not extend the loop.
+    assert_eq!(
+        run(
+            "var o = {a: 1}; var n = 0; for (var k in o) { o.b = 2; n = n + 1; if (n > 4) { break; } } n;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = {a: 1, b: 2}; var s = 0; for (var k in o) { if (k === 'a') { continue; } s = s + o[k]; } s;"
+        ),
+        2
+    );
+}
+
+#[test]
+fn for_of_iterates_arrays_strings_and_maps() {
+    assert_eq!(
+        run("var a = [1, 2, 3]; var s = 0; for (var v of a) { s = s + v; } s;"),
+        6
+    );
+    assert_eq!(
+        run("var s = 0; for (const v of [1, 2, 3]) { s = s + v; if (v === 2) { break; } } s;"),
+        3
+    );
+    assert_eq!(
+        run("var s = 0; for (let v of [1, 2, 3]) { if (v === 2) { continue; } s = s + v; } s;"),
+        4
+    );
+    assert_eq!(
+        run(r#"var s = ""; for (const c of "abc") { s = s + c; } s === "abc" ? 1 : 0;"#),
+        1
+    );
+    // Strings iterate code points, not UTF-16 code units.
+    assert_eq!(
+        run(r#"var n = 0; for (const c of "a\u{1F600}b") { n = n + 1; } n;"#),
+        3
+    );
+    assert_eq!(
+        run(r#"var s = ""; for (const c of "\u{1F600}") { s = s + c.length; } s === "2" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(
+            "var m = new Map(); m.set('a', 1); m.set('b', 2); var s = 0; for (const e of m) { s = s + e[1]; } s;"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var m = new Map(); m.set('a', 1); var k = ''; for (const e of m) { k = k + e[0]; } k === 'a' ? 1 : 0;"
+        ),
+        1
+    );
+    // Anything else contributes no iterations instead of throwing.
+    assert_eq!(run("var n = 0; for (const v of 5) { n = n + 1; } n;"), 0);
+    assert_eq!(run("var n = 0; for (const v of {}) { n = n + 1; } n;"), 0);
+    // An array-like object is iterated by index.
+    assert_eq!(
+        run(
+            "var o = {length: 2, 0: 'a', 1: 'b'}; var s = ''; for (const v of o) { s = s + v; } s === 'ab' ? 1 : 0;"
+        ),
+        1
+    );
+    // The length is re-read each step.
+    assert_eq!(
+        run(
+            "var a = [1]; var n = 0; for (const v of a) { a.push(2); n = n + 1; if (n > 5) { break; } } n;"
+        ),
+        6
+    );
+    assert_eq!(run("var a = [1, 2]; var s = 0; for (s of a) { } s;"), 2);
+    assert_eq!(
+        run("var a = [1, 2]; var o = {}; for (o.v of a) { } o.v;"),
+        2
+    );
+    assert_eq!(
+        run(
+            "var n = 0; outer: for (const v of [1, 2, 3]) { for (const w of [1, 2]) { if (w === 2) { continue outer; } } n = n + 1; } n;"
+        ),
+        0
+    );
+    assert_eq!(
+        run(
+            "var s = 0; outer: for (const v of [1, 2, 3]) { if (v === 2) { break outer; } s = s + v; } s;"
+        ),
+        1
+    );
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("for (const v of [1]) { } v;")
+            .is_err()
+    );
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("for (const [a, b] of [[1, 2]]) { }")
+            .is_err()
+    );
+}
+
+#[test]
+fn for_of_binds_a_fresh_environment_per_iteration() {
+    assert_eq!(
+        run(
+            "var a = [1, 2]; var b = []; for (let v of a) { b.push(function () { return v; }); } b[0]() + b[1]();"
+        ),
+        3
+    );
+    assert_eq!(
+        run("var b = []; for (const v of [1, 2]) { b.push(function () { return v; }); } b[1]();"),
+        2
+    );
+    // A `var` head shares one binding, so every closure sees the last value.
+    assert_eq!(
+        run("var b = []; for (var v of [1, 2]) { b.push(function () { return v; }); } b[0]();"),
+        2
+    );
+}
+
+#[test]
+fn classes_create_instances_with_methods() {
+    assert_eq!(run("class C { } new C() instanceof C ? 1 : 0;"), 1);
+    assert_eq!(run("class C { } typeof C === 'function' ? 1 : 0;"), 1);
+    assert_eq!(run("class C { } typeof new C() === 'object' ? 1 : 0;"), 1);
+    assert_eq!(
+        run("class C { constructor(x) { this.x = x; } get() { return this.x; } } new C(7).get();"),
+        7
+    );
+    assert_eq!(run("class C { m() { return 1; } } new C().m();"), 1);
+    assert_eq!(run("class C { static s() { return 2; } } C.s();"), 2);
+    assert_eq!(
+        run("class C { m() { return this.n; } } var c = new C(); c.n = 3; c.m();"),
+        3
+    );
+    assert_eq!(
+        run(
+            "class C { constructor() { this.a = 1; } m() { return 2; } } var c = new C(); c.a + c.m();"
+        ),
+        3
+    );
+    assert_eq!(run("class C { } new C().constructor === C ? 1 : 0;"), 1);
+    assert_eq!(run("var C = class { m() { return 3; } }; new C().m();"), 3);
+    assert_eq!(
+        run("var C = class Named { m() { return Named; } }; new C().m() === C ? 1 : 0;"),
+        1
+    );
+    // A constructor that returns an object of its own replaces the receiver.
+    assert_eq!(
+        run("class C { constructor() { return {x: 9}; } } new C().x;"),
+        9
+    );
+    assert_eq!(
+        run("class C { constructor() { this.x = 1; } } new C().x;"),
+        1
+    );
+    // Methods are ordinary functions: they can be detached and passed around.
+    assert_eq!(
+        run("class C { m() { return 1; } } var c = new C(); var f = c.m; f();"),
+        1
+    );
+    assert_eq!(
+        run("class C { m() { return 2; } } var c = new C(); [1].map(c.m.bind(c))[0];"),
+        2
+    );
+    // Class members the object model cannot express are rejected.
+    for source in [
+        "class C { x = 1; }",
+        "class C { static { } }",
+        "class C { get x() { return 1; } }",
+        "class C { set x(v) { } }",
+        "class C { #x() { } }",
+    ] {
+        assert!(
+            sealion_engine::Engine::new().compile_jit(source).is_err(),
+            "{source}"
+        );
+    }
+    // A class name is a constant.
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("class C { } C = 1;")
+            .is_err()
+    );
+}
+
+#[test]
+fn class_inheritance_and_super() {
+    assert_eq!(
+        run(
+            "class A { hello() { return 'a'; } } class B extends A { } new B().hello() === 'a' ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "class A { } class B extends A { } var b = new B(); (b instanceof B && b instanceof A) ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "class A { constructor(x) { this.x = x; } } class B extends A { constructor() { super(5); } } new B().x;"
+        ),
+        5
+    );
+    assert_eq!(
+        run("class A { constructor(x) { this.x = x; } } class B extends A { } new B(5).x;"),
+        5
+    );
+    assert_eq!(
+        run(
+            "class A { m() { return 1; } } class B extends A { m() { return super.m() + 1; } } new B().m();"
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "class A { m() { return this.x; } } class B extends A { constructor() { super(); this.x = 4; } m() { return super.m() + 1; } } new B().m();"
+        ),
+        5
+    );
+    // Static members are inherited through the constructor's prototype chain.
+    assert_eq!(
+        run("class A { static t() { return 1; } } class B extends A { } B.t();"),
+        1
+    );
+    assert_eq!(
+        run(
+            "class A { static t() { return 1; } } class B extends A { } (new B() instanceof A) ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("class A { } class B extends A { } Object.getPrototypeOf(B) === A ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run(
+            "class A { } class B extends A { } Object.getPrototypeOf(B.prototype) === A.prototype ? 1 : 0;"
+        ),
+        1
+    );
+    // `super.m()` in an arrow inside a method keeps the method's receiver.
+    assert_eq!(
+        run(
+            "class A { m() { return 1; } } class B extends A { m() { var f = () => super.m() + 1; return f(); } } new B().m();"
+        ),
+        2
+    );
+    // `super.x` reads the parent prototype, not the receiver.
+    assert_eq!(
+        run(
+            "class A { m() { return 1; } } class B extends A { m() { return 0; } n() { return super.m(); } } new B().n();"
+        ),
+        1
+    );
+    // Assigning through `super` writes on the receiver.
+    assert_eq!(
+        run(
+            "class A { } class B extends A { set(v) { super.x = v; return this.x; } } new B().set(3);"
+        ),
+        3
+    );
+    // `super` outside a class is rejected, and so is a non-class parent.
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("class C { m() { return super.x; } } var o = {}; o.m = new C().m;")
+            .is_ok()
+    );
+    assert!(
+        sealion_engine::Engine::new()
+            .compile_jit("function f() { return super.x; } f();")
+            .is_err()
+    );
+}
+
+#[test]
+fn new_constructs_user_functions() {
+    assert_eq!(run("function F(x) { this.x = x; } new F(3).x;"), 3);
+    assert_eq!(
+        run("function F(x) { this.x = x; } new F(3) instanceof F ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("function F() { } new F() instanceof F ? 1 : 0;"), 1);
+    assert_eq!(
+        run("function F() { } F.prototype.m = function () { return 1; }; new F().m();"),
+        1
+    );
+    assert_eq!(run("function F() { return {y: 2}; } new F().y;"), 2);
+    assert_eq!(run("function F() { this.x = 1; return 7; } new F().x;"), 1);
+    assert_eq!(
+        run("function F() { this.x = 1; } function G() { } (new F() instanceof G) ? 1 : 2;"),
+        2
+    );
+    // A plain call still has no receiver, and `new` on a non-function value
+    // yields an empty object instead of crashing.
+    assert_eq!(
+        run("function F() { return this === undefined ? 1 : 0; } new F();"),
+        0
+    );
+    assert_eq!(run("var o = new (5)(); typeof o === 'object' ? 1 : 0;"), 1);
+    // Constructors chain through the prototype they were given.
+    assert_eq!(
+        run(
+            "function A() { this.a = 1; } function B() { A.call(this); this.b = 2; } B.prototype = Object.create(A.prototype); new B().a;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("function F() { } var f = new F(); f.constructor === F ? 1 : 0;"),
+        1
+    );
+    // An arrow function has no prototype, so `new` falls back to an empty object.
+    assert_eq!(run("var f = () => 1; new f() instanceof f ? 1 : 2;"), 2);
+}
+
+#[test]
+fn function_call_apply_and_bind() {
+    assert_eq!(
+        run("function f(a, b) { return this.x + a + b; } var o = {x: 1}; f.call(o, 2, 3);"),
+        6
+    );
+    assert_eq!(
+        run("function f(a, b) { return this.x + a + b; } var o = {x: 1}; f.apply(o, [2, 3]);"),
+        6
+    );
+    assert_eq!(
+        run("function f(a) { return this.x + a; } var o = {x: 1}; var g = f.bind(o, 5); g();"),
+        6
+    );
+    assert_eq!(
+        run(
+            "function f(a, b) { return this.x + a + b; } var o = {x: 1}; var g = f.bind(o, 2); g(3);"
+        ),
+        6
+    );
+    assert_eq!(
+        run("function f() { return this === undefined ? 1 : 0; } f.call(undefined);"),
+        1
+    );
+    // Sloppy-mode `this` boxing is not implemented: the receiver is passed
+    // through unchanged.
+    assert_eq!(
+        run("function f() { return this === null ? 1 : 0; } f.call(null);"),
+        1
+    );
+    // The bound function ignores a later receiver.
+    assert_eq!(
+        run(
+            "function f() { return this.x; } var o = {x: 1}; var p = {x: 2}; var g = f.bind(o); g.call(p);"
+        ),
+        1
+    );
+    assert_eq!(
+        run("function f() { return 1; } var g = f.bind(null); typeof g === 'function' ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("function f(a) { return a; } var g = f.bind(null, 4); g();"),
+        4
+    );
+    // Methods are bound to the receiver they are read from.
+    assert_eq!(
+        run("var o = {n: 1, f: function () { return this.n; }}; o.f.call(o);"),
+        1
+    );
+    // A native array method is a function value too, so it can be rebound.
+    assert_eq!(run("var a = [1]; var f = a.push; f.call(a, 9); a[1];"), 9);
+    assert_eq!(
+        run("var a = [1, 2]; var f = a.join; f.apply(a, ['-']) === '1-2' ? 1 : 0;"),
+        1
+    );
+}

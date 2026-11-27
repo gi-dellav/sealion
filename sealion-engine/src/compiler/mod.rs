@@ -22,6 +22,7 @@ use crate::{
 mod array;
 mod call;
 mod chain;
+mod class;
 mod expr;
 mod flow;
 mod loops;
@@ -34,9 +35,12 @@ mod support;
 pub(crate) use signature::*;
 
 use expr::{compile_default, compile_expr};
+use flow::emit_exception_check;
 use numeric::analyze_numeric_bindings;
 use stmt::compile_statements;
-use support::{alloc_env, declare_vars, init_local_slots, init_slots, new_closure, store_var};
+use support::{
+    alloc_env, declare_vars, hidden_value, init_local_slots, init_slots, new_closure, store_var,
+};
 
 #[derive(Clone)]
 struct CodegenCtx<'a> {
@@ -113,6 +117,13 @@ fn object_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::ObjectOps>
         set: *refs.get("sealion_object_set")?,
         has: *refs.get("sealion_object_has")?,
         delete: *refs.get("sealion_object_delete")?,
+        new_instance: *refs.get("sealion_object_new_instance")?,
+        set_prototype: *refs.get("sealion_object_set_prototype")?,
+        instance_of: *refs.get("sealion_instanceof")?,
+        for_in_keys: *refs.get("sealion_object_for_in_keys")?,
+        iter_new: *refs.get("sealion_iter_new")?,
+        iter_next: *refs.get("sealion_iter_next")?,
+        iter_value: *refs.get("sealion_iter_value")?,
     })
 }
 
@@ -201,7 +212,12 @@ pub fn compile_functions<'a>(
         let exception_global = module.declare_data_in_func(imports.exception, &mut func);
         let builtin_refs = builtins.declare_in(module, &mut func);
         let mut child_refs = HashMap::new();
-        for &child in plan.children.iter().chain(plan.nested.values()) {
+        for &child in plan
+            .children
+            .iter()
+            .chain(plan.nested.values())
+            .chain(plan.members.iter())
+        {
             let child_ref = module.declare_func_in_func(func_ids[child], &mut func);
             child_refs.insert(child, child_ref);
         }
@@ -326,8 +342,36 @@ pub fn compile_functions<'a>(
                 .binding_name
                 .ok_or_else(|| Error::Codegen("missing function binding".to_string()))?;
             let code = builder.ins().func_addr(types::I64, child_refs[&child_id]);
-            let closure = new_closure(&mut builder, calloc_ref, code, ctx.env);
+            let closure = new_closure(&mut builder, calloc_ref, code, ctx.env, true);
             store_var(&mut builder, &ctx, name, closure)?;
+        }
+
+        // A synthesised derived-class constructor forwards its arguments to the
+        // parent constructor, which initialises the receiver `new` allocated.
+        if plan.forwards_super
+            && let Some(home) = plan.super_home
+        {
+            let parent = hidden_value(&mut builder, &ctx, home.scope, home.ctor_slot)?;
+            let callable = value::is_function(&mut builder, parent);
+            let forward = builder.create_block();
+            let skip = builder.create_block();
+            builder.ins().brif(callable, forward, &[], skip, &[]);
+            builder.switch_to_block(forward);
+            let payload = value::payload(&mut builder, parent);
+            let code = builder
+                .ins()
+                .load(types::I64, MemFlags::new(), payload, 0i32);
+            let captured = builder
+                .ins()
+                .load(types::I64, MemFlags::new(), payload, 8i32);
+            builder.ins().call_indirect(
+                js_sig_ref,
+                code,
+                &[captured, args_param, parent, this_param],
+            );
+            emit_exception_check(&mut builder, &ctx, &flow)?;
+            builder.ins().jump(skip, &[]);
+            builder.switch_to_block(skip);
         }
 
         let out = match plan.body {
@@ -340,7 +384,15 @@ pub fn compile_functions<'a>(
             },
         };
         if !out.terminated {
-            let ret = match out.last {
+            // Only the script (whose result is the process exit code) and an
+            // arrow expression body fall off the end with a value; an ordinary
+            // function returns `undefined`, so `new` keeps the receiver it
+            // allocated unless the constructor returns an object of its own.
+            let implicit = match plan.body {
+                FunctionBodyPlan::Statements(_) if !plan.is_script => None,
+                _ => out.last,
+            };
+            let ret = match implicit {
                 Some(value) => value,
                 None => value::undefined(&mut builder),
             };

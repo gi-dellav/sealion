@@ -75,6 +75,18 @@ pub struct ObjectOps {
     pub set: FuncRef,
     pub has: FuncRef,
     pub delete: FuncRef,
+    /// Allocates the receiver of a `new` expression from a prototype value.
+    pub new_instance: FuncRef,
+    pub set_prototype: FuncRef,
+    /// `value instanceof constructor`.
+    pub instance_of: FuncRef,
+    /// The own and inherited enumerable keys of an object, as an array.
+    pub for_in_keys: FuncRef,
+    /// Opens an iteration: `iter_new(value)`, then `iter_next(handle)` until it
+    /// reports `false`, reading `iter_value(handle)` after each step.
+    pub iter_new: FuncRef,
+    pub iter_next: FuncRef,
+    pub iter_value: FuncRef,
 }
 
 pub fn undefined(builder: &mut FunctionBuilder) -> Value {
@@ -174,6 +186,13 @@ pub fn is_boolean(builder: &mut FunctionBuilder, value: Value) -> Value {
 
 pub fn is_function(builder: &mut FunctionBuilder, value: Value) -> Value {
     tag_is(builder, value, TAG_FUNCTION)
+}
+
+/// `true` when the value is an object or a function.
+pub fn is_object_like(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let object = tag_is(builder, value, TAG_OBJECT);
+    let function = tag_is(builder, value, TAG_FUNCTION);
+    builder.ins().bor(object, function)
 }
 
 pub fn is_string(builder: &mut FunctionBuilder, value: Value) -> Value {

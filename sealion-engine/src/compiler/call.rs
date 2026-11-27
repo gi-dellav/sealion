@@ -10,7 +10,7 @@ use super::expr::compile_expr;
 use super::flow::emit_exception_check;
 use super::numeric::expr_is_number;
 use super::object;
-use super::support::new_closure;
+use super::support::{load_var, new_closure};
 use super::{CodegenCtx, Flow};
 use crate::{
     Error, builtins,
@@ -139,6 +139,11 @@ pub(super) fn compile_property_access<'a>(
     flow: &mut Flow<'a>,
     access: &'a StaticMemberExpression<'a>,
 ) -> Result<Value, Error> {
+    if super::class::is_super(&access.object) {
+        let target = super::class::super_target(builder, ctx)?;
+        let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+        return object::get(builder, ctx, target, key);
+    }
     let constant = builtin_member(ctx, access)
         .and_then(|(namespace, name)| ctx.builtins.constant(namespace, name));
     if let Some(value) = constant {
@@ -249,6 +254,13 @@ pub(super) fn compile_call<'a>(
         )));
     }
 
+    if super::class::is_super(&call.callee) {
+        // `super(...)` invokes the parent constructor with the current `this`.
+        let callee = super::class::super_constructor(builder, ctx)?;
+        let this = load_var(builder, ctx, "this")?;
+        return compile_call_value(builder, ctx, flow, callee, this, &call.arguments);
+    }
+
     if let Expression::Identifier(id) = &call.callee
         && let Some(key) = resolve_binding(ctx.program, ctx.scope, id.name.as_str())
         && let Some(&callee) = ctx.program.direct_calls.bindings.get(&key)
@@ -268,6 +280,16 @@ pub(super) fn compile_call<'a>(
     // `object.method(...)` passes the object as `this`; every other call form
     // passes `undefined`.
     match &call.callee {
+        Expression::StaticMemberExpression(access) if super::class::is_super(&access.object) => {
+            let callee = compile_property_access(builder, ctx, flow, access)?;
+            let this = load_var(builder, ctx, "this")?;
+            return compile_call_value(builder, ctx, flow, callee, this, &call.arguments);
+        }
+        Expression::ComputedMemberExpression(member) if super::class::is_super(&member.object) => {
+            let callee = compile_computed_access(builder, ctx, flow, member)?;
+            let this = load_var(builder, ctx, "this")?;
+            return compile_call_value(builder, ctx, flow, callee, this, &call.arguments);
+        }
         Expression::StaticMemberExpression(access) => {
             let receiver = compile_expr(builder, ctx, flow, &access.object)?;
             let key = object::static_key(builder, ctx, access.property.name.as_str())?;
@@ -391,10 +413,29 @@ pub(super) fn compile_closure(
         .nested
         .get(&key)
         .ok_or_else(|| Error::Codegen("missing anonymous function plan".to_string()))?;
+    compile_closure_of(builder, ctx, child)
+}
+
+/// Materialises the closure of a plan of this function: a class constructor or
+/// method, or a nested function/arrow expression.
+pub(super) fn compile_closure_of(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    child: usize,
+) -> Result<Value, Error> {
     let func_ref = *ctx
         .child_refs
         .get(&child)
         .ok_or_else(|| Error::Codegen("missing anonymous function reference".to_string()))?;
     let code = builder.ins().func_addr(types::I64, func_ref);
-    Ok(new_closure(builder, ctx.calloc_ref, code, ctx.env))
+    // Arrows inherit `this` and cannot be constructed, so they carry no
+    // `prototype` property.
+    let constructible = !ctx.program.function(child).is_arrow;
+    Ok(new_closure(
+        builder,
+        ctx.calloc_ref,
+        code,
+        ctx.env,
+        constructible,
+    ))
 }

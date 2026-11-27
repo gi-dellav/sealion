@@ -194,6 +194,28 @@ impl Builtins {
                 module.declare_function("sealion_object_set", Linkage::Import, &ternary_sig)?;
             funcs.insert("sealion_object_set", set_id);
 
+            // `new`, `instanceof` and the `for..in` / `for..of` host helpers.
+            let unary_sig = make_f64_unary_signature(module);
+            let handle_sig = make_f64_to_i64_signature(module);
+            for name in ["sealion_object_new_instance", "sealion_iter_new"] {
+                let id = module.declare_function(name, Linkage::Import, &handle_sig)?;
+                funcs.insert(name, id);
+            }
+            let for_in_id = module.declare_function(
+                "sealion_object_for_in_keys",
+                Linkage::Import,
+                &unary_sig,
+            )?;
+            funcs.insert("sealion_object_for_in_keys", for_in_id);
+            let i64_to_f64_sig = make_i64_to_f64_signature(module);
+            for name in ["sealion_iter_next", "sealion_iter_value"] {
+                let id = module.declare_function(name, Linkage::Import, &i64_to_f64_sig)?;
+                funcs.insert(name, id);
+            }
+            let instance_of_id =
+                module.declare_function("sealion_instanceof", Linkage::Import, &binary_sig)?;
+            funcs.insert("sealion_instanceof", instance_of_id);
+
             let length_sig = make_i64_unary_signature(module);
             for name in [
                 "sealion_array_new",
@@ -404,6 +426,14 @@ impl Builtins {
             .map(|(name, id)| (*name, module.declare_func_in_func(*id, func)))
             .collect()
     }
+}
+
+/// `f64 -> i64`, for the host helpers that hand out an opaque handle.
+fn make_f64_to_i64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
 }
 
 fn make_nullary_i64_signature(module: &mut ObjectModule) -> Signature {

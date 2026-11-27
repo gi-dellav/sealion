@@ -153,10 +153,11 @@ corrupt chain cannot hang the runtime.
 
 Arrays, maps and strings answer their methods from native tables keyed by name
 (`arrays::method_property`, `maps::method_property`,
-`strings::method_property`). Each hit allocates a two-word closure record:
+`strings::method_property`). Each hit allocates a closure record through
+`objects::native_function`:
 
 ```text
-[ entry point , receiver ]     tagged as TAG_FUNCTION
+[ entry point , receiver , properties , constructible ]   tagged as TAG_FUNCTION
 ```
 
 The record uses the ordinary JavaScript calling convention `(env, args, callee,
@@ -182,7 +183,70 @@ of these methods (`o.toString === undefined`).
 Virtual built-ins are invisible to own-key enumeration: `Object.hasOwn(
 Array.prototype, "push")` is `false` even though `[].push` resolves.
 
-## 7. Enumeration
+## 7. Function values
+
+A function is a four-word record (see `jit/functions.rs`):
+
+```text
+word 0  entry point      (the JavaScript calling convention)
+word 1  environment      (captured environment record, or a bound receiver)
+word 2  properties       (*mut JsObject, allocated on first property access, else 0)
+word 3  constructible    (0 for arrows, native methods and bound functions)
+```
+
+Compiled code reads only the first two words, so calling a function is unchanged.
+Word 2 is the function's own property bag — an ordinary `JsObject` whose
+prototype is `Object.prototype` — which makes `F.count = 1`, `C.m = fn`,
+`f.custom` and `delete f.custom` work through the same `get`/`set`/`has`/`delete`
+helpers as any other object. Word 3 decides whether the value owns a `prototype`
+property and may be used with `new`.
+
+`f.prototype` is created lazily by `functions::ensure_prototype` the first time
+it is read, together with a **hidden** `constructor` property that points back at
+the function. Hidden properties read back normally but are skipped by `for..in`
+and `Object.keys`, which is how `for (var k in new C())` stays empty and
+`Object.keys(function () {})` stays `[]`.
+
+Because the property bag is a plain object, `class B extends A` inherits the
+static members of `A` by pointing `B`'s bag at `A`'s bag
+(`sealion_object_set_prototype` redirects a function receiver to its bag). Each
+bag remembers its owner function, so `Object.getPrototypeOf(B) === A` holds.
+
+`Function.prototype.call`, `apply` and `bind` are virtual methods of the same
+kind as the array ones; `bind` returns a new record whose entry point prepends
+the bound arguments and replaces the receiver.
+
+## 8. Construction and `instanceof`
+
+`new F(...)` evaluates `F.prototype` through the ordinary property path,
+allocates the receiver with `sealion_object_new_instance(prototype)` and calls
+`F` with that receiver as `this`. The result is kept only when the constructor
+returned an object or a function of its own, so an ordinary constructor returns
+the receiver it initialised. Anything that is not a function yields an empty
+object instead of a `TypeError`.
+
+`value instanceof C` is `sealion_instanceof`, which walks the prototype chain of
+`value` looking for `C.prototype`; a non-object left side or a right side without
+an object prototype is `false`.
+
+## 9. Iteration (`for..in` and `for..of`)
+
+Neither loop uses an iterator protocol — there is no `Symbol.iterator` and no
+`Symbol` type.
+
+`for..in` snapshots the key list with `sealion_object_for_in_keys`, which walks
+the prototype chain and yields each name once: array indices ascending, then
+named properties in insertion order, with hidden and shadowed names skipped. The
+loop then iterates that array of keys.
+
+`for..of` opens a host iterator (`sealion_iter_new`) and asks it for a value per
+step (`sealion_iter_next`, then `sealion_iter_value`). The `length` is re-read
+every step, so an array that changes size during the loop is observed. Arrays
+iterate their elements, strings their **code points**, maps their `[key, value]`
+pairs and anything with a numeric `length` its indices. Any other value
+contributes no iterations instead of raising `TypeError`.
+
+## 10. Enumeration
 
 `Object.keys`, `Object.values` and `Object.entries` enumerate own properties
 only:
@@ -195,7 +259,7 @@ only:
 `Object.keys` returns a real array (chained to `Array.prototype`), so it supports
 `.length`, `.map`, and so on.
 
-## 8. Object literals
+## 11. Object literals
 
 `compiler::object.rs` compiles `{ ... }` by calling `sealion_object_new` and then
 `sealion_object_set` for each property in source order, so insertion order and
@@ -204,7 +268,7 @@ special case at the AST level: it compiles to a `set` on the `"__proto__"` key,
 which `sealion_object_set` interprets as a prototype assignment. Object spread
 and getter/setter literals are still rejected at compile time.
 
-## 9. Registering a new helper
+## 12. Registering a new helper
 
 Adding an object helper takes four edits:
 
@@ -216,7 +280,7 @@ Adding an object helper takes four edits:
    `builtin_member` recognises `Object.name`.
 4. Add a match arm to `builtins::dispatch::call` that calls the `FuncRef`.
 
-## 10. Namespace objects
+## 13. Namespace objects
 
 `Math`, `String` and `Date` are compile-time namespaces in `builtins`, but the
 dynamic runtime also materialises them as singleton objects (`jit::math`,
@@ -240,12 +304,18 @@ Date methods take their receiver from the closure's `env` like every other
 virtual method, except that the record holds a second word (the method index)
 for the pair to fit in one `env` word: `[ entry point , Box<(receiver, index)> ]`.
 
-## 11. Known gaps
+## 14. Known gaps
 
 * No property descriptors, writable/enumerable/configurable flags, accessors,
   getters or setters (except the built-in `__proto__` shorthand).
-* No `Function.prototype`, no `new` on user functions: user functions have no
-  `.prototype` and cannot be constructors.
+* No `Function.prototype` object: `call`, `apply`, `bind` and `toString` are
+  virtual methods of function values, so `Function.prototype.call` and
+  `Object.keys(Function)` do not exist. There is no `arguments`, no
+  `new.target`, no `Function` constructor, no class fields, getters, setters or
+  private members, and no `extends null`.
+* Function property bags are the prototype-chain link for statics, so
+  `Object.getPrototypeOf(f)` reports the parent's bag through its owner while
+  `for..in` over a function enumerates the bag's own keys.
 * Built-in array/map/string methods live in native tables, so they are not
   visible as own properties of `Array.prototype`/`Map.prototype`.
 * No garbage collection; prototype singletons and every allocated object live

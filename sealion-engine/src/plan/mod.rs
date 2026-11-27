@@ -31,12 +31,54 @@ pub struct ParamPlan<'a> {
     pub init: Option<&'a Expression<'a>>,
 }
 
+/// Where a class method finds `super`: the scope holding the class's hidden
+/// slots, their indices and whether the method is static.
+#[derive(Debug, Clone, Copy)]
+pub struct SuperHome {
+    pub scope: ScopeId,
+    /// The parent constructor value (`super(...)` and static `super.x`).
+    pub ctor_slot: usize,
+    /// The parent's `prototype` object (instance `super.x`).
+    pub proto_slot: usize,
+    pub is_static: bool,
+}
+
+/// One method of a class: the closure that becomes `Class.prototype.<name>` or
+/// `Class.<name>`.
+#[derive(Debug, Clone)]
+pub struct ClassMethodPlan<'a> {
+    pub name: &'a str,
+    pub plan: usize,
+    pub is_static: bool,
+}
+
+/// The lowered form of a `class` node. The class itself is a function value (the
+/// constructor); methods are assigned to its `prototype` object or to itself.
+#[derive(Debug, Clone)]
+pub struct ClassPlan<'a> {
+    /// Scope holding the hidden parent slots; always an environment record so
+    /// that the method closures can capture it.
+    pub scope: ScopeId,
+    pub parent: Option<&'a Expression<'a>>,
+    /// The constructor plan, synthesised when the class declares none.
+    pub ctor: usize,
+    pub methods: Vec<ClassMethodPlan<'a>>,
+    /// The class name, bound inside the class's own scope so that the methods
+    /// and static initialisers can refer to it.
+    pub name_binding: Option<&'a str>,
+    pub ctor_slot: usize,
+    pub proto_slot: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScopePlan<'a> {
     pub parent: Option<ScopeId>,
     /// The function plan that owns this scope.
     pub owner: usize,
     pub bindings: HashMap<&'a str, usize>,
+    /// Anonymous slots after the named bindings, used by lowered constructs such
+    /// as the class `super` slots.
+    pub extra: usize,
     /// Bindings declared with `const`, which may not be assigned to.
     pub consts: HashSet<&'a str>,
     /// Slots that start in the temporal dead zone (`let`, `const`, parameters).
@@ -53,7 +95,7 @@ impl ScopePlan<'_> {
     }
 
     pub fn slot_count(&self) -> usize {
-        self.bindings.len()
+        self.bindings.len() + self.extra
     }
 }
 
@@ -72,6 +114,9 @@ pub struct FunctionPlan<'a> {
     pub body: FunctionBodyPlan<'a>,
     /// Hoisted `function` declarations, evaluated at function entry.
     pub children: Vec<usize>,
+    /// Class constructors and methods lowered inside this function. They are
+    /// not hoisted: the class body creates their closures.
+    pub members: Vec<usize>,
     /// Function and arrow expressions, keyed by the address of the AST node.
     pub nested: HashMap<usize, usize>,
     /// Block scopes, keyed by the address of the block node itself.
@@ -81,6 +126,15 @@ pub struct FunctionPlan<'a> {
     /// Inner name of a named function expression, bound in the function's own
     /// environment and initialised from the call's callee value.
     pub self_binding: Option<&'a str>,
+    /// The plan that lexically encloses this one, so that an arrow inside a
+    /// method can still resolve `super`.
+    pub parent: Option<usize>,
+    /// Arrow functions inherit `this` and have no `prototype` of their own.
+    pub is_arrow: bool,
+    /// Set for a class constructor or method: where `super` is resolved.
+    pub super_home: Option<SuperHome>,
+    /// A synthesised derived-class constructor: forward `super(...arguments)`.
+    pub forwards_super: bool,
 }
 
 pub struct Program<'a> {
@@ -92,6 +146,8 @@ pub struct Program<'a> {
     pub direct_calls: DirectCallInfo<'a>,
     /// Bindings whose loads and stores cannot observe the temporal dead zone.
     pub no_tdz: HashSet<(ScopeId, usize)>,
+    /// Lowered class nodes, keyed by the address of the `Class` node.
+    pub classes: HashMap<usize, ClassPlan<'a>>,
 }
 
 impl<'a> Program<'a> {

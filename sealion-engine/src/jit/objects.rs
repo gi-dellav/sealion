@@ -31,14 +31,14 @@ use super::strings::{
     is_object, method_property, tagged_bool, tagged_null, tagged_string, tagged_undefined,
     to_js_string, with_string,
 };
-use crate::value::{PAYLOAD_MASK, TAG_FUNCTION, TAG_NULL, TAG_OBJECT, TAG_STRING};
+use crate::value::{PAYLOAD_MASK, TAG_NULL, TAG_OBJECT, TAG_STRING};
 
 /// How far a property lookup may walk a prototype chain. Cycles are refused by
 /// `Object.setPrototypeOf`/`__proto__`, so this only bounds a corrupt chain.
 const MAX_PROTOTYPE_DEPTH: usize = 1000;
 
 pub(super) struct JsObject {
-    properties: Vec<(JsString, f64)>,
+    pub(super) properties: Vec<(JsString, f64)>,
     pub(super) elements: Option<Vec<f64>>,
     /// `Some(..)` when this object is a `Map`: insertion-ordered key/value
     /// pairs compared with SameValueZero.
@@ -49,6 +49,12 @@ pub(super) struct JsObject {
     /// The object consulted when an own property is absent, or `None` to end
     /// the chain (`Object.create(null)`).
     pub(super) prototype: Option<*mut JsObject>,
+    /// Set when this object is the property bag of a function value, so that
+    /// `Object.getPrototypeOf` can map it back to the function itself.
+    pub(super) owner: Option<f64>,
+    /// Own properties that exist but are not enumerable, so `for..in` and
+    /// `Object.keys` skip them (`constructor` and a function's `prototype`).
+    pub(super) hidden: Vec<JsString>,
 }
 
 fn alloc_object(prototype: Option<*mut JsObject>) -> *mut JsObject {
@@ -58,6 +64,8 @@ fn alloc_object(prototype: Option<*mut JsObject>) -> *mut JsObject {
         entries: None,
         date: None,
         prototype,
+        owner: None,
+        hidden: Vec::new(),
     }))
 }
 
@@ -91,6 +99,8 @@ pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
         entries: None,
         date: None,
         prototype: Some(array_prototype()),
+        owner: None,
+        hidden: Vec::new(),
     }))
 }
 
@@ -101,14 +111,15 @@ pub(super) fn new_map() -> *mut JsObject {
         entries: Some(Vec::new()),
         date: None,
         prototype: Some(object_prototype()),
+        owner: None,
+        hidden: Vec::new(),
     }))
 }
 
-/// A native method bound to `env`, as the two-word record the four method
-/// tables build: `[entry point, receiver]`.
+/// A native method bound to `env`: a closure record whose first two words
+/// are `[entry point, receiver]` (see `jit::functions`).
 pub(super) fn native_function(method: Method, env: u64) -> f64 {
-    let record = Box::into_raw(Box::new([method as usize as u64, env]));
-    f64::from_bits((TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK))
+    super::functions::new_record(method as usize, env, false)
 }
 
 /// Defines (or overwrites) the own data property `key` of `object`.
@@ -121,11 +132,22 @@ pub(super) fn define_property(object: *mut JsObject, key: &str, value: f64) {
     }
 }
 
+/// Defines an own property that reads back normally but is skipped by
+/// enumeration, like a function's `prototype` or a prototype's `constructor`.
+pub(super) fn define_hidden_property(object: *mut JsObject, key: &str, value: f64) {
+    define_property(object, key, value);
+    let key = JsString::from(key);
+    let object = object_at(object);
+    if !object.hidden.contains(&key) {
+        object.hidden.push(key);
+    }
+}
+
 pub(super) fn tagged_object(pointer: *mut JsObject) -> f64 {
     f64::from_bits((TAG_OBJECT << 48) | pointer as u64)
 }
 
-fn object_pointer(value: f64) -> Option<*mut JsObject> {
+pub(super) fn object_pointer(value: f64) -> Option<*mut JsObject> {
     if !is_object(value) {
         return None;
     }
@@ -179,7 +201,7 @@ fn object_at(pointer: *mut JsObject) -> &'static mut JsObject {
 }
 
 /// `[[Get]]`: walks the prototype chain looking for an own data property.
-fn chain_get(object: f64, key: &JsString) -> Option<f64> {
+pub(super) fn chain_get(object: f64, key: &JsString) -> Option<f64> {
     let mut current = object_pointer(object);
     let mut depth = 0;
     while let Some(pointer) = current {
@@ -198,9 +220,14 @@ fn chain_get(object: f64, key: &JsString) -> Option<f64> {
 
 /// The object's prototype as a value: the prototype object, or `null`.
 fn prototype_value(object: f64) -> Option<f64> {
-    let pointer = object_pointer(object)?;
+    let pointer = object_pointer(object).or_else(|| super::functions::function_object(object))?;
     Some(match unsafe { (*pointer).prototype } {
-        Some(prototype) => tagged_object(prototype),
+        Some(prototype) => match unsafe { (*prototype).owner } {
+            // A function's property bag stands in for the function itself, so
+            // `Object.getPrototypeOf(B) === A` holds for `class B extends A`.
+            Some(owner) => owner,
+            None => tagged_object(prototype),
+        },
         None => tagged_null(),
     })
 }
@@ -224,19 +251,23 @@ fn reaches(start: *mut JsObject, target: *mut JsObject) -> bool {
 }
 
 /// `SetPrototypeOf`: an object or `null` replaces the prototype, anything else
-/// is ignored, and a cycle is refused.
+/// is ignored, and a cycle is refused. A function's prototype chain lives on its
+/// own property object, which is how `class B extends A` inherits the statics.
 fn set_prototype(object: f64, value: f64) {
-    let Some(pointer) = object_pointer(object) else {
+    let Some(pointer) =
+        object_pointer(object).or_else(|| super::functions::function_object(object))
+    else {
         return;
     };
     if value.to_bits() >> 48 == TAG_NULL {
         unsafe { (*pointer).prototype = None };
         return;
     }
-    if !is_object(value) {
-        return;
-    }
-    let prototype = (value.to_bits() & PAYLOAD_MASK) as *mut JsObject;
+    let prototype = match object_pointer(value).or_else(|| super::functions::function_object(value))
+    {
+        Some(pointer) => pointer,
+        None => return,
+    };
     if prototype == pointer || reaches(prototype, pointer) {
         return;
     }
@@ -250,7 +281,14 @@ fn own_keys(object: &JsObject) -> Vec<JsString> {
     if let Some(elements) = &object.elements {
         keys.extend((0..elements.len()).map(|index| JsString::from(index.to_string())));
     }
-    keys.extend(object.properties.iter().map(|(key, _)| key.clone()));
+    keys.extend(
+        object
+            .properties
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| !object.hidden.contains(key))
+            .cloned(),
+    );
     keys
 }
 
@@ -260,6 +298,9 @@ extern "C" fn sealion_object_new() -> u64 {
 
 extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     let key = property_key(key);
+    if super::functions::is_function(object) {
+        return function_get(object, &key);
+    }
     // Strings answer `length` here, so codegen has a single property path.
     if key == "length"
         && let Some(length) = with_string(object, |string| string.len() as f64)
@@ -291,6 +332,10 @@ pub(super) fn get_property(value: f64, key: &str) -> f64 {
 
 extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
     let key = property_key(key);
+    if super::functions::is_function(object) {
+        super::functions::set_property(object, &key, value);
+        return value;
+    }
     if key == "__proto__" {
         set_prototype(object, value);
         return value;
@@ -309,6 +354,12 @@ extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {
 
 extern "C" fn sealion_object_has(object: f64, key: f64) -> f64 {
     let key = property_key(key);
+    if super::functions::is_function(object) {
+        let has = super::functions::property(object, &key).is_some()
+            || (key == "prototype" && super::functions::is_constructible(object))
+            || super::functions::method_property(object, &key).is_some();
+        return tagged_bool(has);
+    }
     let has = chain_get(object, &key).is_some()
         || arrays::has_element(object, &key)
         || maps::method_property(object, &key).is_some()
@@ -320,6 +371,14 @@ extern "C" fn sealion_object_has(object: f64, key: f64) -> f64 {
 
 extern "C" fn sealion_object_delete(object: f64, key: f64) -> f64 {
     let key = property_key(key);
+    if super::functions::is_function(object) {
+        if let Some(properties) = super::functions::function_object(object) {
+            with_object(tagged_object(properties), |properties| {
+                properties.properties.retain(|(name, _)| *name != key);
+            });
+        }
+        return tagged_bool(true);
+    }
     arrays::delete_element(object, &key);
     with_object(object, |object| {
         object.properties.retain(|(name, _)| *name != key);
@@ -366,13 +425,7 @@ fn object_method_property(value: f64, key: &JsString) -> Option<f64> {
         return None;
     }
     let method = object_method(key)?;
-    let record = Box::into_raw(Box::new([
-        method as usize as u64,
-        value.to_bits() & PAYLOAD_MASK,
-    ]));
-    Some(f64::from_bits(
-        (TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK),
-    ))
+    Some(native_function(method, value.to_bits() & PAYLOAD_MASK))
 }
 
 fn receiver(env: i64) -> f64 {
@@ -496,6 +549,29 @@ extern "C" fn sealion_object_entries(object: f64) -> f64 {
     tagged_object(new_array(entries))
 }
 
+/// `value[key]` for a function value: its own properties, then its lazily
+/// created `prototype`, then the `Function.prototype` methods.
+fn function_get(value: f64, key: &JsString) -> f64 {
+    if let Some(found) = super::functions::property(value, key) {
+        return found;
+    }
+    if key == "prototype" && super::functions::is_constructible(value) {
+        return super::functions::ensure_prototype(value);
+    }
+    super::functions::method_property(value, key).unwrap_or_else(tagged_undefined)
+}
+
+/// Allocates the object a `new` expression fills in, with `prototype` as its
+/// prototype (falling back to `Object.prototype` for a non-object).
+extern "C" fn sealion_object_new_instance(prototype: f64) -> f64 {
+    let prototype = object_pointer(prototype).unwrap_or_else(object_prototype);
+    tagged_object(alloc_object(Some(prototype)))
+}
+
+extern "C" fn sealion_instanceof(value: f64, constructor: f64) -> f64 {
+    tagged_bool(super::functions::has_instance(value, constructor))
+}
+
 pub(super) fn lookup(name: &str) -> Option<usize> {
     Some(match name {
         "sealion_object_new" => sealion_object_new as *const () as usize,
@@ -512,6 +588,8 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         "sealion_object_keys" => sealion_object_keys as *const () as usize,
         "sealion_object_values" => sealion_object_values as *const () as usize,
         "sealion_object_entries" => sealion_object_entries as *const () as usize,
+        "sealion_object_new_instance" => sealion_object_new_instance as *const () as usize,
+        "sealion_instanceof" => sealion_instanceof as *const () as usize,
         _ => return None,
     })
 }

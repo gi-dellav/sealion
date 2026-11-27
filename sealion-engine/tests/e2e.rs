@@ -598,6 +598,40 @@ fn builtins_shadowing_and_errors() {
 }
 
 #[test]
+fn objects_classes_and_iteration_require_the_dynamic_runtime() {
+    // `for..in`, `for..of`, `class`, `super`, user-defined `new` and
+    // `instanceof` are host-runtime features: the static backend has no object
+    // model and no iterator, so each one is a clear compile error there.
+    for program in [
+        "for (var k in 1) { }",
+        "for (var v of 1) { }",
+        "for (const v of [1]) { }",
+        "class C { }",
+        "class C { } new C();",
+        "class C { m() { return super.x; } }",
+        "function f() { this.x = 1; } new f();",
+        "function f() { } f instanceof f;",
+        "var f = function () { }; f.call(undefined);",
+    ] {
+        let error = match Engine::new().compile(program) {
+            Ok(_) => panic!("{program} should need the dynamic runtime"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("dynamic runtime"),
+            "{program}: {error}"
+        );
+    }
+    // The static subset of the loop and constructor syntax keeps working.
+    assert_eq!(
+        run("var i = 0; for (;;) { i = i + 1; if (i > 2) { break; } } i;"),
+        3
+    );
+    assert_eq!(run("function f(x) { return x; } f(2);"), 2);
+    assert!(Engine::new().compile("class C { x = 1; }").is_err());
+}
+
+#[test]
 fn namespace_values_require_the_dynamic_runtime() {
     // `Math`, `String` and `Date` are objects and constructors of the dynamic
     // runtime only: the AOT backend has no JIT loader to resolve them.

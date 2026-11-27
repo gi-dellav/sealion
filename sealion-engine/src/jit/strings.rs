@@ -376,7 +376,7 @@ fn find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
 }
 
 /// The native closure for `string.method`, or `None` when the key names no
-/// method. Like the array and map closures it is a two-word record holding the
+/// method. Like the array and map closures it is a function record holding the
 /// entry point and the receiver, so `var f = s.trim` works and `this` is
 /// ignored.
 pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
@@ -384,12 +384,9 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
         return None;
     }
     let method = method(key)?;
-    let record = Box::into_raw(Box::new([
-        method as usize as u64,
+    Some(super::objects::native_function(
+        method,
         value.to_bits() & PAYLOAD_MASK,
-    ]));
-    Some(f64::from_bits(
-        (TAG_FUNCTION << 48) | (record as u64 & PAYLOAD_MASK),
     ))
 }
 

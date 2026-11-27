@@ -5,13 +5,15 @@ use oxc_ast::ast::{
     UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
+use super::class::compile_class;
 use super::expr::{compile_condition_compare, compile_expr};
 use super::flow::{
     break_target, continue_target, emit_pending_exception, emit_unwind, set_exception,
     take_exception,
 };
 use super::loops::{
-    compile_do_while, compile_for, compile_labelled, compile_switch, compile_while,
+    compile_do_while, compile_for, compile_for_in, compile_for_of, compile_labelled,
+    compile_switch, compile_while,
 };
 use super::support::{enter_scope, node_scope, store_var};
 use super::{Cleanup, CodegenCtx, ExceptionTarget, Flow, StmtOutcome};
@@ -94,6 +96,17 @@ pub(super) fn compile_statement<'a>(
         Statement::FunctionDeclaration(_)
         | Statement::EmptyStatement(_)
         | Statement::DebuggerStatement(_) => Ok(StmtOutcome::default()),
+        Statement::ClassDeclaration(class) => {
+            let value = compile_class(builder, ctx, flow, node_key(&**class))?;
+            let name = class
+                .id
+                .as_ref()
+                .ok_or_else(|| Error::Codegen("anonymous class declaration".to_string()))?;
+            store_var(builder, ctx, name.name.as_str(), value)?;
+            Ok(StmtOutcome::default())
+        }
+        Statement::ForInStatement(for_in) => compile_for_in(builder, ctx, for_in, &[], flow),
+        Statement::ForOfStatement(for_of) => compile_for_of(builder, ctx, for_of, &[], flow),
         Statement::ExpressionStatement(expr) => {
             let value = compile_expr(builder, ctx, flow, &expr.expression)?;
             Ok(StmtOutcome {

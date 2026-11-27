@@ -29,16 +29,50 @@ pub(super) fn alloc_env(
     env
 }
 
+/// A closure record: `[entry point, environment, properties, constructible]`,
+/// which is the four-word layout `jit::functions` reads and writes.
 pub(super) fn new_closure(
     builder: &mut FunctionBuilder,
     calloc_ref: FuncRef,
     code: Value,
     env: Value,
+    constructible: bool,
 ) -> Value {
-    let ptr = call_calloc(builder, calloc_ref, 16);
+    let ptr = call_calloc(builder, calloc_ref, 32);
     builder.ins().store(MemFlags::new(), code, ptr, 0i32);
     builder.ins().store(MemFlags::new(), env, ptr, 8i32);
+    let none = builder.ins().iconst(types::I64, 0);
+    builder.ins().store(MemFlags::new(), none, ptr, 16i32);
+    let flag = builder.ins().iconst(types::I64, i64::from(constructible));
+    builder.ins().store(MemFlags::new(), flag, ptr, 24i32);
     value::function(builder, ptr)
+}
+
+/// Reads an anonymous slot of an enclosing scope, walking the environment chain
+/// the way name resolution does.
+pub(super) fn hidden_value(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    owner: crate::plan::ScopeId,
+    slot: usize,
+) -> Result<Value, Error> {
+    let mut depth = 0usize;
+    let mut current = Some(ctx.scope);
+    while let Some(id) = current {
+        if id == owner {
+            let mut ptr = ctx.env;
+            for _ in 0..depth {
+                ptr = builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+            }
+            return Ok(load_at(builder, ptr, (8 + 8 * slot) as i32));
+        }
+        let scope = ctx.program.scope(id);
+        if scope.has_env() {
+            depth += 1;
+        }
+        current = scope.parent;
+    }
+    Err(Error::Codegen("missing super slot scope".to_string()))
 }
 
 pub(super) fn init_slots(builder: &mut FunctionBuilder, env: Value, scope: &ScopePlan<'_>) {

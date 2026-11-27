@@ -70,8 +70,16 @@
 - [x] `String.fromCharCode` and `String.fromCodePoint` (dynamic runtime only; an out-of-range or non-integral code point is skipped instead of raising `RangeError`)
 - [x] `Math` module — `Math` as an object of the dynamic runtime, so `var m = Math`, `var floor = Math.floor`, `Math['abs'](-1)` and `Object.keys(Math)` work; member calls keep using the inline/libm paths
 - [x] `Date` module — `new Date(...)` (no argument, a time value, a string or the year/month fields), `Date()`, `Date.now`, `Date.parse`, `Date.UTC`, `Date.prototype` and the `get*`/`getUTC*`/`setTime`/`to*String` methods (dynamic runtime only; local time comes from the system clock, and an invalid date degrades to `"Invalid Date"`/`NaN` instead of raising `RangeError`)
-- [ ] `new` and `super`
-- [ ] `for..in` and `for..of`
+- [x] `class` declarations and expressions — constructor, methods, static methods and `extends`
+- [x] `super` — `super(...)`, `super.m()` and `super.x = v`, in methods and in arrows nested in them
+- [x] `new` on user functions and classes — the receiver comes from `callee.prototype`, is passed as `this`, and is replaced only when the constructor returns an object
+- [x] `instanceof`
+- [x] `this` in constructors and methods, plus `Function.prototype.call`, `apply` and `bind`
+- [x] Function values are object-like: a four-word record whose third word is a lazily allocated property bag, so `F.count = 1`, `C.m = fn` and `f.prototype` work, and `class B extends A` inherits the statics
+- [x] Hidden (non-enumerable) properties, so `constructor` and a function's `prototype` stay out of `for..in` and `Object.keys`
+- [x] `for..in` — enumerable string keys, own first then inherited, each name once, snapshotted at loop entry
+- [x] `for..of` — arrays, strings (by code point), maps and array-likes, with a fresh binding per iteration for a `let`/`const` head
+- [x] Functions return `undefined` when they fall off the end; only the script and an arrow expression body yield a trailing expression value
 
 ### 0.9.0
 
@@ -82,5 +90,22 @@
 
 - [ ] Error handling
 - [ ] Array destructuring
+- [ ] Passing the `Acorn` and `SICP` baselines
+
+### 0.11.0
+
 - [ ] `using` keyword
-- [ ] `class` keyword and full support
+- [ ] Class fields, accessors, private members and `new.target`
+
+#### 0.11.0 (NodeJS modules)
+
+0.11.0 must ship basic implementations of:
+
+- [ ] `assert`
+- [ ] `abort`
+- [ ] `console`
+- [ ] `fs`
+- [ ] `os`
+- [ ] `process`
+- [ ] `path`
+- [ ] `util`

@@ -139,7 +139,48 @@
 //! outer loops or labelled blocks.
 //!
 //! `undefined` is a non-writable global and `debugger` is accepted as a no-op.
-//! `for..of` and `for..in` are intentionally deferred to later roadmap versions.
+//!
+//! The dynamic (JIT) runtime also supports `class` declarations and expressions
+//! (methods, static methods, `extends`, `super(...)`, `super.m()` and
+//! `super.x = v`), `new` on any function value, `instanceof`,
+//! `Function.prototype.call`/`apply`/`bind`, `for..in` and `for..of`. A class is
+//! a function value whose lazily created `prototype` object carries the instance
+//! methods; `extends` chains both `C.prototype` to `B.prototype` and `C` to `B`,
+//! so static members are inherited too, and an instance's chain makes
+//! `instanceof` work. `new` allocates the receiver from `callee.prototype`,
+//! calls the function with it as `this`, and keeps the result only when the
+//! constructor returned an object of its own.
+//!
+//! Iteration needs no iterator protocol (there is no `Symbol`). `for..in`
+//! snapshots the enumerable keys of a value — array indices ascending, then
+//! named properties in insertion order, each name once across the prototype
+//! chain — and `for..of` reads arrays, strings (by code point), maps (entry
+//! pairs) and anything with a numeric `length`; every other value contributes no
+//! iterations instead of raising a `TypeError`. Hidden properties (`constructor`
+//! on a prototype, `prototype` on a function) are skipped by both loops and by
+//! `Object.keys`.
+//!
+//! Consequences of the object model for these features:
+//!
+//! - There is no `Function.prototype` object, so `call`/`apply`/`bind` are
+//!   virtual members of function values rather than inherited properties.
+//! - A function's property bag stands in for the function in the prototype
+//!   chain, which is what makes `class B extends A` inherit `A`'s statics and
+//!   `Object.getPrototypeOf(B) === A` true.
+//! - `this` is passed through unchanged: sloppy-mode boxing (a `null` or
+//!   `undefined` receiver becoming the global object) is not implemented, and
+//!   there is no `arguments`, `new.target`, `Function` constructor, class field,
+//!   getter, setter or private member.
+//! - A function that falls off the end returns `undefined`, so `new` keeps the
+//!   receiver it allocated; only the script and an arrow expression body yield
+//!   their trailing expression value.
+//! - `super(...)` invokes the parent constructor with the already allocated
+//!   receiver rather than allocating a new one, which is equivalent for this
+//!   prototype-chain model.
+//!
+//! Classes, `super`, `new`, `instanceof`, function properties and both `for..in`
+//! and `for..of` require the dynamic runtime: the AOT backend has no object
+//! model and rejects them with an error that says so.
 
 mod builtins;
 mod compiler;
