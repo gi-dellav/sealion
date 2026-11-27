@@ -159,7 +159,7 @@ pub(super) fn for_in_keys(value: f64) -> Vec<JsString> {
                 }
             }
         }
-        for (key, _) in &object.properties {
+        for key in object.names() {
             if object.hidden.contains(key) {
                 continue;
             }

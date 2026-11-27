@@ -17,7 +17,7 @@ use sealion_string::JsString;
 use super::arrays::{arg, arg_count, is_array};
 use super::objects::with_object;
 use super::objects::{
-    JsObject, chain_get, define_hidden_property, define_property, new_object, object_pointer,
+    JsObject, chain_get, define_hidden_property, define_property_named, new_object, object_pointer,
     tagged_object,
 };
 use super::strings::{tagged_undefined, to_js_string};
@@ -84,7 +84,7 @@ pub(super) fn property(value: f64, key: &JsString) -> Option<f64> {
 /// Defines `value[key]` on a function's own properties.
 pub(super) fn set_property(value: f64, key: &JsString, property: f64) {
     if let Some(object) = function_object(value) {
-        define_property(object, &key.to_std_string_lossy(), property);
+        define_property_named(object, key, property);
     }
 }
 
@@ -118,11 +118,15 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
 }
 
 fn method(key: &JsString) -> Option<Method> {
-    Some(match key.to_std_string_lossy().as_str() {
-        "call" => call,
-        "apply" => apply,
-        "bind" => bind,
-        "toString" => to_string,
+    super::strings::with_ascii_key(key, method_named)?
+}
+
+fn method_named(name: &[u8]) -> Option<Method> {
+    Some(match name {
+        b"call" => call,
+        b"apply" => apply,
+        b"bind" => bind,
+        b"toString" => to_string,
         _ => return None,
     })
 }

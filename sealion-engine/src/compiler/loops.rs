@@ -264,8 +264,7 @@ fn assign_iteration_value<'a>(
         }
         ForStatementLeft::StaticMemberExpression(access) => {
             let object = compile_expr(builder, ctx, flow, &access.object)?;
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            object::set(builder, ctx, object, key, value)?;
+            object::set_named(builder, ctx, object, access.property.name.as_str(), value)?;
         }
         ForStatementLeft::ComputedMemberExpression(member) => {
             let object = compile_expr(builder, ctx, flow, &member.object)?;

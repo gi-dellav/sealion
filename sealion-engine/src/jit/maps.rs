@@ -53,16 +53,20 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
 }
 
 fn method(key: &JsString) -> Option<Method> {
-    Some(match key.to_std_string_lossy().as_str() {
-        "get" => get,
-        "set" => set,
-        "has" => has,
-        "delete" => delete,
-        "clear" => clear,
-        "forEach" => for_each,
-        "keys" => keys,
-        "values" => values,
-        "entries" => entries,
+    super::strings::with_ascii_key(key, method_named)?
+}
+
+fn method_named(name: &[u8]) -> Option<Method> {
+    Some(match name {
+        b"get" => get,
+        b"set" => set,
+        b"has" => has,
+        b"delete" => delete,
+        b"clear" => clear,
+        b"forEach" => for_each,
+        b"keys" => keys,
+        b"values" => values,
+        b"entries" => entries,
         _ => return None,
     })
 }

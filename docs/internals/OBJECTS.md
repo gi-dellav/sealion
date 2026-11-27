@@ -17,20 +17,29 @@ Objects participate in the NaN-boxing scheme described in
 +------------------------+-----------------------------------+
 ```
 
-Codegen never inspects the payload. Every read, write, `in` and `delete` is a
-call to an `extern "C"` host helper declared in `builtins::Builtins::new` and
-resolved by the JIT loader through `jit::objects::lookup`. The ABI is uniform:
-`f64` in, `f64` out, with `sealion_object_new` returning the raw pointer bits
-that codegen wraps with `value::object`.
+Codegen does not interpret the payload beyond two loads, and only for a
+statically named access: a read or write of `o.a` compares the receiver's shape
+against the site's inline cache and indexes the slot array directly (see
+[`INLINE_CACHES.md`](INLINE_CACHES.md)); every other read, write, `in` and
+`delete` — a computed key, a different shape, a string or function receiver —
+is a call to an `extern "C"` host helper declared in `builtins::Builtins::new`
+and resolved by the JIT loader through `jit::objects::lookup`. The call ABI is
+uniform: `f64` in, `f64` out, with `sealion_object_new` returning the raw pointer
+bits that codegen wraps with `value::object`.
 
 ## 2. The `JsObject` heap block
 
 ```rust
+#[repr(C)]
 pub(super) struct JsObject {
-    properties: Vec<(JsString, f64)>,       // insertion-ordered named properties
-    pub(super) elements: Option<Vec<f64>>,  // dense index range: arrays
+    pub(super) shape: *const Shape,              // the own property layout
+    pub(super) slots: Slots,                     // the own property values
+    pub(super) elements: Option<Vec<f64>>,       // dense index range: arrays
     pub(super) entries: Option<Vec<(f64, f64)>>, // key/value pairs: Map
+    pub(super) date: Option<f64>,                // time value: Date
     pub(super) prototype: Option<*mut JsObject>,
+    pub(super) owner: Option<f64>,
+    pub(super) hidden: Vec<JsString>,
 }
 ```
 
@@ -43,10 +52,13 @@ than by a tag or a class pointer:
 | Array (`[]`) | `Some` | `None` | `Array.prototype` |
 | Map (`new Map()`) | `None` | `Some` | `Object.prototype` |
 
-Named properties always live in `properties`. `elements` and `entries` only add
-the shape-specific storage; both fall back to `properties` for ordinary keys.
-Nothing is ever freed: there is no garbage collector, so objects leak for the
-lifetime of the process exactly like closure environment records.
+Named properties always live in the slot array, described by the object's
+[`Shape`](INLINE_CACHES.md): `shape.names[i]` names the value at `slots[i]`, and
+two objects built by the same sequence of property definitions share one shape
+pointer. `elements` and `entries` only add the shape-specific storage; both fall
+back to the slots for ordinary keys. Nothing is ever freed: there is no garbage
+collector, so objects leak for the lifetime of the process exactly like closure
+environment records, and so do shapes.
 
 Property keys are canonicalised through `ToPropertyKey`
 (`objects::property_key`): a string key is kept, every other value is converted
@@ -88,7 +100,8 @@ that `new_object`/`new_array` use.
 
 ### 4.1 Reads (`[[Get]]`)
 
-`sealion_object_get(object, key)` evaluates, in order:
+`sealion_object_get(object, key)` is the call path; a statically named site
+usually answers from its inline cache first. The helper evaluates, in order:
 
 1. `string.length` for a string receiver — strings are primitives but answer
    `length` through the same code path.
@@ -98,7 +111,8 @@ that `new_object`/`new_array` use.
      index at or past the length is **absent**, so the walk continues into the
      prototype.
    * `entries`: the map `size`.
-   * `properties`: the ordinary name/value table.
+   * `slots`: the ordinary own properties, found by scanning `shape.names` (a
+     cache hit skips the scan entirely).
 3. `__proto__`: return the receiver's prototype object, or `null`.
 4. Virtual methods, in this order: `Map` methods, array methods, then
    `Object.prototype` methods. String methods are the last fallback for a string
@@ -113,7 +127,8 @@ instead of throwing.
 
 1. `key === "__proto__"` replaces the prototype (section 5) and returns `value`.
 2. `arrays::set_element` handles `length` and index writes.
-3. Otherwise it updates an existing own property or appends a new one.
+3. Otherwise it updates an existing slot, or appends a slot and moves the
+   receiver to the shape that has the new name last.
 
 Writes never traverse the prototype chain: assigning to an inherited name
 creates an own property on the receiver, shadowing the inherited value. There
@@ -165,6 +180,9 @@ this)`, so `var push = a.push` keeps working and `this` is the receiver bound at
 the moment the method was read. These virtual methods are consulted **after**
 the prototype chain, which means a user assignment to `Array.prototype.push`
 creates a real own property on the singleton and shadows the built-in.
+
+The name is matched as a byte slice through `strings::with_ascii_key`, so a miss
+does not decode the key into a `String` (`INLINE_CACHES.md` §6).
 
 `Object.prototype`'s own methods are implemented the same way for every object
 whose chain includes `Object.prototype`:
@@ -257,13 +275,16 @@ only:
 * `length`/`size` are not enumerable keys.
 
 `Object.keys` returns a real array (chained to `Array.prototype`), so it supports
-`.length`, `.map`, and so on.
+`.length`, `.map`, and so on. Slots are stored in shape order, which is
+insertion order, so the enumeration order the old name/value table produced is
+unchanged.
 
 ## 11. Object literals
 
 `compiler::object.rs` compiles `{ ... }` by calling `sealion_object_new` and then
-`sealion_object_set` for each property in source order, so insertion order and
-evaluation order both match the specification. `{__proto__: proto}` needs no
+setting each property in source order (through `set_named` when the name is
+static), so insertion order, evaluation order and the shape transitions all
+match the specification. `{__proto__: proto}` needs no
 special case at the AST level: it compiles to a `set` on the `"__proto__"` key,
 which `sealion_object_set` interprets as a prototype assignment. Object spread
 and getter/setter literals are still rejected at compile time.
@@ -318,8 +339,13 @@ for the pair to fit in one `env` word: `[ entry point , Box<(receiver, index)> ]
   `for..in` over a function enumerates the bag's own keys.
 * Built-in array/map/string methods live in native tables, so they are not
   visible as own properties of `Array.prototype`/`Map.prototype`.
-* No garbage collection; prototype singletons and every allocated object live
-  forever.
+* No garbage collection; prototype singletons, every allocated object and every
+  shape live forever.
+* The inline cache is monomorphic and only covers statically named reads and
+  writes: a site that alternates between several shapes refills its cell each
+  time, and a computed (`o[k]`) access always takes the call path. There is no
+  dictionary mode, so an object that keeps gaining and losing properties keeps
+  building new shapes.
 * `Object.create(proto)` returns `undefined` for a non-object, non-`null`
   argument instead of throwing a `TypeError`; prototype cycles are refused
   silently for the same reason — the runtime has no exception path out of a host

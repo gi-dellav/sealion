@@ -36,6 +36,14 @@ const TWO_POW_32: f64 = 4_294_967_296.0;
 
 pub(crate) const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
+/// Byte offset of `jit::objects::JsObject::shape`. A compiled access site loads
+/// the receiver's shape from here and compares it with its cached one;
+/// `jit::objects` asserts that the field really is at this offset.
+pub const OBJECT_SHAPE_OFFSET: i32 = 0;
+/// Byte offset of `jit::objects::JsObject::slots`. The first word there is the
+/// `Vec<f64>` data pointer that holds the property values.
+pub const OBJECT_SLOTS_OFFSET: i32 = 8;
+
 /// Runtime entry points that implement string semantics.
 ///
 /// The AOT backend leaves this unset and rejects string literals; the dynamic
@@ -43,6 +51,8 @@ pub(crate) const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 #[derive(Clone, Copy)]
 pub struct StringOps {
     pub from_utf8: FuncRef,
+    /// Resolves a literal's interned `JsString` through the site's cache slot.
+    pub key: FuncRef,
     pub add: FuncRef,
     pub strict_equal: FuncRef,
     pub loose_equal: FuncRef,
@@ -73,6 +83,11 @@ pub struct ObjectOps {
     pub new: FuncRef,
     pub get: FuncRef,
     pub set: FuncRef,
+    /// `get`/`set` on an inline-cache miss: they also record the receiver's
+    /// shape and slot when the key is an own slot, so the compiled fast path
+    /// can answer the next access without a call.
+    pub get_cached: FuncRef,
+    pub set_cached: FuncRef,
     pub has: FuncRef,
     pub delete: FuncRef,
     /// Allocates the receiver of a `new` expression from a prototype value.
@@ -186,6 +201,11 @@ pub fn is_boolean(builder: &mut FunctionBuilder, value: Value) -> Value {
 
 pub fn is_function(builder: &mut FunctionBuilder, value: Value) -> Value {
     tag_is(builder, value, TAG_FUNCTION)
+}
+
+/// `true` when the value is an object, i.e. a `JsObject` pointer.
+pub fn is_object(builder: &mut FunctionBuilder, value: Value) -> Value {
+    tag_is(builder, value, TAG_OBJECT)
 }
 
 /// `true` when the value is an object or a function.

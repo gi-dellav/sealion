@@ -63,14 +63,16 @@ pub(super) fn compile_string_data(
     let ops = ctx.strings.as_ref().ok_or_else(|| {
         Error::Unsupported("string values require the dynamic runtime".to_string())
     })?;
-    let (pointer, len) = *ctx
+    let (pointer, len, slot) = *ctx
         .string_literals
         .get(text)
         .ok_or_else(|| Error::Codegen("missing string literal data".to_string()))?;
     let len = builder.ins().iconst(types::I64, len);
-    let call = builder.ins().call(ops.from_utf8, &[pointer, len]);
-    let raw = builder.inst_results(call)[0];
-    Ok(value::string(builder, raw))
+    // The helper returns the literal's interned value, or interns it once and
+    // records it in the site's cache slot, so a literal in a loop is not
+    // re-interpreted on every evaluation.
+    let call = builder.ins().call(ops.key, &[slot, pointer, len]);
+    Ok(builder.inst_results(call)[0])
 }
 
 fn compile_template<'a>(
@@ -704,6 +706,38 @@ pub(super) fn compile_delete<'a>(
     }
 }
 
+/// The key of a member assignment: a name the compiler knows, which can take an
+/// inline cache, or a value computed at run time.
+enum MemberKey<'a> {
+    Named(&'a str),
+    Value(Value),
+}
+
+fn get_member(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    object: Value,
+    key: &MemberKey<'_>,
+) -> Result<Value, Error> {
+    match key {
+        MemberKey::Named(name) => object::get_named(builder, ctx, object, name),
+        MemberKey::Value(key) => object::get(builder, ctx, object, *key),
+    }
+}
+
+fn set_member(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'_>,
+    object: Value,
+    key: &MemberKey<'_>,
+    value: Value,
+) -> Result<Value, Error> {
+    match key {
+        MemberKey::Named(name) => object::set_named(builder, ctx, object, name, value),
+        MemberKey::Value(key) => object::set(builder, ctx, object, *key, value),
+    }
+}
+
 pub(super) fn compile_assign<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -717,29 +751,27 @@ pub(super) fn compile_assign<'a>(
             if super::class::is_super(&access.object) =>
         {
             let object = super::support::load_var(builder, ctx, "this")?;
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            (object, key)
+            (object, MemberKey::Named(access.property.name.as_str()))
         }
         AssignmentTarget::StaticMemberExpression(access) => {
             let object = compile_expr(builder, ctx, flow, &access.object)?;
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            (object, key)
+            (object, MemberKey::Named(access.property.name.as_str()))
         }
         AssignmentTarget::ComputedMemberExpression(member)
             if super::class::is_super(&member.object) =>
         {
             let object = super::support::load_var(builder, ctx, "this")?;
             let key = compile_expr(builder, ctx, flow, &member.expression)?;
-            (object, key)
+            (object, MemberKey::Value(key))
         }
         AssignmentTarget::ComputedMemberExpression(member) => {
             let object = compile_expr(builder, ctx, flow, &member.object)?;
             let key = compile_expr(builder, ctx, flow, &member.expression)?;
-            (object, key)
+            (object, MemberKey::Value(key))
         }
         _ => return compile_variable_assign(builder, ctx, flow, assign),
     };
-    compile_member_assign(builder, ctx, flow, assign, object, key)
+    compile_member_assign(builder, ctx, flow, assign, object, &key)
 }
 
 /// Assigns to `object[key]`, honouring the compound and logical forms.
@@ -749,12 +781,12 @@ fn compile_member_assign<'a>(
     flow: &mut Flow<'a>,
     assign: &'a AssignmentExpression<'a>,
     object: Value,
-    key: Value,
+    key: &MemberKey<'_>,
 ) -> Result<Value, Error> {
     let op = assign.operator;
     if op == AssignmentOperator::Assign {
         let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
-        return object::set(builder, ctx, object, key, rhs);
+        return set_member(builder, ctx, object, key, rhs);
     }
 
     let short_circuit = match op {
@@ -764,7 +796,7 @@ fn compile_member_assign<'a>(
         _ => None,
     };
     if let Some((rhs_when_truthy, use_truthy)) = short_circuit {
-        let old = object::get(builder, ctx, object, key)?;
+        let old = get_member(builder, ctx, object, key)?;
         let cond = if use_truthy {
             value::truthy(builder, old, ctx.strings.as_ref())
         } else {
@@ -783,7 +815,7 @@ fn compile_member_assign<'a>(
 
         builder.switch_to_block(rhs_block);
         let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
-        object::set(builder, ctx, object, key, rhs)?;
+        set_member(builder, ctx, object, key, rhs)?;
         builder.def_var(result_var, rhs);
         builder.ins().jump(join_block, &[]);
 
@@ -792,7 +824,7 @@ fn compile_member_assign<'a>(
     }
 
     // The old value is read before the right-hand side is evaluated.
-    let old = object::get(builder, ctx, object, key)?;
+    let old = get_member(builder, ctx, object, key)?;
     let rhs = compile_expr(builder, ctx, flow, &assign.right)?;
     let binary = op
         .to_binary_operator()
@@ -810,7 +842,7 @@ fn compile_member_assign<'a>(
     } else {
         compile_bitwise(builder, ctx, binary, old, rhs)
     };
-    object::set(builder, ctx, object, key, value)
+    set_member(builder, ctx, object, key, value)
 }
 
 fn compile_variable_assign<'a>(
@@ -921,24 +953,23 @@ pub(super) fn compile_update<'a>(
     let (object, key) = match &update.argument {
         SimpleAssignmentTarget::StaticMemberExpression(access) => {
             let object = compile_expr(builder, ctx, flow, &access.object)?;
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            (object, key)
+            (object, MemberKey::Named(access.property.name.as_str()))
         }
         SimpleAssignmentTarget::ComputedMemberExpression(member) => {
             let object = compile_expr(builder, ctx, flow, &member.object)?;
             let key = compile_expr(builder, ctx, flow, &member.expression)?;
-            (object, key)
+            (object, MemberKey::Value(key))
         }
         _ => return compile_variable_update(builder, ctx, update),
     };
-    let old = object::get(builder, ctx, object, key)?;
+    let old = get_member(builder, ctx, object, &key)?;
     let old = number_value(builder, old, false, ctx.strings.as_ref());
     let one = builder.ins().f64const(1.0);
     let new_value = match update.operator {
         UpdateOperator::Increment => builder.ins().fadd(old, one),
         UpdateOperator::Decrement => builder.ins().fsub(old, one),
     };
-    object::set(builder, ctx, object, key, new_value)?;
+    set_member(builder, ctx, object, &key, new_value)?;
     Ok(if update.prefix { new_value } else { old })
 }
 

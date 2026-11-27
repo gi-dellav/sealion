@@ -107,8 +107,7 @@ pub(super) fn compile_chain_static_member<'a>(
     if ctx.objects.is_none() {
         return Ok(value::undefined(builder));
     }
-    let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-    object::get(builder, ctx, object, key)
+    object::get_named(builder, ctx, object, access.property.name.as_str())
 }
 
 pub(super) fn compile_chain_computed_member<'a>(
@@ -156,8 +155,7 @@ fn compile_chain_callee<'a>(
             if ctx.objects.is_none() {
                 return Ok((value::undefined(builder), receiver));
             }
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            let callee = object::get(builder, ctx, receiver, key)?;
+            let callee = object::get_named(builder, ctx, receiver, access.property.name.as_str())?;
             Ok((callee, receiver))
         }
         Expression::ComputedMemberExpression(member) => {

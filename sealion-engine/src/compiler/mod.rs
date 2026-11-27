@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     rc::Rc,
 };
@@ -42,6 +43,25 @@ use support::{
     alloc_env, declare_vars, hidden_value, init_local_slots, init_slots, new_closure, store_var,
 };
 
+/// Bytes per inline cache: the receiver shape and the slot index it served.
+pub const INLINE_CACHE_SIZE: usize = 16;
+/// The pool is sized from the module instead of being a fixed constant, so a
+/// small program does not carry a large zeroed data section in its artifact.
+pub const INLINE_CACHE_MIN_SLOTS: usize = 256;
+pub const INLINE_CACHE_MAX_SLOTS: usize = 4096;
+
+/// Eight access sites per distinct string literal, clamped. A module with more
+/// statically named sites than this keeps the rest on the call path.
+pub fn inline_cache_slots(strings: usize) -> usize {
+    strings
+        .saturating_mul(8)
+        .clamp(INLINE_CACHE_MIN_SLOTS, INLINE_CACHE_MAX_SLOTS)
+}
+
+pub fn inline_cache_bytes(slots: usize) -> usize {
+    slots * INLINE_CACHE_SIZE
+}
+
 #[derive(Clone)]
 struct CodegenCtx<'a> {
     program: &'a Program<'a>,
@@ -61,7 +81,12 @@ struct CodegenCtx<'a> {
     strings: Option<value::StringOps>,
     objects: Option<value::ObjectOps>,
     arrays: Option<value::ArrayOps>,
-    string_literals: Rc<HashMap<String, (Value, i64)>>,
+    /// The address, length and interned-value cache slot of every literal.
+    string_literals: Rc<HashMap<String, (Value, i64, Value)>>,
+    /// The module's inline-cache pool base and the next free slot.
+    inline_caches: Option<(Value, Rc<Cell<usize>>)>,
+    /// How many cells that pool holds.
+    inline_cache_slots: usize,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -86,13 +111,32 @@ impl<'a> CodegenCtx<'a> {
             objects: self.objects,
             arrays: self.arrays,
             string_literals: Rc::clone(&self.string_literals),
+            inline_caches: self.inline_caches.clone(),
+            inline_cache_slots: self.inline_cache_slots,
         }
+    }
+
+    /// The address of a fresh inline-cache cell, or `None` once the module's
+    /// pool is exhausted (the access then stays on the call path).
+    fn inline_cache(&self, builder: &mut FunctionBuilder) -> Option<Value> {
+        let (base, next) = self.inline_caches.as_ref()?;
+        let index = next.get();
+        if index >= self.inline_cache_slots {
+            return None;
+        }
+        next.set(index + 1);
+        Some(
+            builder
+                .ins()
+                .iadd_imm(*base, (index * INLINE_CACHE_SIZE) as i64),
+        )
     }
 }
 
 fn string_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::StringOps> {
     Some(value::StringOps {
         from_utf8: *refs.get("sealion_string_from_utf8")?,
+        key: *refs.get("sealion_string_key")?,
         add: *refs.get("sealion_string_add")?,
         strict_equal: *refs.get("sealion_string_strict_equal")?,
         loose_equal: *refs.get("sealion_string_loose_equal")?,
@@ -115,6 +159,8 @@ fn object_ops(refs: &HashMap<&'static str, FuncRef>) -> Option<value::ObjectOps>
         new: *refs.get("sealion_object_new")?,
         get: *refs.get("sealion_object_get")?,
         set: *refs.get("sealion_object_set")?,
+        get_cached: *refs.get("sealion_object_get_cached")?,
+        set_cached: *refs.get("sealion_object_set_cached")?,
         has: *refs.get("sealion_object_has")?,
         delete: *refs.get("sealion_object_delete")?,
         new_instance: *refs.get("sealion_object_new_instance")?,
@@ -186,6 +232,11 @@ pub struct Imports {
     pub pow: FuncId,
     pub fmod: FuncId,
     pub exception: DataId,
+    /// The writable pool of per-site inline caches; `None` without the dynamic
+    /// runtime, where property access does not exist.
+    pub inline_caches: Option<DataId>,
+    /// Cells in that pool, from [`inline_cache_slots`].
+    pub inline_cache_slots: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,10 +248,12 @@ pub fn compile_functions<'a>(
     imports: &Imports,
     builtins: &'a Builtins,
     string_ids: &HashMap<String, DataId>,
+    key_ids: &HashMap<String, DataId>,
     dynamic: bool,
 ) -> Result<Vec<IrFunction>, Error> {
     let numeric = analyze_numeric_bindings(program, builtins);
     let mut raws = Vec::new();
+    let next_inline_cache = Rc::new(Cell::new(0));
 
     for plan in &program.functions {
         let mut func =
@@ -222,13 +275,22 @@ pub fn compile_functions<'a>(
             child_refs.insert(child, child_ref);
         }
 
-        let string_data: Vec<(String, cranelift_codegen::ir::GlobalValue, i64)> = string_ids
+        let string_data: Vec<(
+            String,
+            cranelift_codegen::ir::GlobalValue,
+            i64,
+            cranelift_codegen::ir::GlobalValue,
+        )> = string_ids
             .iter()
             .map(|(text, &id)| {
                 let data = module.declare_data_in_func(id, &mut func);
-                (text.clone(), data, text.len() as i64)
+                let slot = module.declare_data_in_func(key_ids[text], &mut func);
+                (text.clone(), data, text.len() as i64, slot)
             })
             .collect();
+        let inline_cache_data = imports
+            .inline_caches
+            .map(|id| module.declare_data_in_func(id, &mut func));
 
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
@@ -243,14 +305,19 @@ pub fn compile_functions<'a>(
         let self_param = builder.block_params(entry)[2];
         let this_param = builder.block_params(entry)[3];
         let exception = builder.ins().global_value(types::I64, exception_global);
-        let string_literals: HashMap<String, (Value, i64)> = string_data
+        let string_literals: HashMap<String, (Value, i64, Value)> = string_data
             .into_iter()
-            .map(|(text, data, len)| {
+            .map(|(text, data, len, slot)| {
                 let pointer = builder.ins().global_value(types::I64, data);
-                (text, (pointer, len))
+                let slot = builder.ins().global_value(types::I64, slot);
+                (text, (pointer, len, slot))
             })
             .collect();
         let string_literals = Rc::new(string_literals);
+        let inline_caches = inline_cache_data.map(|data| {
+            let base = builder.ins().global_value(types::I64, data);
+            (base, Rc::clone(&next_inline_cache))
+        });
         let strings = if dynamic {
             Some(
                 string_ops(&builtin_refs)
@@ -305,6 +372,8 @@ pub fn compile_functions<'a>(
             objects,
             arrays,
             string_literals,
+            inline_caches,
+            inline_cache_slots: imports.inline_cache_slots,
         };
 
         let mut flow = Flow::new();

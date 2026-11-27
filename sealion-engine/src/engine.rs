@@ -295,6 +295,7 @@ impl Engine {
         let builtins = builtins::Builtins::new(&mut module, dynamic)?;
 
         let mut string_ids = HashMap::new();
+        let mut key_ids = HashMap::new();
         if dynamic {
             for (index, text) in program.strings.iter().enumerate() {
                 let name = format!("__string_{index}");
@@ -304,8 +305,35 @@ impl Engine {
                 data.set_align(1);
                 module.define_data(id, &data)?;
                 string_ids.insert(text.clone(), id);
+
+                // One writable word per literal holds its interned value once
+                // the program has materialised it, so a literal used in a loop
+                // is resolved without probing the static string table again.
+                let slot = module.declare_data(
+                    &format!("__string_key_{index}"),
+                    Linkage::Local,
+                    true,
+                    false,
+                )?;
+                let mut data = DataDescription::new();
+                data.define_zeroinit(8);
+                data.set_align(8);
+                module.define_data(slot, &data)?;
+                key_ids.insert(text.clone(), slot);
             }
         }
+
+        let inline_cache_slots = compiler::inline_cache_slots(program.strings.len());
+        let inline_caches = if dynamic {
+            let id = module.declare_data("sealion_inline_caches", Linkage::Local, true, false)?;
+            let mut data = DataDescription::new();
+            data.define_zeroinit(compiler::inline_cache_bytes(inline_cache_slots));
+            data.set_align(8);
+            module.define_data(id, &data)?;
+            Some(id)
+        } else {
+            None
+        };
 
         let js_sig = compiler::make_js_signature(&module);
         let calloc_sig = compiler::make_calloc_signature(&module);
@@ -334,6 +362,8 @@ impl Engine {
             pow: pow_id,
             fmod: fmod_id,
             exception: exception_id,
+            inline_caches,
+            inline_cache_slots,
         };
         let mut functions = compiler::compile_functions(
             &mut module,
@@ -343,6 +373,7 @@ impl Engine {
             &imports,
             &builtins,
             &string_ids,
+            &key_ids,
             dynamic,
         )?;
         functions.push(compiler::compile_main(

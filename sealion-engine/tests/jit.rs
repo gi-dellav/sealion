@@ -267,6 +267,84 @@ fn object_property_writes_updates_and_delete() {
 }
 
 #[test]
+fn inline_cached_property_accesses_stay_correct() {
+    // A site that saw one shape must still answer for another.
+    assert_eq!(
+        run("function read(o) { return o.a; } read({a: 1}) * 10 + read({a: 2, b: 3});"),
+        12
+    );
+    // The same site, alternating between shapes.
+    assert_eq!(
+        run(
+            "function read(o) { return o.a; } var s = 0; var i = 0; while (i < 4) { s = s + read(i % 2 === 0 ? {a: 1} : {a: 2, b: 0}); i = i + 1; } s;"
+        ),
+        6
+    );
+    // A cached own property, then the same name from the prototype chain.
+    assert_eq!(
+        run(
+            "function read(o) { return o.a; } var proto = {a: 5}; var child = Object.create(proto); child.a = 1; var first = read(child); delete child.a; first * 10 + read(child);"
+        ),
+        15
+    );
+    // Growth past the initial slot capacity keeps the layout in step.
+    assert_eq!(
+        run(
+            "var o = {}; var i = 0; while (i < 12) { o['k' + i] = i; i = i + 1; } var s = 0; var j = 0; while (j < 12) { s = s + o['k' + j]; j = j + 1; } s;"
+        ),
+        66
+    );
+    // Writes at a cached site still append, and still reject `__proto__`.
+    assert_eq!(run("var o = {}; o.a = 1; o.b = 2; o.a + o.b;"), 3);
+    assert_eq!(run("var p = {z: 9}; var o = {}; o.__proto__ = p; o.z;"), 9);
+    // An array and a plain object at the same site answer their own kinds.
+    assert_eq!(
+        run("function read(o) { return o.length; } read([1, 2, 3]) * 10 + read({length: 4});"),
+        34
+    );
+    // Compound assignment, update and a member loop head at the same sites.
+    assert_eq!(run("var o = {n: 1}; o.n += 2; o.n *= 2; o.n;"), 6);
+    assert_eq!(
+        run("var a = [1, 2]; var o = {}; for (o.v of a) { } o.v;"),
+        2
+    );
+    assert_eq!(
+        run("var a = [1, 2]; var n = 0; for (a.n of a) { n = n + 1; } n;"),
+        2
+    );
+}
+
+#[test]
+fn accesses_past_the_inline_cache_pool_still_work() {
+    // More statically named sites than the module's cache pool holds: the extra
+    // sites are compiled as plain calls and must behave identically.
+    let mut js = String::from("var o = {a: 0}; ");
+    for _ in 0..300 {
+        js.push_str("o.a = o.a + 1; ");
+    }
+    js.push_str("o.a;");
+    assert_eq!(run(&js), 300);
+}
+
+#[test]
+fn method_names_are_matched_without_decoding_the_key() {
+    // A key built from code units names the same method as a literal.
+    assert_eq!(
+        run(
+            "var a = [1]; var f = a[String.fromCharCode(112, 117, 115, 104)]; f.call(a, 2); a.length;"
+        ),
+        2
+    );
+    // A name that only `Object.prototype` has still binds, as it always did.
+    assert_eq!(run(r#"var a = [1]; a.hasOwnProperty(0) ? 1 : 2;"#), 1);
+    assert_eq!(run("var o = {a: 1}; o[String.fromCharCode(97)];"), 1);
+    // A non-ASCII key names neither a method nor an element.
+    assert_eq!(run(r#"var a = [1]; a["\u00e9"] === undefined ? 1 : 2;"#), 1);
+    assert_eq!(run(r#"var a = []; a["01"] === undefined ? 1 : 2;"#), 1);
+    assert_eq!(run("var a = [7]; a[0] + a['0'];"), 14);
+}
+
+#[test]
 fn object_identity_truthiness_and_chaining() {
     assert_eq!(run("var o = {}; o === o ? 1 : 2;"), 1);
     assert_eq!(run("var o = {}; o === {} ? 1 : 2;"), 2);

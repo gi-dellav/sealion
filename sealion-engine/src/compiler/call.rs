@@ -206,8 +206,7 @@ pub(super) fn compile_property_access<'a>(
         // Without objects a property read is always `undefined`.
         return Ok(value::undefined(builder));
     }
-    let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-    object::get(builder, ctx, object, key)
+    object::get_named(builder, ctx, object, access.property.name.as_str())
 }
 
 /// `object[key]`, where both sides are arbitrary expressions.
@@ -292,8 +291,7 @@ pub(super) fn compile_call<'a>(
         }
         Expression::StaticMemberExpression(access) => {
             let receiver = compile_expr(builder, ctx, flow, &access.object)?;
-            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
-            let callee = object::get(builder, ctx, receiver, key)?;
+            let callee = object::get_named(builder, ctx, receiver, access.property.name.as_str())?;
             return compile_call_value(builder, ctx, flow, callee, receiver, &call.arguments);
         }
         Expression::ComputedMemberExpression(member) => {

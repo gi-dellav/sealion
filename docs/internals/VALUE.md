@@ -664,6 +664,7 @@ The value domain is deliberately narrow:
 | Exception state | `sealion-engine/src/engine.rs:265`, `sealion-engine/src/compiler/flow.rs:56` |
 | Closure and environment layout | [CLOSURE.md](CLOSURE.md) |
 | Object model (dynamic backend) | `sealion-engine/src/jit/objects.rs`, `sealion-engine/src/compiler/object.rs` |
+| Constant keys, shapes and inline caches | [INLINE_CACHES.md](INLINE_CACHES.md) |
 | Array model (dynamic backend) | `sealion-engine/src/jit/arrays.rs`, `sealion-engine/src/compiler/array.rs` |
 | String model (dynamic backend) | `sealion-engine/src/jit/strings.rs` |
 

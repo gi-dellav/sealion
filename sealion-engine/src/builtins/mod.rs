@@ -144,6 +144,10 @@ impl Builtins {
             &string_from_utf8_sig,
         )?;
         funcs.insert("sealion_string_from_utf8", from_utf8_id);
+        let string_key_sig = make_i64_ternary_to_f64_signature(module);
+        let key_id =
+            module.declare_function("sealion_string_key", Linkage::Import, &string_key_sig)?;
+        funcs.insert("sealion_string_key", key_id);
         let f64_predicate_sig = make_f64_predicate_signature(module);
         let truthy_id = module.declare_function(
             "sealion_string_truthy",
@@ -193,6 +197,20 @@ impl Builtins {
             let set_id =
                 module.declare_function("sealion_object_set", Linkage::Import, &ternary_sig)?;
             funcs.insert("sealion_object_set", set_id);
+            let get_cached_sig = make_f64_pair_i64_to_f64_signature(module);
+            let get_cached_id = module.declare_function(
+                "sealion_object_get_cached",
+                Linkage::Import,
+                &get_cached_sig,
+            )?;
+            funcs.insert("sealion_object_get_cached", get_cached_id);
+            let set_cached_sig = make_f64_triple_i64_to_f64_signature(module);
+            let set_cached_id = module.declare_function(
+                "sealion_object_set_cached",
+                Linkage::Import,
+                &set_cached_sig,
+            )?;
+            funcs.insert("sealion_object_set_cached", set_cached_id);
 
             // `new`, `instanceof` and the `for..in` / `for..of` host helpers.
             let unary_sig = make_f64_unary_signature(module);
@@ -444,6 +462,37 @@ fn make_nullary_i64_signature(module: &mut ObjectModule) -> Signature {
 
 fn make_i64_to_f64_signature(module: &mut ObjectModule) -> Signature {
     let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
+/// `(i64, i64, i64) -> f64`, for the literal-key cache.
+fn make_i64_ternary_to_f64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    for _ in 0..3 {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
+/// `(f64, f64, i64) -> f64`, for a cached property read.
+fn make_f64_pair_i64_to_f64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::F64));
+    sig
+}
+
+/// `(f64, f64, f64, i64) -> f64`, for a cached property write.
+fn make_f64_triple_i64_to_f64_signature(module: &mut ObjectModule) -> Signature {
+    let mut sig = module.make_signature();
+    for _ in 0..3 {
+        sig.params.push(AbiParam::new(types::F64));
+    }
     sig.params.push(AbiParam::new(types::I64));
     sig.returns.push(AbiParam::new(types::F64));
     sig

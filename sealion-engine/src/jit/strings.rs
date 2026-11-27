@@ -8,7 +8,7 @@
 
 use std::{cmp::Ordering, io::Write, mem::ManuallyDrop, ptr::NonNull, str, sync::OnceLock};
 
-use sealion_string::{CodePoint, JsString, RawJsString};
+use sealion_string::{CodePoint, JsStrVariant, JsString, RawJsString};
 
 use super::arrays::{arg, arg_count, call};
 use super::objects::{define_property, native_function, new_array, new_object, tagged_object};
@@ -17,7 +17,7 @@ use crate::value::{
     TAG_UNINITIALIZED,
 };
 
-fn string_pointer(value: f64) -> Option<NonNull<RawJsString>> {
+pub(super) fn string_pointer(value: f64) -> Option<NonNull<RawJsString>> {
     let bits = value.to_bits();
     if bits >> 48 != TAG_STRING {
         return None;
@@ -40,6 +40,32 @@ pub(super) fn tagged_string(string: JsString) -> f64 {
 
 pub(super) fn tagged_bool(value: bool) -> f64 {
     f64::from_bits((TAG_BOOLEAN << 48) | u64::from(value))
+}
+
+/// The longest name in any method table, so that a key wider than this cannot
+/// name one.
+const MAX_METHOD_NAME: usize = 24;
+
+/// Calls `f` with the bytes of `key` when it is an ASCII name, or returns
+/// `None` when it is not (no method, slot or element name is non-ASCII).
+///
+/// This replaces decoding a key into a fresh `String` for every method lookup,
+/// which used to allocate on each miss.
+pub(super) fn with_ascii_key<R>(key: &JsString, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    match key.variant() {
+        JsStrVariant::Latin1(bytes) if bytes.is_ascii() => Some(f(bytes)),
+        JsStrVariant::Latin1(_) => None,
+        JsStrVariant::Utf16(units) => {
+            if units.len() > MAX_METHOD_NAME {
+                return None;
+            }
+            let mut buffer = [0u8; MAX_METHOD_NAME];
+            for (slot, unit) in buffer.iter_mut().zip(units) {
+                *slot = u8::try_from(*unit).ok()?;
+            }
+            Some(f(&buffer[..units.len()]))
+        }
+    }
 }
 
 pub(super) fn tagged_undefined() -> f64 {
@@ -159,6 +185,30 @@ extern "C" fn sealion_string_from_utf8(ptr: *const u8, len: u64) -> u64 {
     };
     let text = str::from_utf8(bytes).unwrap_or("");
     tagged_string(JsString::from(text)).to_bits() & PAYLOAD_MASK
+}
+
+/// The interned string value of a source literal, memoised in the compiled
+/// program's own data section.
+///
+/// `slot` is a writable word the artifact carries for this literal. The first
+/// access interns the text and stores the tagged value there; every later
+/// access at that site loads the word instead of validating UTF-8 and probing
+/// the static string table again.
+extern "C" fn sealion_string_key(slot: *mut u64, ptr: *const u8, len: u64) -> f64 {
+    let cached = unsafe { *slot };
+    if cached != 0 {
+        return f64::from_bits(cached);
+    }
+    let bytes = if len == 0 {
+        &[][..]
+    } else if ptr.is_null() {
+        return tagged_string(JsString::from(""));
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    };
+    let value = tagged_string(JsString::from(str::from_utf8(bytes).unwrap_or("")));
+    unsafe { *slot = value.to_bits() };
+    value
 }
 
 extern "C" fn sealion_string_to_number(value: f64) -> f64 {
@@ -391,32 +441,36 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
 }
 
 fn method(key: &JsString) -> Option<Method> {
-    Some(match key.to_std_string_lossy().as_str() {
-        "charAt" => char_at,
-        "charCodeAt" => char_code_at,
-        "codePointAt" => code_point_at,
-        "at" => at,
-        "indexOf" => index_of,
-        "lastIndexOf" => last_index_of,
-        "includes" => includes,
-        "startsWith" => starts_with,
-        "endsWith" => ends_with,
-        "slice" => slice,
-        "substring" => substring,
-        "substr" => substr,
-        "split" => split,
-        "trim" => trim,
-        "trimStart" => trim_start,
-        "trimEnd" => trim_end,
-        "toUpperCase" => to_upper,
-        "toLowerCase" => to_lower,
-        "repeat" => repeat,
-        "padStart" => pad_start,
-        "padEnd" => pad_end,
-        "replace" => replace,
-        "replaceAll" => replace_all,
-        "concat" => concat,
-        "toString" | "valueOf" => to_string,
+    super::strings::with_ascii_key(key, method_named)?
+}
+
+fn method_named(name: &[u8]) -> Option<Method> {
+    Some(match name {
+        b"charAt" => char_at,
+        b"charCodeAt" => char_code_at,
+        b"codePointAt" => code_point_at,
+        b"at" => at,
+        b"indexOf" => index_of,
+        b"lastIndexOf" => last_index_of,
+        b"includes" => includes,
+        b"startsWith" => starts_with,
+        b"endsWith" => ends_with,
+        b"slice" => slice,
+        b"substring" => substring,
+        b"substr" => substr,
+        b"split" => split,
+        b"trim" => trim,
+        b"trimStart" => trim_start,
+        b"trimEnd" => trim_end,
+        b"toUpperCase" => to_upper,
+        b"toLowerCase" => to_lower,
+        b"repeat" => repeat,
+        b"padStart" => pad_start,
+        b"padEnd" => pad_end,
+        b"replace" => replace,
+        b"replaceAll" => replace_all,
+        b"concat" => concat,
+        b"toString" | b"valueOf" => to_string,
         _ => return None,
     })
 }
@@ -856,6 +910,7 @@ extern "C" fn sealion_string_object() -> u64 {
 pub(super) fn lookup(name: &str) -> Option<usize> {
     Some(match name {
         "sealion_string_from_utf8" => sealion_string_from_utf8 as *const () as usize,
+        "sealion_string_key" => sealion_string_key as *const () as usize,
         "sealion_string_from_char_codes" => sealion_string_from_char_codes as *const () as usize,
         "sealion_string_from_code_points" => sealion_string_from_code_points as *const () as usize,
         "sealion_string_object" => sealion_string_object as *const () as usize,

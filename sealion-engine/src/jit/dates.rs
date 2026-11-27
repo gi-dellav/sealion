@@ -406,9 +406,10 @@ extern "C" fn date_method(env: i64, args: *const u8, _callee: f64, _this: f64) -
 /// The native closure for `date.method`, or `None` when the key names no
 /// method. Answered only by a `Date` and its prototype.
 pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
-    let key = key.to_std_string_lossy();
-    let index = METHODS.iter().position(|name| *name == key)?;
+    // The receiver check comes first: a non-`Date` never reads a `Date` method,
+    // so it must not pay for decoding the key.
     time_of(value)?;
+    let index = METHODS.iter().position(|name| key == *name)?;
     let binding = Box::into_raw(Box::new((value.to_bits() & PAYLOAD_MASK, index as u64)));
     Some(native_function(date_method, binding as u64))
 }

@@ -66,17 +66,22 @@ fn element(env: i64, index: usize) -> f64 {
 }
 
 /// A canonical array index key: `"0"` yes, `"01"` and `"-1"` no.
+///
+/// Parsed from the string's own bytes, so an index lookup does not allocate.
 pub(super) fn index_of_key(key: &JsString) -> Option<usize> {
-    let text = key.to_std_string_lossy();
-    let bytes = text.as_bytes();
-    if bytes.is_empty() || bytes.len() > 10 || (bytes.len() > 1 && bytes[0] == b'0') {
-        return None;
-    }
-    if !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let index: usize = text.parse().ok()?;
-    (index < u32::MAX as usize).then_some(index)
+    super::strings::with_ascii_key(key, |bytes| {
+        if bytes.is_empty() || bytes.len() > 10 || (bytes.len() > 1 && bytes[0] == b'0') {
+            return None;
+        }
+        let mut index = 0usize;
+        for &byte in bytes {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            index = index * 10 + usize::from(byte - b'0');
+        }
+        (index < u32::MAX as usize).then_some(index)
+    })?
 }
 
 /// Writes `array.length` or `array[index]`; returns `false` for other keys.
@@ -157,46 +162,50 @@ pub(super) fn method_property(value: f64, key: &JsString) -> Option<f64> {
 }
 
 fn method(key: &JsString) -> Option<Method> {
-    Some(match key.to_std_string_lossy().as_str() {
-        "push" => push,
-        "pop" => pop,
-        "shift" => shift,
-        "unshift" => unshift,
-        "join" => join,
-        "toString" => to_string,
-        "slice" => slice,
-        "concat" => concat,
-        "indexOf" => index_of,
-        "includes" => includes,
-        "reverse" => reverse,
-        "forEach" => for_each,
-        "map" => map,
-        "filter" => filter,
-        "some" => some,
-        "every" => every,
-        "find" => find,
-        "findIndex" => find_index,
-        "findLast" => find_last,
-        "findLastIndex" => find_last_index,
-        "reduce" => reduce,
-        "reduceRight" => reduce_right,
-        "at" => at,
-        "lastIndexOf" => last_index_of,
-        "copyWithin" => copy_within,
-        "fill" => fill,
-        "flat" => flat,
-        "flatMap" => flat_map,
-        "keys" => keys,
-        "values" => values,
-        "entries" => entries,
-        "sort" => sort,
-        "toReversed" => to_reversed,
-        "toSorted" => to_sorted,
-        "splice" => splice,
-        "toSpliced" => to_spliced,
-        "with" => with_value,
-        "toLocaleString" => to_string,
-        "valueOf" => value_of,
+    super::strings::with_ascii_key(key, method_named)?
+}
+
+fn method_named(name: &[u8]) -> Option<Method> {
+    Some(match name {
+        b"push" => push,
+        b"pop" => pop,
+        b"shift" => shift,
+        b"unshift" => unshift,
+        b"join" => join,
+        b"toString" => to_string,
+        b"slice" => slice,
+        b"concat" => concat,
+        b"indexOf" => index_of,
+        b"includes" => includes,
+        b"reverse" => reverse,
+        b"forEach" => for_each,
+        b"map" => map,
+        b"filter" => filter,
+        b"some" => some,
+        b"every" => every,
+        b"find" => find,
+        b"findIndex" => find_index,
+        b"findLast" => find_last,
+        b"findLastIndex" => find_last_index,
+        b"reduce" => reduce,
+        b"reduceRight" => reduce_right,
+        b"at" => at,
+        b"lastIndexOf" => last_index_of,
+        b"copyWithin" => copy_within,
+        b"fill" => fill,
+        b"flat" => flat,
+        b"flatMap" => flat_map,
+        b"keys" => keys,
+        b"values" => values,
+        b"entries" => entries,
+        b"sort" => sort,
+        b"toReversed" => to_reversed,
+        b"toSorted" => to_sorted,
+        b"splice" => splice,
+        b"toSpliced" => to_spliced,
+        b"with" => with_value,
+        b"toLocaleString" => to_string,
+        b"valueOf" => value_of,
         _ => return None,
     })
 }
