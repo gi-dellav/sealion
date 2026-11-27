@@ -12,12 +12,14 @@
 //! (`env`, argument block, callee, this) and work through the same indirect call path
 //! as a user function, including `var push = a.push`.
 
+use std::cmp::Ordering;
+
 use sealion_string::JsString;
 
-use super::objects::{JsObject, new_array, tagged_object, with_object};
+use super::objects::{JsObject, get_property, new_array, tagged_object, with_object};
 use super::strings::{
     is_tagged, same_value_zero, tagged_bool, tagged_string, tagged_undefined, to_js_string,
-    to_number_value, value_truthy, values_strict_equal,
+    to_number_value, value_truthy, values_strict_equal, with_string,
 };
 use crate::value::{PAYLOAD_MASK, TAG_FUNCTION, TAG_UNDEFINED};
 
@@ -196,7 +198,27 @@ fn method(key: &JsString) -> Option<Method> {
         "every" => every,
         "find" => find,
         "findIndex" => find_index,
+        "findLast" => find_last,
+        "findLastIndex" => find_last_index,
         "reduce" => reduce,
+        "reduceRight" => reduce_right,
+        "at" => at,
+        "lastIndexOf" => last_index_of,
+        "copyWithin" => copy_within,
+        "fill" => fill,
+        "flat" => flat,
+        "flatMap" => flat_map,
+        "keys" => keys,
+        "values" => values,
+        "entries" => entries,
+        "sort" => sort,
+        "toReversed" => to_reversed,
+        "toSorted" => to_sorted,
+        "splice" => splice,
+        "toSpliced" => to_spliced,
+        "with" => with_value,
+        "toLocaleString" => to_string,
+        "valueOf" => value_of,
         _ => return None,
     })
 }
@@ -258,6 +280,95 @@ fn relative(args: *const u8, index: usize, length: usize, default: usize) -> usi
         return length.saturating_sub((-number) as usize);
     }
     (number as usize).min(length)
+}
+
+/// Like [`relative`], but keeps the out-of-range answer: `at` and `with` need
+/// `undefined`/a no-op for an index past either end instead of a clamp.
+fn signed_index(value: f64, length: usize) -> Option<usize> {
+    let number = to_number_value(value).trunc();
+    let index = if number.is_nan() {
+        0.0
+    } else if number < 0.0 {
+        length as f64 + number
+    } else {
+        number
+    };
+    (index >= 0.0 && index < length as f64).then_some(index as usize)
+}
+
+/// `deleteCount` for `splice` and `toSpliced`: a lone `start` removes the tail,
+/// an explicit count is clamped to what is left.
+fn delete_count(args: *const u8, start: usize, length: usize) -> usize {
+    match arg_count(args) {
+        0 => 0,
+        1 => length - start,
+        _ => {
+            let number = to_number_value(arg(args, 1)).trunc();
+            if number.is_nan() || number <= 0.0 {
+                0
+            } else {
+                (number as usize).min(length - start)
+            }
+        }
+    }
+}
+
+/// Replaces `remove` elements at `start` with `items` and returns the removed
+/// ones, the shared core of `splice` and `toSpliced`.
+fn splice_into(elements: &mut Vec<f64>, start: usize, remove: usize, items: Vec<f64>) -> Vec<f64> {
+    let end = (start + remove).min(elements.len());
+    elements.splice(start..end, items).collect()
+}
+
+/// The arguments from `splice`/`toSpliced` that are inserted.
+fn inserted(args: *const u8) -> Vec<f64> {
+    (2..arg_count(args)).map(|index| arg(args, index)).collect()
+}
+
+/// Copies the array's elements out so a callback may mutate it while we sort.
+fn drain(env: i64) -> Vec<f64> {
+    with_array(env, |elements| elements.clone()).unwrap_or_default()
+}
+
+/// `sort`'s comparison: the callback's sign, else the `ToString` order in
+/// UTF-16 code units, which is what comparing two strings does.
+fn compare(comparator: f64, lhs: f64, rhs: f64) -> Ordering {
+    if comparator.to_bits() >> 48 != TAG_FUNCTION {
+        return to_js_string(lhs).cmp(&to_js_string(rhs));
+    }
+    let result = to_number_value(call(comparator, &[lhs, rhs]));
+    if result < 0.0 {
+        Ordering::Less
+    } else if result > 0.0 {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// `flat`'s depth: `undefined` is one level, `Infinity` flattens everything.
+fn flatten_depth(value: f64) -> usize {
+    if value.to_bits() >> 48 == TAG_UNDEFINED {
+        return 1;
+    }
+    let number = to_number_value(value).trunc();
+    if number.is_nan() || number <= 0.0 {
+        0
+    } else if number.is_infinite() || number >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        number as usize
+    }
+}
+
+/// Flattens `source` up to `depth` levels into `target`.
+fn flatten_into(target: &mut Vec<f64>, source: &[f64], depth: usize) {
+    for &value in source {
+        match with_object(value, |object| object.elements.clone()).flatten() {
+            Some(inner) if depth > 0 => flatten_into(target, &inner, depth - 1),
+            _ => target.push(value),
+        }
+    }
 }
 
 extern "C" fn push(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
@@ -474,6 +585,217 @@ extern "C" fn reduce(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64
     accumulator
 }
 
+extern "C" fn find_last(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let callback = arg(args, 0);
+    let this = array_value(env);
+    for index in (0..length(env)).rev() {
+        let value = element(env, index);
+        if value_truthy(call(callback, &[value, index as f64, this])) {
+            return value;
+        }
+    }
+    tagged_undefined()
+}
+
+extern "C" fn find_last_index(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let callback = arg(args, 0);
+    let this = array_value(env);
+    for index in (0..length(env)).rev() {
+        if value_truthy(call(callback, &[element(env, index), index as f64, this])) {
+            return index as f64;
+        }
+    }
+    -1.0
+}
+
+extern "C" fn reduce_right(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let callback = arg(args, 0);
+    let this = array_value(env);
+    let length = length(env);
+    let mut index = length as isize - 1;
+    let mut accumulator = if arg_count(args) > 1 {
+        arg(args, 1)
+    } else if length > 0 {
+        index -= 1;
+        element(env, length - 1)
+    } else {
+        return tagged_undefined();
+    };
+    while index >= 0 {
+        accumulator = call(
+            callback,
+            &[
+                accumulator,
+                element(env, index as usize),
+                index as f64,
+                this,
+            ],
+        );
+        index -= 1;
+    }
+    accumulator
+}
+
+extern "C" fn at(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    match signed_index(arg(args, 0), length(env)) {
+        Some(index) => element(env, index),
+        None => tagged_undefined(),
+    }
+}
+
+extern "C" fn last_index_of(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let search = arg(args, 0);
+    let length = length(env);
+    if length == 0 {
+        return -1.0;
+    }
+    let position = arg(args, 1);
+    let start = if position.to_bits() >> 48 == TAG_UNDEFINED {
+        length - 1
+    } else {
+        let number = to_number_value(position).trunc();
+        if number.is_nan() {
+            return -1.0;
+        }
+        if number < 0.0 {
+            match length.checked_sub((-number) as usize) {
+                Some(shifted) => shifted,
+                None => return -1.0,
+            }
+        } else {
+            (number as usize).min(length - 1)
+        }
+    };
+    for index in (0..=start).rev() {
+        if values_strict_equal(element(env, index), search) {
+            return index as f64;
+        }
+    }
+    -1.0
+}
+
+extern "C" fn copy_within(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    with_array(env, |elements| {
+        let length = elements.len();
+        let target = relative(args, 0, length, 0);
+        let start = relative(args, 1, length, 0);
+        let end = relative(args, 2, length, length);
+        let count = end.saturating_sub(start).min(length - target);
+        if count > 0 {
+            elements.copy_within(start..start + count, target);
+        }
+    });
+    array_value(env)
+}
+
+extern "C" fn fill(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let value = arg(args, 0);
+    with_array(env, |elements| {
+        let length = elements.len();
+        let start = relative(args, 1, length, 0);
+        let end = relative(args, 2, length, length).max(start);
+        elements[start..end].fill(value);
+    });
+    array_value(env)
+}
+
+extern "C" fn flat(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let depth = flatten_depth(arg(args, 0));
+    let source = drain(env);
+    let mut flattened = Vec::with_capacity(source.len());
+    flatten_into(&mut flattened, &source, depth);
+    tagged_object(new_array(flattened))
+}
+
+extern "C" fn flat_map(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let callback = arg(args, 0);
+    let this = array_value(env);
+    let mut mapped = Vec::with_capacity(length(env));
+    for index in 0..length(env) {
+        let value = call(callback, &[element(env, index), index as f64, this]);
+        match with_object(value, |object| object.elements.clone()).flatten() {
+            Some(inner) => mapped.extend(inner),
+            None => mapped.push(value),
+        }
+    }
+    tagged_object(new_array(mapped))
+}
+
+/// `array.keys()`: the indices as an array, since there is no iterator protocol.
+extern "C" fn keys(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let indices = (0..length(env)).map(|index| index as f64).collect();
+    tagged_object(new_array(indices))
+}
+
+/// `array.values()`: a shallow copy of the elements.
+extern "C" fn values(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    tagged_object(new_array(drain(env)))
+}
+
+/// `array.entries()`: `[index, value]` pairs, as an array of two-element arrays.
+extern "C" fn entries(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let pairs = with_array(env, |elements| {
+        elements
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| tagged_object(new_array(vec![index as f64, value])))
+            .collect()
+    })
+    .unwrap_or_default();
+    tagged_object(new_array(pairs))
+}
+
+extern "C" fn sort(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let comparator = arg(args, 0);
+    let mut elements = drain(env);
+    elements.sort_by(|&lhs, &rhs| compare(comparator, lhs, rhs));
+    with_array(env, |slot| *slot = elements);
+    array_value(env)
+}
+
+extern "C" fn to_reversed(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let mut elements = drain(env);
+    elements.reverse();
+    tagged_object(new_array(elements))
+}
+
+extern "C" fn to_sorted(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let comparator = arg(args, 0);
+    let mut elements = drain(env);
+    elements.sort_by(|&lhs, &rhs| compare(comparator, lhs, rhs));
+    tagged_object(new_array(elements))
+}
+
+extern "C" fn splice(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let start = relative(args, 0, length(env), 0);
+    let remove = delete_count(args, start, length(env));
+    let items = inserted(args);
+    let removed =
+        with_array(env, |elements| splice_into(elements, start, remove, items)).unwrap_or_default();
+    tagged_object(new_array(removed))
+}
+
+extern "C" fn to_spliced(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let mut elements = drain(env);
+    let start = relative(args, 0, elements.len(), 0);
+    let remove = delete_count(args, start, elements.len());
+    let items = inserted(args);
+    splice_into(&mut elements, start, remove, items);
+    tagged_object(new_array(elements))
+}
+
+extern "C" fn with_value(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let mut elements = drain(env);
+    if let Some(index) = signed_index(arg(args, 0), elements.len()) {
+        elements[index] = arg(args, 1);
+    }
+    tagged_object(new_array(elements))
+}
+
+extern "C" fn value_of(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    array_value(env)
+}
+
 extern "C" fn sealion_array_new(length: i64) -> u64 {
     let length = usize::try_from(length).unwrap_or(0);
     new_array(vec![tagged_undefined(); length]) as u64
@@ -512,11 +834,54 @@ extern "C" fn sealion_array_is_array(value: f64) -> f64 {
     tagged_bool(is_array(value))
 }
 
+/// `Array.of(...)`: unlike [`sealion_array_construct`] a lone number is an
+/// element, not a length.
+extern "C" fn sealion_array_of(values: *const u8) -> u64 {
+    let words = values.cast::<u64>();
+    let count = unsafe { *words } as usize;
+    let elements = (0..count)
+        .map(|index| f64::from_bits(unsafe { *words.add(index + 1) }))
+        .collect();
+    new_array(elements) as u64
+}
+
+/// `Array.from(arrayLike)`: copies an array, splits a string into code points,
+/// and indexes anything else by its `length` property.
+extern "C" fn sealion_array_from(value: f64) -> f64 {
+    if let Some(elements) = with_object(value, |object| object.elements.clone()).flatten() {
+        return tagged_object(new_array(elements));
+    }
+    let characters = with_string(value, |text| {
+        text.code_points()
+            .map(|point| {
+                let mut buffer = [0u16; 2];
+                let units: &[u16] = point.encode_utf16(&mut buffer);
+                tagged_string(JsString::from(units))
+            })
+            .collect::<Vec<f64>>()
+    });
+    if let Some(characters) = characters {
+        return tagged_object(new_array(characters));
+    }
+    let length = to_number_value(get_property(value, "length"));
+    let length = if length.is_finite() && length > 0.0 {
+        length as usize
+    } else {
+        0
+    };
+    let elements = (0..length)
+        .map(|index| get_property(value, &index.to_string()))
+        .collect();
+    tagged_object(new_array(elements))
+}
+
 pub(super) fn lookup(name: &str) -> Option<usize> {
     Some(match name {
         "sealion_array_new" => sealion_array_new as *const () as usize,
         "sealion_array_construct" => sealion_array_construct as *const () as usize,
         "sealion_array_is_array" => sealion_array_is_array as *const () as usize,
+        "sealion_array_of" => sealion_array_of as *const () as usize,
+        "sealion_array_from" => sealion_array_from as *const () as usize,
         _ => return None,
     })
 }

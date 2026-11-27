@@ -60,7 +60,7 @@ const NUMBER_INLINE: &[&str] = &["isNaN", "isFinite", "isInteger", "isSafeIntege
 const OBJECT_INLINE: &[&str] = &["is"];
 
 /// `Array` static functions implemented by the dynamic runtime.
-const ARRAY_INLINE: &[&str] = &["isArray"];
+const ARRAY_INLINE: &[&str] = &["isArray", "of", "from"];
 
 /// `Date` functions implemented inline.
 const DATE_INLINE: &[&str] = &["now"];
@@ -179,13 +179,20 @@ impl Builtins {
             funcs.insert("sealion_object_set", set_id);
 
             let length_sig = make_i64_unary_signature(module);
-            for name in ["sealion_array_new", "sealion_array_construct"] {
+            for name in [
+                "sealion_array_new",
+                "sealion_array_construct",
+                "sealion_array_of",
+            ] {
                 let id = module.declare_function(name, Linkage::Import, &length_sig)?;
                 funcs.insert(name, id);
             }
             let is_array_id =
                 module.declare_function("sealion_array_is_array", Linkage::Import, &unary_sig)?;
             funcs.insert("sealion_array_is_array", is_array_id);
+            let from_id =
+                module.declare_function("sealion_array_from", Linkage::Import, &unary_sig)?;
+            funcs.insert("sealion_array_from", from_id);
 
             let new_map_id =
                 module.declare_function("sealion_map_new", Linkage::Import, &pointer_sig)?;

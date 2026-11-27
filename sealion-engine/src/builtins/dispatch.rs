@@ -216,6 +216,22 @@ pub fn call(
             let pointer = builder.inst_results(call)[0];
             value::object(builder, pointer)
         }
+        "of" => {
+            let func_ref = *funcs.get("sealion_array_of").ok_or_else(|| {
+                Error::Unsupported("Array.of requires the dynamic runtime".to_string())
+            })?;
+            let values = write_args(builder, args);
+            let call = builder.ins().call(func_ref, &[values]);
+            let pointer = builder.inst_results(call)[0];
+            value::object(builder, pointer)
+        }
+        "from" => {
+            let func_ref = *funcs.get("sealion_array_from").ok_or_else(|| {
+                Error::Unsupported("Array.from requires the dynamic runtime".to_string())
+            })?;
+            let value = argument(builder, args, 0);
+            call_libm(builder, func_ref, &[value])
+        }
         "Map" => {
             let func_ref = *funcs.get("sealion_map_new").ok_or_else(|| {
                 Error::Unsupported("Map requires the dynamic runtime".to_string())

@@ -464,6 +464,109 @@ fn array_iteration_methods_call_closures() {
 }
 
 #[test]
+fn array_at_search_and_right_folds() {
+    assert_eq!(run("[1, 2, 3].at(1);"), 2);
+    assert_eq!(run("[1, 2, 3].at(-1);"), 3);
+    assert_eq!(run("[1, 2, 3].at();"), 1);
+    assert_eq!(run("[1, 2, 3].at(9) === undefined ? 1 : 0;"), 1);
+    assert_eq!(run("[1, 2, 3].at(-9) === undefined ? 1 : 0;"), 1);
+    assert_eq!(run("[1, 2, 1].lastIndexOf(1);"), 2);
+    assert_eq!(run("[1, 2, 1].lastIndexOf(1, 1);"), 0);
+    assert_eq!(run("[1, 2].lastIndexOf(3);"), -1);
+    assert_eq!(run("[1, 2].lastIndexOf(2, -5);"), -1);
+    assert_eq!(
+        run(r#"["a", "b"].reduceRight(function (acc, x) { return acc + x; }) === "ba" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run("[1, 2, 3].reduceRight(function (acc, x) { return acc + x; }, 10);"),
+        16
+    );
+    assert_eq!(
+        run("[1, 2, 3].findLast(function (x) { return x < 3; });"),
+        2
+    );
+    assert_eq!(
+        run("[1, 2, 3].findLastIndex(function (x) { return x < 3; });"),
+        1
+    );
+    assert_eq!(
+        run("[1, 2].findLast(function (x) { return x > 5; }) === undefined ? 1 : 0;"),
+        1
+    );
+}
+
+#[test]
+fn array_fill_copy_and_flatten_methods() {
+    assert_eq!(run("[1, 2, 3].fill(0)[1];"), 0);
+    assert_eq!(
+        run(r#"[1, 2, 3].fill(0, 1).join() === "1,0,0" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run("[1, 2, 3].fill(0, 1, 2).join() === \"1,0,3\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var a = [1, 2, 3]; a.fill(0) === a ? 1 : 0;"), 1);
+    assert_eq!(
+        run(r#"[1, 2, 3, 4].copyWithin(0, 2).join() === "3,4,3,4" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"[1, 2, 3].copyWithin(1, 0).join() === "1,1,2" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("[1, [2, [3]]].flat()[2][0];"), 3);
+    assert_eq!(run("[1, [2, [3]]].flat().length;"), 3);
+    assert_eq!(run("[1, [2, [3]]].flat(2).length;"), 3);
+    assert_eq!(run("[1, [2, [3]]].flat(Infinity).length;"), 3);
+    assert_eq!(run("[1, [2, [3]]].flat(0).length;"), 2);
+    assert_eq!(
+        run("[1, 2].flatMap(function (x) { return [x, x]; }).length;"),
+        4
+    );
+    assert_eq!(run("[1, 2].flatMap(function (x) { return x; })[1];"), 2);
+}
+
+#[test]
+fn array_sort_splice_and_copy_variants() {
+    assert_eq!(run("[10, 9, 1].sort()[0];"), 1);
+    assert_eq!(run("[10, 9, 1].sort()[2];"), 9);
+    assert_eq!(
+        run("[10, 9, 1].sort(function (a, b) { return b - a; })[0];"),
+        10
+    );
+    assert_eq!(run("var a = [2, 1]; a.sort() === a ? 1 : 0;"), 1);
+    assert_eq!(
+        run(r#"var a = [1, 2, 3, 4]; a.splice(1, 2).join() === "2,3" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var a = [1, 2, 3, 4]; a.splice(1, 2, 9); a.join() === "1,9,4" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2, 3]; a.splice(1); a.length;"), 1);
+    assert_eq!(run("var a = [1, 2, 3]; a.splice(-1)[0];"), 3);
+    assert_eq!(run("[3, 1, 2].toReversed()[0];"), 2);
+    assert_eq!(run("var a = [3, 1, 2]; a.toReversed(); a[0];"), 3);
+    assert_eq!(run("[10, 9, 1].toSorted()[0];"), 1);
+    assert_eq!(run("var a = [2, 1]; a.toSorted(); a[0];"), 2);
+    assert_eq!(
+        run(r#"[1, 2].toSpliced(0, 1, 7).join() === "7,2" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2]; a.toSpliced(0, 1); a.length;"), 2);
+    assert_eq!(run("[1, 2].with(0, 9)[0];"), 9);
+    assert_eq!(run("var a = [1, 2]; a.with(-1, 9)[1] + a[1];"), 11);
+    assert_eq!(run("[1, 2].with(5, 9).length;"), 2);
+    assert_eq!(run("[7, 8].keys()[1];"), 1);
+    assert_eq!(run("[7, 8].values()[1];"), 8);
+    assert_eq!(run("[7, 8].keys().length;"), 2);
+    assert_eq!(run("[7, 8].entries()[1][0] + [7, 8].entries()[1][1];"), 9);
+    assert_eq!(run("var a = [1]; a.valueOf() === a ? 1 : 0;"), 1);
+}
+
+#[test]
 fn map_constructor_and_methods() {
     assert_eq!(run("new Map().size;"), 0);
     assert_eq!(run("Map().size;"), 0);
@@ -538,6 +641,32 @@ fn map_for_each_calls_closures() {
 }
 
 #[test]
+fn map_iteration_accessors_return_arrays() {
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("b", 2); m.keys().length;"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("b", 2); m.keys()[1] === "b" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("b", 2); m.values()[0];"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.entries()[0][0] === "a" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.entries()[0][1];"#),
+        1
+    );
+    assert_eq!(run("new Map().keys().length;"), 0);
+    assert_eq!(run("new Map().entries().length;"), 0);
+}
+
+#[test]
 fn array_constructor_and_method_references() {
     assert_eq!(run("Array.isArray([]) ? 1 : 0;"), 1);
     assert_eq!(run("Array.isArray({}) ? 0 : 1;"), 1);
@@ -547,6 +676,18 @@ fn array_constructor_and_method_references() {
     assert_eq!(run("Array(3).length;"), 3);
     assert_eq!(run("new Array(2).length;"), 2);
     assert_eq!(run("new Array(7, 8)[1];"), 8);
+    assert_eq!(run("Array.of(7).length;"), 1);
+    assert_eq!(run("Array.of(7)[0];"), 7);
+    assert_eq!(run("Array.of(1, 2, 3).length;"), 3);
+    assert_eq!(run("Array.of().length;"), 0);
+    assert_eq!(run("Array.from([1, 2])[1];"), 2);
+    assert_eq!(run("var a = [1]; Array.from(a) === a ? 0 : 1;"), 1);
+    assert_eq!(run("Array.from('ab').length;"), 2);
+    assert_eq!(run("Array.from('ab')[1] === 'b' ? 1 : 0;"), 1);
+    assert_eq!(
+        run("Array.from({length: 2, 0: 'x', 1: 'y'})[1] === 'y' ? 1 : 0;"),
+        1
+    );
     assert_eq!(run("var a = []; var push = a.push; push(4); a[0];"), 4);
 }
 

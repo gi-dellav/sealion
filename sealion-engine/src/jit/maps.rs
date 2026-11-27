@@ -15,7 +15,7 @@
 use sealion_string::JsString;
 
 use super::arrays::{arg, call};
-use super::objects::{JsObject, new_map, tagged_object, with_object};
+use super::objects::{JsObject, new_array, new_map, tagged_object, with_object};
 use super::strings::{same_value_zero, tagged_bool, tagged_undefined};
 use crate::value::{PAYLOAD_MASK, TAG_FUNCTION};
 
@@ -73,6 +73,9 @@ fn method(key: &JsString) -> Option<Method> {
         "delete" => delete,
         "clear" => clear,
         "forEach" => for_each,
+        "keys" => keys,
+        "values" => values,
+        "entries" => entries,
         _ => return None,
     })
 }
@@ -131,6 +134,35 @@ extern "C" fn for_each(env: i64, args: *const u8, _callee: f64, _this: f64) -> f
         call(callback, &[value, key, this]);
     }
     tagged_undefined()
+}
+
+/// `map.keys()`: the keys as an array in insertion order, since the runtime has
+/// no iterator protocol.
+extern "C" fn keys(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let keys =
+        with_map(env, |entries| entries.iter().map(|&(key, _)| key).collect()).unwrap_or_default();
+    tagged_object(new_array(keys))
+}
+
+/// `map.values()`: the values as an array in insertion order.
+extern "C" fn values(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let values = with_map(env, |entries| {
+        entries.iter().map(|&(_, value)| value).collect()
+    })
+    .unwrap_or_default();
+    tagged_object(new_array(values))
+}
+
+/// `map.entries()`: `[key, value]` pairs, as an array of two-element arrays.
+extern "C" fn entries(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
+    let pairs = with_map(env, |entries| {
+        entries
+            .iter()
+            .map(|&(key, value)| tagged_object(new_array(vec![key, value])))
+            .collect()
+    })
+    .unwrap_or_default();
+    tagged_object(new_array(pairs))
 }
 
 extern "C" fn sealion_map_new() -> u64 {

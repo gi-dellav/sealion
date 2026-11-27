@@ -17,7 +17,8 @@ use sealion_string::JsString;
 use super::arrays;
 use super::maps;
 use super::strings::{
-    is_object, method_property, tagged_bool, tagged_undefined, to_js_string, with_string,
+    is_object, method_property, tagged_bool, tagged_string, tagged_undefined, to_js_string,
+    with_string,
 };
 use crate::value::{PAYLOAD_MASK, TAG_OBJECT, TAG_STRING};
 
@@ -118,6 +119,12 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
         .or_else(|| arrays::method_property(object, &key))
         .or_else(|| method_property(object, &key))
         .unwrap_or_else(tagged_undefined)
+}
+
+/// Reads `value[key]` through the ordinary property path, for host helpers
+/// such as `Array.from` that index array-likes.
+pub(super) fn get_property(value: f64, key: &str) -> f64 {
+    sealion_object_get(value, tagged_string(JsString::from(key)))
 }
 
 extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {

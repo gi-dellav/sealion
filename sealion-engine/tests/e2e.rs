@@ -1604,6 +1604,8 @@ fn arrays_require_the_dynamic_runtime() {
         "var a = [1]; a[0] = 2;",
         "Array(1, 2);",
         "new Array(1);",
+        "Array.of(1);",
+        "Array.from([]);",
         "new Map();",
     ] {
         assert!(
