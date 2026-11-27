@@ -133,6 +133,55 @@ pub(super) fn compile_chain_computed_member<'a>(
     object::get(builder, ctx, object, key)
 }
 
+/// Evaluates an optional-chain call target, returning the callee and the value
+/// to bind as `this`. A member callee keeps its receiver; anything else calls
+/// with `undefined`.
+fn compile_chain_callee<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    callee: &'a Expression<'a>,
+    short: Block,
+    result: Variable,
+) -> Result<(Value, Value), Error> {
+    match callee {
+        Expression::StaticMemberExpression(access) => {
+            let receiver = compile_chain_expr(builder, ctx, flow, &access.object, short, result)?;
+            if access.optional {
+                let ok = builder.create_block();
+                let nullish = value::is_nullish(builder, receiver);
+                builder.ins().brif(nullish, short, &[], ok, &[]);
+                builder.switch_to_block(ok);
+            }
+            if ctx.objects.is_none() {
+                return Ok((value::undefined(builder), receiver));
+            }
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            let callee = object::get(builder, ctx, receiver, key)?;
+            Ok((callee, receiver))
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let receiver = compile_chain_expr(builder, ctx, flow, &member.object, short, result)?;
+            if member.optional {
+                let ok = builder.create_block();
+                let nullish = value::is_nullish(builder, receiver);
+                builder.ins().brif(nullish, short, &[], ok, &[]);
+                builder.switch_to_block(ok);
+            }
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
+            if ctx.objects.is_none() {
+                return Ok((value::undefined(builder), receiver));
+            }
+            let callee = object::get(builder, ctx, receiver, key)?;
+            Ok((callee, receiver))
+        }
+        _ => {
+            let callee = compile_chain_expr(builder, ctx, flow, callee, short, result)?;
+            Ok((callee, value::undefined(builder)))
+        }
+    }
+}
+
 pub(super) fn compile_chain_call<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -145,12 +194,12 @@ pub(super) fn compile_chain_call<'a>(
         return compile_builtin_call(builder, ctx, flow, builtin, call.arguments.as_slice());
     }
 
-    let callee = compile_chain_expr(builder, ctx, flow, &call.callee, short, result)?;
+    let (callee, this) = compile_chain_callee(builder, ctx, flow, &call.callee, short, result)?;
     if call.optional {
         let ok = builder.create_block();
         let nullish = value::is_nullish(builder, callee);
         builder.ins().brif(nullish, short, &[], ok, &[]);
         builder.switch_to_block(ok);
     }
-    compile_call_value(builder, ctx, flow, callee, &call.arguments)
+    compile_call_value(builder, ctx, flow, callee, this, &call.arguments)
 }

@@ -225,6 +225,7 @@ pub fn compile_functions<'a>(
         let env_param = builder.block_params(entry)[0];
         let args_param = builder.block_params(entry)[1];
         let self_param = builder.block_params(entry)[2];
+        let this_param = builder.block_params(entry)[3];
         let exception = builder.ins().global_value(types::I64, exception_global);
         let string_literals: HashMap<String, (Value, i64)> = string_data
             .into_iter()
@@ -291,6 +292,9 @@ pub fn compile_functions<'a>(
         };
 
         let mut flow = Flow::new();
+        if root_scope.bindings.contains_key("this") {
+            store_var(&mut builder, &ctx, "this", this_param)?;
+        }
         if let Some(self_name) = plan.self_binding {
             store_var(&mut builder, &ctx, self_name, self_param)?;
         }
@@ -392,7 +396,9 @@ pub fn compile_main(
     let exception = builder.ins().global_value(types::I64, exception_global);
     let zero = builder.ins().iconst(types::I64, 0);
     let self_value = value::undefined(&mut builder);
-    let call = builder.ins().call(script_ref, &[zero, zero, self_value]);
+    let call = builder
+        .ins()
+        .call(script_ref, &[zero, zero, self_value, self_value]);
     let result = builder.inst_results(call)[0];
 
     let pending = builder

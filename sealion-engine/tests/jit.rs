@@ -470,3 +470,654 @@ fn array_constructor_and_method_references() {
     assert_eq!(run("new Array(7, 8)[1];"), 8);
     assert_eq!(run("var a = []; var push = a.push; push(4); a[0];"), 4);
 }
+
+#[test]
+fn this_in_methods_and_arrows() {
+    assert_eq!(
+        run("var o = { x: 7, f: function () { return this.x; } }; o.f();"),
+        7
+    );
+    assert_eq!(
+        run("var o = { x: 7, f: function () { return this.x; } }; o['f']();"),
+        7
+    );
+    assert_eq!(run("var o = { x: 2, f() { return this.x; } }; o.f();"), 2);
+    assert_eq!(
+        run("var o = { x: 1, f: function () { return this === o; } }; o.f() ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = { x: 7, f: function () { return this.x; } }; var g = o.f; g() === undefined ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var o = { x: 5, f: function () { var g = () => this.x; return g(); } }; o.f();"),
+        5
+    );
+    assert_eq!(
+        run("var o = { x: 3, f: function () { return () => this.x; } }; var g = o.f(); g();"),
+        3
+    );
+}
+
+#[test]
+fn typeof_operator() {
+    assert_eq!(run(r#"typeof 1 === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof "s" === "string" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof true === "boolean" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof undefined === "undefined" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof null === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof {} === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof [1] === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof function () {} === "function" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"function f() {} typeof f === "function" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof notDefined === "undefined" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"typeof (alsoNotDefined) === "undefined" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof Math === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Number === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var x; typeof x === "undefined" ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn array_callbacks_receive_index_and_array() {
+    assert_eq!(
+        run("[10, 20].map(function (x, i) { return x + i; })[1];"),
+        21
+    );
+    assert_eq!(
+        run("[1, 2, 3].map(function (x, i, arr) { return arr.length; })[0];"),
+        3
+    );
+    assert_eq!(
+        run("[1, 2, 3].filter(function (x, i) { return i > 0; }).length;"),
+        2
+    );
+    assert_eq!(
+        run(
+            r#"var out = ""; [1, 2, 3].forEach(function (x, i) { out = out + i; }); out === "012" ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run("var a = [1, 2, 3]; a.reduce(function (acc, x) { return acc * x; });"),
+        6
+    );
+    assert_eq!(
+        run("[1, 2, 3].findIndex(function (x) { return x === 9; }) === -1 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("[1, 2, 3].some(function (x) { return x > 9; }) ? 0 : 1;"),
+        1
+    );
+    assert_eq!(
+        run("[1, 2, 3].every(function (x) { return x > 1; }) ? 0 : 1;"),
+        1
+    );
+    assert_eq!(
+        run("var a = [1, 2, 3]; a.map(function (x) { return [x, x * 2]; })[1][0];"),
+        2
+    );
+    assert_eq!(
+        run("[[1, 2], [3, 4]].map(function (p) { return p[0] + p[1]; })[1];"),
+        7
+    );
+}
+
+#[test]
+fn array_methods_copy_and_compose() {
+    assert_eq!(run("var a = [1, 2]; var b = a.slice(); b[0] = 9; a[0];"), 1);
+    assert_eq!(
+        run("var a = [1]; var b = a.concat([2]); a.length + b.length;"),
+        3
+    );
+    assert_eq!(
+        run(r#"var a = [1, 2, 3]; a.slice(1).join(",") === "2,3" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2, 3]; a.slice(5).length;"), 0);
+    assert_eq!(run("var a = [1, 2, 3]; a.slice(-2, -1)[0];"), 2);
+    assert_eq!(
+        run(
+            r#"var a = [1, 2, 3]; a.map(function (x) { return x * x; }).join(",") === "1,4,9" ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(r#"var a = [1, 2, 3]; a.join("") === "123" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2, 3]; a.concat(a).length;"), 6);
+    assert_eq!(
+        run(r#"var a = ["a", "b"]; a.reverse(); a.join("") === "ba" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var a = [5]; a.unshift(1, 2, 3); a.join(",") === "1,2,3,5" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("[1, 2, 3].includes(3, 1) ? 1 : 0;"), 1);
+    assert_eq!(run(r#"["a", "b", "c"].indexOf("c", 5) === -1 ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn array_indices_length_and_aliasing() {
+    assert_eq!(run("var a = []; a[0] = 1; a.length;"), 1);
+    assert_eq!(run("var a = [1, 2, 3]; a[10] = 5; a.length;"), 11);
+    assert_eq!(run("var a = [1, 2, 3]; delete a[1]; a.length;"), 3);
+    assert_eq!(
+        run("var a = [1, 2, 3]; delete a[1]; a[1] === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run(r#"var a = [1, 2, 3]; a.length = 2; a.join(",") === "1,2" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var a = [1, 2, 3]; a[1] = 9; a.join(",") === "1,9,3" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2]; var b = a; b.push(3); a.length;"), 3);
+    assert_eq!(run("[1, [2, [3]]][1][1][0];"), 3);
+    assert_eq!(
+        run("var a = [1, 2, 3]; a.reverse(); a[0] === 3 && a[2] === 1 ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run(r#"Array.isArray([1]) && !Array.isArray("x") ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run("var a = [1, 2]; a.indexOf(1, 1) === -1 ? 1 : 0;"), 1);
+}
+
+#[test]
+fn array_closures_capture_and_mutate() {
+    assert_eq!(
+        run("var a = []; function add(x) { a.push(x); } add(1); add(2); a.length;"),
+        2
+    );
+    assert_eq!(
+        run("var a = [1, 2]; var f = function () { return a.length; }; a.push(3); f();"),
+        3
+    );
+    assert_eq!(
+        run("var f = function () { var inner = [1]; inner.push(2); return inner; }; f().length;"),
+        2
+    );
+    assert_eq!(
+        run("var a = []; for (var i = 0; i < 5; i = i + 1) { a.push(i * i); } a[4];"),
+        16
+    );
+    assert_eq!(
+        run(
+            "var a = [1, 2, 3, 4].filter(function (x) { return x > 2; }); a.map(function (x) { return x * 10; })[1];"
+        ),
+        40
+    );
+}
+
+#[test]
+fn map_values_hold_every_value_kind() {
+    assert_eq!(run("new Map().size;"), 0);
+    assert_eq!(run("new Map().set(1, 2).get(1);"), 2);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1).set("b", 2); m.size;"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", [1, 2]); m.get("a")[1];"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", {n: 5}); m.get("a").n;"#),
+        5
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("o", {n: 1}); m.get("o").n = 2; m.get("o").n;"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("f", function () { return 3; }); m.get("f")();"#),
+        3
+    );
+    assert_eq!(run("var m = new Map(); m.set(true, 1); m.get(true);"), 1);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", [1, 2]); m.get("a").push(3); m.get("a").length;"#),
+        3
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set(1, "one"); typeof m.get(1) === "string" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.get("a") === 1 ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn map_keys_use_same_value_zero_and_identity() {
+    assert_eq!(
+        run(r#"var m = new Map(); m.set(1, 1); m.set("1", 2); m.get(1);"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set(1, 1); m.set("1", 2); m.size;"#),
+        2
+    );
+    assert_eq!(
+        run("var m = new Map(); m.set(NaN, 1); m.set(NaN, 2); m.size;"),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set(0, "zero"); m.get(-0) === "zero" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("k", 1); m.get("K") === undefined ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run("var m = new Map(); var k = {}; m.set(k, 1); m.has(k) ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var m = new Map(); m.set({}, 1); m.has({}) ? 0 : 1;"),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("a", 2); m.size;"#),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.delete("a"); m.get("a") === undefined ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("b", 2); m.delete("a"); m.size;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.clear(); m.set("b", 2); m.get("b");"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.clear(); m.has("a") ? 0 : 1;"#),
+        1
+    );
+}
+
+#[test]
+fn map_for_each_receives_map_and_preserves_order() {
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.set("b", 2); var out = ""; m.forEach(function (v, k) { out = out + k + v; }); out === "a1b2" ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.set("b", 2); var t = 0; m.forEach(function (v) { t = t * 10 + v; }); t;"#
+        ),
+        12
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); var same = 0; m.forEach(function (v, k, map) { same = map === m ? 1 : 0; }); same;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run("var m = new Map(); var c = 0; m.forEach(function () { c = c + 1; }); c;"),
+        0
+    );
+    assert_eq!(
+        run(
+            "var count = 0; var m = new Map(); m.set(\"a\", 1); m.forEach(function () { count = count + 1; }); count;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.forEach(function (v, k, map) { map.set(k + "!", v * 10); }); m.size;"#
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.set("b", 2); m.forEach(function (v, k, map) { if (k === "a") { m.delete(k); } }); m.size;"#
+        ),
+        1
+    );
+}
+
+#[test]
+fn map_flows_through_functions_and_containers() {
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); function read(map, k) { return map.get(k); } read(m, "a");"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); var o = {m: m}; o.m.set("a", 1); m.size;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var ms = [new Map()]; ms[0].set("a", 1); ms[0].get("a");"#),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var outer = new Map(); outer.set("in", new Map()); outer.get("in").set("x", 5); outer.get("in").get("x");"#
+        ),
+        5
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); var n = m; n.set("b", 2); m.size;"#),
+        2
+    );
+    assert_eq!(run(r#"var m = new Map(); m === m ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var m = new Map(); var s = m.size; m.set("a", 1); s;"#),
+        0
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", {}); typeof m.get("a") === "object" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn this_rebinds_to_the_call_site_receiver() {
+    assert_eq!(
+        run(
+            "var o = {v: 1, get: function () { return this.v; }}; var p = {v: 2, get: o.get}; p.get();"
+        ),
+        2
+    );
+    assert_eq!(
+        run("var o = {x: 2, f: function () { return this.x; }}; ({x: 5, f: o.f}).f();"),
+        5
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 1, a: function () { return this.b(); }, b: function () { return this.x + 1; }}; o.a();"
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 3, f: function () { return this.x; }}; function run1(x) { return x.f(); } run1(o);"
+        ),
+        3
+    );
+    assert_eq!(
+        run("var o = {inner: {x: 7, f: function () { return this.x; }}}; o.inner.f();"),
+        7
+    );
+    assert_eq!(
+        run("function f() { return {x: 3, get: function () { return this.x; }}; } f().get();"),
+        3
+    );
+    assert_eq!(
+        run("var o = {f: function () { return this; }}; o.f() === o ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = {x: 9}; o.get = function () { return this.x; }; o.get();"),
+        9
+    );
+}
+
+#[test]
+fn this_mutates_and_chains_on_the_receiver() {
+    assert_eq!(
+        run(
+            "var o = {n: 1, inc: function () { this.n = this.n + 1; return this.n; }}; o.inc(); o.inc();"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var o = {n: 0, add: function (x) { this.n = this.n + x; return this; }}; o.add(1).add(2).n;"
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 1, f: function () { return this.x; }}; var c = 0; while (c < 2) { o.f(); c = c + 1; } o.x;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var a = [1, 2, 3]; a.get = function () { return this.length; }; a.get();"),
+        3
+    );
+    assert_eq!(
+        run("var o = {x: 5, f: function () { return this.x + this.x; }}; o.f();"),
+        10
+    );
+    assert_eq!(
+        run(r#"var o = {x: 4}; o["f"] = function () { return this.x; }; o.f();"#),
+        4
+    );
+}
+
+#[test]
+fn this_in_computed_and_optional_member_calls() {
+    assert_eq!(
+        run(r#"var o = {x: 6, f: function () { return this.x; }}; var k = "f"; o[k]();"#),
+        6
+    );
+    assert_eq!(
+        run(r#"var o = {x: 6, f: function () { return this.x; }}; var k = "f"; o?.[k]();"#),
+        6
+    );
+    assert_eq!(
+        run("var o = {x: 6, f: function () { return this.x; }}; o?.f();"),
+        6
+    );
+    assert_eq!(run("var o = null; o?.f() === undefined ? 1 : 0;"), 1);
+
+    assert_eq!(
+        run(r#"var o = {d: {v: 3, f: function () { return this.v; }}}; var k = "d"; o[k].f();"#),
+        3
+    );
+}
+
+#[test]
+fn this_is_undefined_for_plain_and_detached_calls() {
+    assert_eq!(
+        run("function f() { return this === undefined ? 1 : 0; } f();"),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 7, f: function () { return this.x; }}; var g = o.f; g() === undefined ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = {f: function () { return typeof this; }}; var g = o.f; g() === \"undefined\" ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = {f: function () { return this === o ? 1 : 0; }}; var g = function () { return o.f(); }; g();"
+        ),
+        1
+    );
+    assert_eq!(run("var g = () => this; g() === undefined ? 1 : 0;"), 1);
+    assert_eq!(
+        run("var t = 0; [1].forEach(function () { t = this === undefined ? 1 : 0; }); t;"),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var t = 0; var m = new Map(); m.set("a", 1); m.forEach(function () { t = this === undefined ? 1 : 0; }); t;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run("var o = {f: function () { return this; }}; var fs = [o.f]; fs[0]() === fs ? 1 : 0;"),
+        1
+    );
+}
+
+#[test]
+fn this_in_nested_ordinary_functions_and_arrows() {
+    assert_eq!(
+        run(
+            "var o = {x: 1, f: function () { function inner() { return this; } return inner() === undefined ? 1 : 0; }}; o.f();"
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 1, f: function () { var g = function () { return this === undefined ? 1 : 0; }; return g(); }}; o.f();"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var o = {x: 4, f: function () { return (() => this.x)(); }}; o.f();"),
+        4
+    );
+    assert_eq!(
+        run("var o = {x: 4, f: function () { var g = () => () => this.x; return g()(); }}; o.f();"),
+        4
+    );
+    assert_eq!(
+        run("var o = {x: 3, f: function () { return () => this.x; }}; var g = o.f(); g();"),
+        3
+    );
+    assert_eq!(
+        run(
+            "var o = {x: 1, f: function () { return typeof this.x; }}; o.f() === \"number\" ? 1 : 0;"
+        ),
+        1
+    );
+    assert_eq!(
+        run("var o = {f: function () { return typeof this; }}; o.f() === \"object\" ? 1 : 0;"),
+        1
+    );
+    assert_eq!(
+        run("var o = {x: 2, f: function () { return [1, 2].map(() => this.x).length; }}; o.f();"),
+        2
+    );
+}
+
+#[test]
+fn typeof_covers_every_value_kind() {
+    assert_eq!(run(r#"typeof 1 === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof -1 === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof NaN === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof (0 / 0) === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof "s" === "string" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof true === "boolean" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof (1 === 1) === "boolean" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof undefined === "undefined" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof null === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof {} === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof [] === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof new Map() === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof function () {} === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof (() => 1) === "function" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var o = {f: function () {}}; typeof o.f === "function" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof [].push === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof new Map().get === "function" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var a = [1, "s"]; typeof a[1] === "string" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof [1, 2] === typeof {} ? 1 : 0;"#), 1);
+}
+
+#[test]
+fn typeof_builtin_globals_and_undeclared_names() {
+    assert_eq!(run(r#"typeof Math === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Math.PI === "number" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof console === "object" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Number === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof String === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Boolean === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Array === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Map === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Object === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof Date === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof isNaN === "function" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof notDefined === "undefined" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"typeof (alsoNotDefined) === "undefined" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof typeof notDefined === "string" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var o = {}; typeof o.nope === "undefined" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"function f(a) { return typeof a; } f() === "undefined" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"var x; typeof x === "undefined" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"function f() {} typeof f() === "undefined" ? 1 : 0;"#),
+        1
+    );
+}
+
+#[test]
+fn typeof_composes_with_operators_and_control_flow() {
+    assert_eq!(run(r#"(typeof 1) + 2 === "number2" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"typeof typeof 1 === "string" ? 1 : 0;"#), 1);
+    assert_eq!(run(r#"var t = typeof 1; t === "number" ? 1 : 0;"#), 1);
+    assert_eq!(
+        run(r#"var o = {t: typeof 1}; o.t === "number" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var t = 0; if (typeof 1 === "number") { t = 1; } t;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var r = 0; switch (typeof 1) { case "number": r = 1; break; default: r = 2; } r;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"function f(a) { return typeof a; } f(1) === "number" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"function f(a) { return typeof a; } f("s") === "string" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"function f(a) { return typeof a; } f({}) === "object" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"function f(a) { return typeof a; } f(function () {}) === "function" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var s = "x"; typeof s === "string" && typeof s.length === "number" ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"typeof [1, 2].length === "number" ? 1 : 0;"#), 1);
+}

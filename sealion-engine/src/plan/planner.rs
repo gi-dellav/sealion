@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, CatchClause, ChainElement, Expression, ForStatement,
     ForStatementInit, FormalParameters, Function, ObjectPropertyKind, PropertyKey,
-    SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+    SimpleAssignmentTarget, Statement, UnaryOperator, VariableDeclaration, VariableDeclarationKind,
 };
 
 use crate::Error;
@@ -25,6 +25,7 @@ pub fn build_program_plan<'a>(
         Vec::new(),
         FunctionBodyPlan::Statements(program.body.as_slice()),
         true,
+        false,
         None,
     )?;
 
@@ -122,6 +123,7 @@ impl<'a> Planner<'a> {
         self.functions[plan_id].root_scope
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_function_plan(
         &mut self,
         parent_scope: Option<ScopeId>,
@@ -129,6 +131,7 @@ impl<'a> Planner<'a> {
         params: Vec<ParamPlan<'a>>,
         body: FunctionBodyPlan<'a>,
         is_script: bool,
+        is_arrow: bool,
         self_binding: Option<&'a str>,
     ) -> Result<usize, Error> {
         let id = self.functions.len();
@@ -154,6 +157,11 @@ impl<'a> Planner<'a> {
         if let Some(name) = self_binding {
             self.add_binding(root_scope, name);
         }
+        // Arrow functions inherit `this` lexically, so only ordinary functions
+        // (and the script) get a binding of their own.
+        if !is_arrow {
+            self.add_binding(root_scope, "this");
+        }
 
         for param in &params {
             if let Some(init) = param.init {
@@ -173,6 +181,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Builds a plan for a function or arrow expression nested in `scope`.
+    #[allow(clippy::too_many_arguments)]
     fn add_nested_function(
         &mut self,
         plan_id: usize,
@@ -180,12 +189,20 @@ impl<'a> Planner<'a> {
         key: usize,
         params: &'a FormalParameters<'a>,
         body: FunctionBodyPlan<'a>,
+        is_arrow: bool,
         self_binding: Option<&'a str>,
     ) -> Result<(), Error> {
         let params = collect_params(params)?;
         let name = format!("js_fn_{}", self.functions.len());
-        let child =
-            self.build_function_plan(Some(scope), name, params, body, false, self_binding)?;
+        let child = self.build_function_plan(
+            Some(scope),
+            name,
+            params,
+            body,
+            false,
+            is_arrow,
+            self_binding,
+        )?;
         self.mark_captured(scope);
         self.functions[plan_id].nested.insert(key, child);
         Ok(())
@@ -429,6 +446,7 @@ impl<'a> Planner<'a> {
             params,
             FunctionBodyPlan::Statements(body.statements.as_slice()),
             false,
+            false,
             None,
         )?;
         self.mark_captured(root);
@@ -483,6 +501,7 @@ impl<'a> Planner<'a> {
                     node_key(&**func),
                     &func.params,
                     FunctionBodyPlan::Statements(body.statements.as_slice()),
+                    false,
                     func.id.as_ref().map(|id| id.name.as_str()),
                 )?;
             }
@@ -499,6 +518,7 @@ impl<'a> Planner<'a> {
                     node_key(&**arrow),
                     &arrow.params,
                     body,
+                    true,
                     None,
                 )?;
             }
@@ -514,6 +534,18 @@ impl<'a> Planner<'a> {
                 self.scan_expression(plan_id, scope, &logical.right)?;
             }
             Expression::UnaryExpression(unary) => {
+                if unary.operator == UnaryOperator::Typeof {
+                    for name in [
+                        "undefined",
+                        "boolean",
+                        "number",
+                        "string",
+                        "function",
+                        "object",
+                    ] {
+                        self.add_string(name.to_string());
+                    }
+                }
                 self.scan_expression(plan_id, scope, &unary.argument)?;
             }
             Expression::UpdateExpression(update) => {

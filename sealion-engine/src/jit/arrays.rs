@@ -9,7 +9,7 @@
 //! Methods are exposed as native closures: a two-word record whose first word
 //! is the address of one of the entry points below and whose second word is the
 //! array pointer. They therefore use the ordinary JavaScript calling convention
-//! (`env`, argument block, callee) and work through the same indirect call path
+//! (`env`, argument block, callee, this) and work through the same indirect call path
 //! as a user function, including `var push = a.push`.
 
 use sealion_string::JsString;
@@ -21,8 +21,8 @@ use super::strings::{
 };
 use crate::value::{PAYLOAD_MASK, TAG_FUNCTION, TAG_UNDEFINED};
 
-type Method = extern "C" fn(i64, *const u8, f64) -> f64;
-type JsCall = unsafe extern "C" fn(i64, *const u8, f64) -> f64;
+type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
+type JsCall = unsafe extern "C" fn(i64, *const u8, f64, f64) -> f64;
 
 /// Argument blocks hold at most this many values (`compiler::call::MAX_ARGS`).
 const MAX_ARGS: usize = 32;
@@ -237,7 +237,14 @@ pub(super) fn call(callback: f64, arguments: &[f64]) -> f64 {
         *slot = argument.to_bits();
     }
     let function: JsCall = unsafe { std::mem::transmute(code as usize) };
-    unsafe { function(env as i64, block.as_ptr().cast(), callback) }
+    unsafe {
+        function(
+            env as i64,
+            block.as_ptr().cast(),
+            callback,
+            tagged_undefined(),
+        )
+    }
 }
 
 /// Resolves a relative start/end argument the way `slice` and `indexOf` do.
@@ -253,7 +260,7 @@ fn relative(args: *const u8, index: usize, length: usize, default: usize) -> usi
     (number as usize).min(length)
 }
 
-extern "C" fn push(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn push(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let count = arg_count(args);
     let length = with_array(env, |elements| {
         for index in 0..count {
@@ -265,13 +272,13 @@ extern "C" fn push(env: i64, args: *const u8, _this: f64) -> f64 {
     length as f64
 }
 
-extern "C" fn pop(env: i64, _args: *const u8, _this: f64) -> f64 {
+extern "C" fn pop(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
     with_array(env, Vec::pop)
         .flatten()
         .unwrap_or_else(tagged_undefined)
 }
 
-extern "C" fn shift(env: i64, _args: *const u8, _this: f64) -> f64 {
+extern "C" fn shift(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
     with_array(env, |elements| {
         if elements.is_empty() {
             None
@@ -283,7 +290,7 @@ extern "C" fn shift(env: i64, _args: *const u8, _this: f64) -> f64 {
     .unwrap_or_else(tagged_undefined)
 }
 
-extern "C" fn unshift(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn unshift(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let count = arg_count(args);
     let length = with_array(env, |elements| {
         for index in (0..count).rev() {
@@ -295,7 +302,7 @@ extern "C" fn unshift(env: i64, args: *const u8, _this: f64) -> f64 {
     length as f64
 }
 
-extern "C" fn join(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn join(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let separator = arg(args, 0);
     let separator = if separator.to_bits() >> 48 == TAG_UNDEFINED {
         JsString::from(",")
@@ -307,7 +314,7 @@ extern "C" fn join(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_string(text)
 }
 
-extern "C" fn to_string(env: i64, _args: *const u8, _this: f64) -> f64 {
+extern "C" fn to_string(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
     let text = with_array(env, |elements| {
         join_elements(elements, &JsString::from(","))
     })
@@ -315,7 +322,7 @@ extern "C" fn to_string(env: i64, _args: *const u8, _this: f64) -> f64 {
     tagged_string(text)
 }
 
-extern "C" fn slice(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn slice(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let length = length(env);
     let start = relative(args, 0, length, 0);
     let end = relative(args, 1, length, length);
@@ -328,7 +335,7 @@ extern "C" fn slice(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_object(new_array(sliced))
 }
 
-extern "C" fn concat(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn concat(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let mut elements = with_array(env, |elements| elements.clone()).unwrap_or_default();
     for index in 0..arg_count(args) {
         let value = arg(args, index);
@@ -340,7 +347,7 @@ extern "C" fn concat(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_object(new_array(elements))
 }
 
-extern "C" fn index_of(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn index_of(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let search = arg(args, 0);
     let length = length(env);
     for index in relative(args, 1, length, 0)..length {
@@ -351,7 +358,7 @@ extern "C" fn index_of(env: i64, args: *const u8, _this: f64) -> f64 {
     -1.0
 }
 
-extern "C" fn includes(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn includes(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let search = arg(args, 0);
     let length = length(env);
     for index in relative(args, 1, length, 0)..length {
@@ -362,12 +369,12 @@ extern "C" fn includes(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_bool(false)
 }
 
-extern "C" fn reverse(env: i64, _args: *const u8, _this: f64) -> f64 {
+extern "C" fn reverse(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
     with_array(env, |elements| elements.reverse());
     array_value(env)
 }
 
-extern "C" fn for_each(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn for_each(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     for index in 0..length(env) {
@@ -376,7 +383,7 @@ extern "C" fn for_each(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_undefined()
 }
 
-extern "C" fn map(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn map(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     let mut mapped = Vec::with_capacity(length(env));
@@ -386,7 +393,7 @@ extern "C" fn map(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_object(new_array(mapped))
 }
 
-extern "C" fn filter(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn filter(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     let mut kept = Vec::new();
@@ -399,7 +406,7 @@ extern "C" fn filter(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_object(new_array(kept))
 }
 
-extern "C" fn some(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn some(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     for index in 0..length(env) {
@@ -410,7 +417,7 @@ extern "C" fn some(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_bool(false)
 }
 
-extern "C" fn every(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn every(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     for index in 0..length(env) {
@@ -421,7 +428,7 @@ extern "C" fn every(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_bool(true)
 }
 
-extern "C" fn find(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn find(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     for index in 0..length(env) {
@@ -433,7 +440,7 @@ extern "C" fn find(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_undefined()
 }
 
-extern "C" fn find_index(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn find_index(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     for index in 0..length(env) {
@@ -444,7 +451,7 @@ extern "C" fn find_index(env: i64, args: *const u8, _this: f64) -> f64 {
     -1.0
 }
 
-extern "C" fn reduce(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn reduce(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = array_value(env);
     let length = length(env);

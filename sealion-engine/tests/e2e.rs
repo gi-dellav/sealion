@@ -1660,3 +1660,18 @@ fn rejects_invalid_target() {
     };
     assert!(Engine::new().compile_with_options("1;", &options).is_err());
 }
+
+#[test]
+fn this_binding() {
+    assert_eq!(
+        run("function f() { return this; } f() === undefined ? 1 : 0;"),
+        1
+    );
+    assert_eq!(run("var f = () => this; f() === undefined ? 1 : 0;"), 1);
+    assert_eq!(
+        run(
+            "function outer() { function inner() { return this; } return inner() === undefined ? 1 : 0; } outer();"
+        ),
+        1
+    );
+}

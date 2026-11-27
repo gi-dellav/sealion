@@ -249,6 +249,27 @@ impl Builtins {
         name == "undefined"
     }
 
+    /// The `typeof` result for one of the engine's builtin globals. `Math` and
+    /// `console` are plain objects, so every other namespace names a function.
+    pub fn typeof_name(&self, name: &str) -> Option<&'static str> {
+        if self.is_undefined(name) {
+            Some("undefined")
+        } else if self.global_constant(name).is_some() {
+            Some("number")
+        } else if self.global_function(name).is_some()
+            || matches!(
+                self.namespace(name),
+                Some(Namespace::Object | Namespace::Date)
+            )
+        {
+            Some("function")
+        } else if self.namespace(name).is_some() {
+            Some("object")
+        } else {
+            None
+        }
+    }
+
     /// True when `name` is one of the engine's builtin globals.
     pub fn is_global(&self, name: &str) -> bool {
         self.namespace(name).is_some()

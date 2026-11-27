@@ -168,8 +168,16 @@ pub fn is_uninitialized(builder: &mut FunctionBuilder, value: Value) -> Value {
     tag_is(builder, value, TAG_UNINITIALIZED)
 }
 
-fn is_boolean(builder: &mut FunctionBuilder, value: Value) -> Value {
+pub fn is_boolean(builder: &mut FunctionBuilder, value: Value) -> Value {
     tag_is(builder, value, TAG_BOOLEAN)
+}
+
+pub fn is_function(builder: &mut FunctionBuilder, value: Value) -> Value {
+    tag_is(builder, value, TAG_FUNCTION)
+}
+
+pub fn is_string(builder: &mut FunctionBuilder, value: Value) -> Value {
+    tag_is(builder, value, TAG_STRING)
 }
 
 fn call1(builder: &mut FunctionBuilder, func_ref: FuncRef, arg: Value) -> Value {

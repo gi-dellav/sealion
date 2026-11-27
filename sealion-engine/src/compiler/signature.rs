@@ -6,6 +6,7 @@ pub fn make_js_signature<M: Module>(module: &M) -> Signature {
     sig.params.push(AbiParam::new(types::I64));
     sig.params.push(AbiParam::new(types::I64));
     sig.params.push(AbiParam::new(types::F64));
+    sig.params.push(AbiParam::new(types::F64));
     sig.returns.push(AbiParam::new(types::F64));
     sig
 }

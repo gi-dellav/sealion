@@ -174,8 +174,27 @@ pub(super) fn compile_call<'a>(
         );
     }
 
+    // `object.method(...)` passes the object as `this`; every other call form
+    // passes `undefined`.
+    match &call.callee {
+        Expression::StaticMemberExpression(access) => {
+            let receiver = compile_expr(builder, ctx, flow, &access.object)?;
+            let key = object::static_key(builder, ctx, access.property.name.as_str())?;
+            let callee = object::get(builder, ctx, receiver, key)?;
+            return compile_call_value(builder, ctx, flow, callee, receiver, &call.arguments);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let receiver = compile_expr(builder, ctx, flow, &member.object)?;
+            let key = compile_expr(builder, ctx, flow, &member.expression)?;
+            let callee = object::get(builder, ctx, receiver, key)?;
+            return compile_call_value(builder, ctx, flow, callee, receiver, &call.arguments);
+        }
+        _ => {}
+    }
+
     let callee = compile_expr(builder, ctx, flow, &call.callee)?;
-    compile_call_value(builder, ctx, flow, callee, &call.arguments)
+    let this = value::undefined(builder);
+    compile_call_value(builder, ctx, flow, callee, this, &call.arguments)
 }
 
 /// Evaluates call arguments into a stack buffer the callee reads in its
@@ -232,9 +251,10 @@ fn compile_direct_call<'a>(
         .ins()
         .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
     let args_ptr = compile_args(builder, ctx, flow, args)?;
+    let this = value::undefined(builder);
     let call = builder
         .ins()
-        .call(func_ref, &[captured_env, args_ptr, callee]);
+        .call(func_ref, &[captured_env, args_ptr, callee, this]);
     let result = builder.inst_results(call)[0];
     emit_exception_check(builder, ctx, flow)?;
     Ok(result)
@@ -245,6 +265,7 @@ pub(super) fn compile_call_value<'a>(
     ctx: &CodegenCtx<'a>,
     flow: &mut Flow<'a>,
     callee: Value,
+    this: Value,
     args: &'a [Argument<'a>],
 ) -> Result<Value, Error> {
     let callee_ptr = value::payload(builder, callee);
@@ -256,9 +277,11 @@ pub(super) fn compile_call_value<'a>(
         .load(types::I64, MemFlags::new(), callee_ptr, 8i32);
     let args_ptr = compile_args(builder, ctx, flow, args)?;
 
-    let call = builder
-        .ins()
-        .call_indirect(ctx.js_sig_ref, code, &[captured_env, args_ptr, callee]);
+    let call = builder.ins().call_indirect(
+        ctx.js_sig_ref,
+        code,
+        &[captured_env, args_ptr, callee, this],
+    );
     let result = builder.inst_results(call)[0];
     emit_exception_check(builder, ctx, flow)?;
     Ok(result)

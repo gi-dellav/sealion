@@ -535,14 +535,16 @@ records are described in detail in [CLOSURE.md](CLOSURE.md).
 Every JavaScript function has one signature (`sealion-engine/src/compiler/signature.rs:4`):
 
 ```text
-(i64 env, i64 args, f64 callee) -> f64
+(i64 env, i64 args, f64 callee, f64 this) -> f64
 ```
 
 - `env` is the captured environment pointer, not a JS value.
 - `args` points to a block whose first word is the argument count and whose
   following words are `f64` arguments.
 - `callee` is the function value itself, used for named function expression
-  self bindings. It is not `this`.
+  self bindings.
+- `this` is the receiver of `object.method(...)` calls, `undefined` otherwise;
+  arrows capture the enclosing `this` instead.
 - The return value is a NaN-boxed `f64`.
 
 `compile_call_value` (`sealion-engine/src/compiler/call.rs:128`) allocates the argument block with
@@ -625,13 +627,14 @@ The value domain is deliberately narrow:
 - No symbols, BigInts or regular expressions. In the AOT backend, string,
   object and array values are rejected at compile time; the dynamic backend
   supports strings, plain objects and dense arrays.
-- Objects are own-property bags: no prototypes, `__proto__`, `this`, getters,
-  setters, spread or property descriptors, and `delete` always succeeds. An
+- Objects are own-property bags: no prototypes, `__proto__`, getters, setters,
+  spread or property descriptors, and `delete` always succeeds. An
   array is a `JsObject` with a dense `Vec<f64>` of elements; it answers
   `length`, indices and a handful of methods but has no prototype, no iterator
   protocol and no sparse representation (deleting an index leaves `undefined`).
   `Object.keys`/`values`/`entries` are absent; only `Object.is` is implemented.
-- No `typeof` or `instanceof`. `in` works on objects in the dynamic backend.
+- No `instanceof`. `typeof` is implemented and needs the dynamic backend
+  because its result is a string. `in` works on objects in the dynamic backend.
   There are no wrapper objects, so a property read on a primitive yields
   `undefined` (strings answer `length`).
 - No function objects as property containers: `f.name`, `f.length` and similar

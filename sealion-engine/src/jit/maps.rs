@@ -19,7 +19,7 @@ use super::objects::{JsObject, new_map, tagged_object, with_object};
 use super::strings::{same_value_zero, tagged_bool, tagged_undefined};
 use crate::value::{PAYLOAD_MASK, TAG_FUNCTION};
 
-type Method = extern "C" fn(i64, *const u8, f64) -> f64;
+type Method = extern "C" fn(i64, *const u8, f64, f64) -> f64;
 
 pub(super) fn is_map(value: f64) -> bool {
     with_object(value, |object| object.entries.is_some()).unwrap_or(false)
@@ -77,7 +77,7 @@ fn method(key: &JsString) -> Option<Method> {
     })
 }
 
-extern "C" fn get(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn get(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let key = arg(args, 0);
     with_map(env, |entries| {
         entry_index(entries, key).map(|index| entries[index].1)
@@ -86,7 +86,7 @@ extern "C" fn get(env: i64, args: *const u8, _this: f64) -> f64 {
     .unwrap_or_else(tagged_undefined)
 }
 
-extern "C" fn set(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn set(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let key = arg(args, 0);
     let value = arg(args, 1);
     with_map(env, |entries| match entry_index(entries, key) {
@@ -97,13 +97,13 @@ extern "C" fn set(env: i64, args: *const u8, _this: f64) -> f64 {
     map_value(env)
 }
 
-extern "C" fn has(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn has(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let key = arg(args, 0);
     let found = with_map(env, |entries| entry_index(entries, key).is_some()).unwrap_or(false);
     tagged_bool(found)
 }
 
-extern "C" fn delete(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn delete(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let key = arg(args, 0);
     let removed = with_map(env, |entries| match entry_index(entries, key) {
         Some(index) => {
@@ -116,14 +116,14 @@ extern "C" fn delete(env: i64, args: *const u8, _this: f64) -> f64 {
     tagged_bool(removed)
 }
 
-extern "C" fn clear(env: i64, _args: *const u8, _this: f64) -> f64 {
+extern "C" fn clear(env: i64, _args: *const u8, _callee: f64, _this: f64) -> f64 {
     with_map(env, Vec::clear);
     tagged_undefined()
 }
 
 /// Calls `callback(value, key, map)` for every entry in insertion order. The
 /// entries are copied first so that the callback may mutate the map safely.
-extern "C" fn for_each(env: i64, args: *const u8, _this: f64) -> f64 {
+extern "C" fn for_each(env: i64, args: *const u8, _callee: f64, _this: f64) -> f64 {
     let callback = arg(args, 0);
     let this = map_value(env);
     let entries = with_map(env, |entries| entries.clone()).unwrap_or_default();

@@ -137,6 +137,7 @@ pub(super) fn compile_expr<'a>(
         Expression::BigIntLiteral(_) | Expression::RegExpLiteral(_) => Err(Error::Unsupported(
             "this literal is not supported".to_string(),
         )),
+        Expression::ThisExpression(_) => load_var(builder, ctx, "this"),
         Expression::Identifier(id) => {
             let name = id.name.as_str();
             if is_free_global(ctx, name) {
@@ -517,6 +518,9 @@ pub(super) fn compile_unary<'a>(
     if unary.operator == UnaryOperator::Delete {
         return compile_delete(builder, ctx, flow, &unary.argument);
     }
+    if unary.operator == UnaryOperator::Typeof {
+        return compile_typeof(builder, ctx, flow, &unary.argument);
+    }
     let target = compile_expr(builder, ctx, flow, &unary.argument)?;
     match unary.operator {
         UnaryOperator::UnaryNegation => {
@@ -549,6 +553,46 @@ pub(super) fn compile_unary<'a>(
             "unary operator not supported: {other:?}"
         ))),
     }
+}
+
+/// The identifier `typeof` names, looking through parentheses. `typeof` of an
+/// unresolvable name is the one read that must not throw.
+fn typeof_identifier<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::ParenthesizedExpression(paren) => typeof_identifier(&paren.expression),
+        _ => None,
+    }
+}
+
+/// `typeof x`, classified by the NaN-boxing tag. Builtin globals have no
+/// runtime value, so they are answered from the compile-time tables.
+fn compile_typeof<'a>(
+    builder: &mut FunctionBuilder,
+    ctx: &CodegenCtx<'a>,
+    flow: &mut Flow<'a>,
+    argument: &'a Expression<'a>,
+) -> Result<Value, Error> {
+    if let Some(name) = typeof_identifier(argument)
+        && resolve_binding(ctx.program, ctx.scope, name).is_none()
+    {
+        let kind = ctx.builtins.typeof_name(name).unwrap_or("undefined");
+        return compile_string_data(builder, ctx, kind);
+    }
+
+    let value = compile_expr(builder, ctx, flow, argument)?;
+    let mut result = compile_string_data(builder, ctx, "object")?;
+    for (condition, name) in [
+        (value::is_undefined(builder, value), "undefined"),
+        (value::is_boolean(builder, value), "boolean"),
+        (value::is_string(builder, value), "string"),
+        (value::is_function(builder, value), "function"),
+        (value::not_tagged(builder, value), "number"),
+    ] {
+        let text = compile_string_data(builder, ctx, name)?;
+        result = builder.ins().select(condition, text, result);
+    }
+    Ok(result)
 }
 
 pub(super) fn compile_delete<'a>(

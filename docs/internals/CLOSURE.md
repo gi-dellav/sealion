@@ -324,14 +324,15 @@ expressions and arrows, has the same signature (`make_js_signature`,
 `sealion-engine/src/compiler/signature.rs:4`):
 
 ```text
-(i64 env, i64 args, f64 callee) -> f64
+(i64 env, i64 args, f64 callee, f64 this) -> f64
 ```
 
 - `env`: the environment captured by the closure being called.
 - `args`: pointer to an argument block.
-- `callee`: the function value itself. This is not `this`; `this` is not
-  implemented. It exists so named function expressions can initialise their
-  self binding without a separate lookup.
+- `callee`: the function value itself. It exists so named function expressions
+  can initialise their self binding without a separate lookup.
+- `this`: the receiver for `object.method(...)` calls, `undefined` otherwise.
+  Arrow functions ignore it and resolve `this` lexically.
 - Return: the function result as a NaN-boxed `f64`.
 
 The argument block layout is:
@@ -757,9 +758,10 @@ initialised before default parameter expressions, so defaults may reference it.
 
 ### Missing features
 
-The current closure model has no `this`, `arguments`, `new`, methods, classes,
-generators, `async` functions, `eval`, `Function` constructor, `bind`, `call` or
-`apply`. A function is only callable through the uniform call path.
+The current closure model has no `arguments`, `new`, classes, generators,
+`async` functions, `eval`, `Function` constructor, `bind`, `call` or `apply`.
+A function is only callable through the uniform call path. `this` is bound for
+ordinary functions and the script; arrows capture it lexically.
 
 ## 7. Memory and lifetime
 
