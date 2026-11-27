@@ -670,8 +670,7 @@ The value domain is deliberately narrow:
 Inspect the lowered representation with:
 
 ```sh
-cd sealionjs
-cargo run -- --emit-ir --no-run ../path/to/file.js
+cargo run -p sealionjs -- --emit-ir --no-run path/to/file.js
 ```
 
 Relevant end-to-end tests in `sealion-engine/tests/e2e.rs`:
@@ -691,5 +690,5 @@ Relevant end-to-end tests in `sealion-engine/tests/e2e.rs`:
 Run the suite with:
 
 ```sh
-cargo test --manifest-path sealion-engine/Cargo.toml
+cargo test -p sealion-engine
 ```

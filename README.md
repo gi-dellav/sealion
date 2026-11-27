@@ -8,7 +8,7 @@ Experimental JS engine built on Cranelift
 Requires Rust 1.98 or newer.
 
 1. Clone the repo
-2. Run `cd sealionjs && cargo install --path .`
+2. Run `cargo install --path sealionjs`
 3. Run `sealionjs --help` to see CLI flags
 4. Run `cd perfbench/loopmath && ./bench.sh` to run a simple perf benchmark
 

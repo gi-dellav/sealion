@@ -808,8 +808,7 @@ and closure records should then become part of it.
 Inspect the generated IR with:
 
 ```sh
-cd sealionjs
-cargo run -- --emit-ir --no-run ../path/to/file.js
+cargo run -p sealionjs -- --emit-ir --no-run path/to/file.js
 ```
 
 The closure-related end-to-end tests live in `sealion-engine/tests/e2e.rs`:
@@ -826,5 +825,5 @@ The closure-related end-to-end tests live in `sealion-engine/tests/e2e.rs`:
 Run them with:
 
 ```sh
-cargo test --manifest-path sealion-engine/Cargo.toml
+cargo test -p sealion-engine
 ```

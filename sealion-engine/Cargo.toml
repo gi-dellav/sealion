@@ -1,34 +1,28 @@
 [package]
 name = "sealion-engine"
-version = "0.7.0"
-edition = "2024"
-rust-version = "1.98"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [features]
 default = []
 jit = ["dep:object", "dep:libc", "dep:postcard", "dep:serde", "dep:sealion-string", "dep:chrono"]
 
 [dependencies]
-cranelift-codegen = { version = "0.132.3", features = ["x86", "arm64"] }
-cranelift-frontend = "0.132.3"
-cranelift-module = "0.132.3"
-cranelift-object = "0.132.3"
-target-lexicon = "0.13.3"
-oxc_allocator = "0.159.0"
-oxc_ast = "0.159.0"
-oxc_parser = "0.159.0"
-oxc_span = "0.159.0"
-oxc_transformer = "0.159.0"
-oxc_semantic = "0.159.0"
-object = { version = "0.39", optional = true, default-features = false, features = ["read_core", "write_core", "elf", "std"] }
-libc = { version = "0.2", optional = true }
-serde = { version = "1", optional = true, features = ["derive"] }
-postcard = { version = "1.1", optional = true }
-sealion-string = { path = "../sealion-string", optional = true }
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"], optional = true }
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-object.workspace = true
+target-lexicon.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_transformer.workspace = true
+oxc_semantic.workspace = true
+object = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
+sealion-string = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
