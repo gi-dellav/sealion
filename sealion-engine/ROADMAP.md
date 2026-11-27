@@ -70,8 +70,17 @@
 - [x] `String.fromCharCode` and `String.fromCodePoint` (dynamic runtime only; an out-of-range or non-integral code point is skipped instead of raising `RangeError`)
 - [x] `Math` module — `Math` as an object of the dynamic runtime, so `var m = Math`, `var floor = Math.floor`, `Math['abs'](-1)` and `Object.keys(Math)` work; member calls keep using the inline/libm paths
 - [x] `Date` module — `new Date(...)` (no argument, a time value, a string or the year/month fields), `Date()`, `Date.now`, `Date.parse`, `Date.UTC`, `Date.prototype` and the `get*`/`getUTC*`/`setTime`/`to*String` methods (dynamic runtime only; local time comes from the system clock, and an invalid date degrades to `"Invalid Date"`/`NaN` instead of raising `RangeError`)
+- [ ] `new` and `super`
+- [ ] `for..in` and `for..of`
 
+### 0.9.0
 
-### Later
+- [ ] `import` and `export` modules
+- [ ] CommonJS modules via `require`
+
+### 0.10.0
 
 - [ ] Error handling
+- [ ] Array destructuring
+- [ ] `using` keyword
+- [ ] `class` keyword and full support
