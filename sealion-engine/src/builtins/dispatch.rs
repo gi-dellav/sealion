@@ -216,6 +216,14 @@ pub fn call(
             let pointer = builder.inst_results(call)[0];
             value::object(builder, pointer)
         }
+        "Map" => {
+            let func_ref = *funcs.get("sealion_map_new").ok_or_else(|| {
+                Error::Unsupported("Map requires the dynamic runtime".to_string())
+            })?;
+            let call = builder.ins().call(func_ref, &[]);
+            let pointer = builder.inst_results(call)[0];
+            value::object(builder, pointer)
+        }
         "String" => {
             let ops = strings.ok_or_else(|| {
                 Error::Unsupported("String() requires the dynamic runtime".to_string())

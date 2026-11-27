@@ -1588,6 +1588,7 @@ fn arrays_require_the_dynamic_runtime() {
         "var a = [1]; a[0] = 2;",
         "Array(1, 2);",
         "new Array(1);",
+        "new Map();",
     ] {
         assert!(
             engine.compile(source).is_err(),

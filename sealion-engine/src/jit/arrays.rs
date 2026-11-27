@@ -27,11 +27,11 @@ type JsCall = unsafe extern "C" fn(i64, *const u8, f64) -> f64;
 /// Argument blocks hold at most this many values (`compiler::call::MAX_ARGS`).
 const MAX_ARGS: usize = 32;
 
-fn arg_count(args: *const u8) -> usize {
+pub(super) fn arg_count(args: *const u8) -> usize {
     (unsafe { *args.cast::<u64>() } as usize).min(MAX_ARGS)
 }
 
-fn arg(args: *const u8, index: usize) -> f64 {
+pub(super) fn arg(args: *const u8, index: usize) -> f64 {
     let words = args.cast::<u64>();
     if index < arg_count(args) {
         f64::from_bits(unsafe { *words.add(index + 1) })
@@ -225,7 +225,7 @@ fn join_elements(elements: &[f64], separator: &JsString) -> JsString {
 }
 
 /// Calls a JavaScript closure with at most four arguments.
-fn call(callback: f64, arguments: &[f64]) -> f64 {
+pub(super) fn call(callback: f64, arguments: &[f64]) -> f64 {
     if callback.to_bits() >> 48 != TAG_FUNCTION {
         return tagged_undefined();
     }

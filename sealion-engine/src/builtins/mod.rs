@@ -186,6 +186,10 @@ impl Builtins {
             let is_array_id =
                 module.declare_function("sealion_array_is_array", Linkage::Import, &unary_sig)?;
             funcs.insert("sealion_array_is_array", is_array_id);
+
+            let new_map_id =
+                module.declare_function("sealion_map_new", Linkage::Import, &pointer_sig)?;
+            funcs.insert("sealion_map_new", new_map_id);
         }
 
         let names = MATH_CONSTANTS
@@ -227,6 +231,7 @@ impl Builtins {
             "Number" => Some("Number"),
             "String" => Some("String"),
             "Array" => Some("Array"),
+            "Map" => Some("Map"),
             _ => None,
         }
     }

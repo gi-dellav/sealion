@@ -15,18 +15,23 @@
 use sealion_string::JsString;
 
 use super::arrays;
+use super::maps;
 use super::strings::{is_object, tagged_bool, tagged_undefined, to_js_string, with_string};
 use crate::value::{PAYLOAD_MASK, TAG_OBJECT, TAG_STRING};
 
 pub(super) struct JsObject {
     properties: Vec<(JsString, f64)>,
     pub(super) elements: Option<Vec<f64>>,
+    /// `Some(..)` when this object is a `Map`: insertion-ordered key/value
+    /// pairs compared with SameValueZero.
+    pub(super) entries: Option<Vec<(f64, f64)>>,
 }
 
 pub(super) fn new_object() -> *mut JsObject {
     Box::into_raw(Box::new(JsObject {
         properties: Vec::new(),
         elements: None,
+        entries: None,
     }))
 }
 
@@ -34,6 +39,15 @@ pub(super) fn new_array(elements: Vec<f64>) -> *mut JsObject {
     Box::into_raw(Box::new(JsObject {
         properties: Vec::new(),
         elements: Some(elements),
+        entries: None,
+    }))
+}
+
+pub(super) fn new_map() -> *mut JsObject {
+    Box::into_raw(Box::new(JsObject {
+        properties: Vec::new(),
+        elements: None,
+        entries: Some(Vec::new()),
     }))
 }
 
@@ -95,7 +109,12 @@ extern "C" fn sealion_object_get(object: f64, key: f64) -> f64 {
     if let Some(value) = own_property(object, &key) {
         return value;
     }
-    arrays::method_property(object, &key).unwrap_or_else(tagged_undefined)
+    if let Some(value) = maps::property(object, &key) {
+        return value;
+    }
+    maps::method_property(object, &key)
+        .or_else(|| arrays::method_property(object, &key))
+        .unwrap_or_else(tagged_undefined)
 }
 
 extern "C" fn sealion_object_set(object: f64, key: f64, value: f64) -> f64 {

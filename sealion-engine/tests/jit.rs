@@ -385,6 +385,80 @@ fn array_iteration_methods_call_closures() {
 }
 
 #[test]
+fn map_constructor_and_methods() {
+    assert_eq!(run("new Map().size;"), 0);
+    assert_eq!(run("Map().size;"), 0);
+    assert_eq!(run(r#"var m = new Map(); m.set("a", 1); m.get("a");"#), 1);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("a", 2); m.get("a");"#),
+        2
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.set("a", 2); m.size;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.get("b") === undefined ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.has("a") ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(run(r#"var m = new Map(); m.has("a") ? 0 : 1;"#), 1);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.delete("a") ? 1 : 0;"#),
+        1
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.delete("a"); m.has("a") ? 0 : 1;"#),
+        1
+    );
+    assert_eq!(run(r#"var m = new Map(); m.delete("a") ? 0 : 1;"#), 1);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set("a", 1); m.clear(); m.size;"#),
+        0
+    );
+    assert_eq!(run("new Map().set(1, 2).get(1);"), 2);
+    assert_eq!(
+        run(r#"var m = new Map(); m.set(1, 2); m.set("1", 3); m.size;"#),
+        2
+    );
+    assert_eq!(run("var m = new Map(); m.set(NaN, 5); m.get(NaN);"), 5);
+    assert_eq!(
+        run("var k = {}; var m = new Map(); m.set(k, 7); m.get(k);"),
+        7
+    );
+    assert_eq!(
+        run(r#"var m = new Map(); var set = m.set; set("a", 3); m.get("a");"#),
+        3
+    );
+    assert_eq!(run("Array.isArray(new Map()) ? 0 : 1;"), 1);
+}
+
+#[test]
+fn map_for_each_calls_closures() {
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.set("b", 2); var s = 0; m.forEach(function (v, k) { s = s + v; }); s;"#
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.set("b", 2); var keys = ""; m.forEach(function (v, k) { keys = keys + k; }); keys === "ab" ? 1 : 0;"#
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            r#"var m = new Map(); m.set("a", 1); m.forEach(function (v, k, map) { m.delete(k); }); m.size;"#
+        ),
+        0
+    );
+}
+
+#[test]
 fn array_constructor_and_method_references() {
     assert_eq!(run("Array.isArray([]) ? 1 : 0;"), 1);
     assert_eq!(run("Array.isArray({}) ? 0 : 1;"), 1);

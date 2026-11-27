@@ -191,8 +191,8 @@ pub(super) fn compile_expr<'a>(
     }
 }
 
-/// Only `new Array(...)` is supported: the constructors of the engine have no
-/// first-class identity, so every other `new` is rejected.
+/// Only `new Array(...)` and `new Map()` are supported: the constructors of the
+/// engine have no first-class identity, so every other `new` is rejected.
 fn compile_new<'a>(
     builder: &mut FunctionBuilder,
     ctx: &CodegenCtx<'a>,
@@ -200,19 +200,19 @@ fn compile_new<'a>(
     new: &'a NewExpression<'a>,
 ) -> Result<Value, Error> {
     if let Expression::Identifier(id) = &new.callee
-        && id.name.as_str() == "Array"
         && is_free_global(ctx, id.name.as_str())
+        && let Some(name @ ("Array" | "Map")) = ctx.builtins.global_function(id.name.as_str())
     {
         return compile_builtin_call(
             builder,
             ctx,
             flow,
-            BuiltinCallee::Global("Array"),
+            BuiltinCallee::Global(name),
             new.arguments.as_slice(),
         );
     }
     Err(Error::Unsupported(
-        "only `new Array` is supported".to_string(),
+        "only `new Array` and `new Map` are supported".to_string(),
     ))
 }
 
